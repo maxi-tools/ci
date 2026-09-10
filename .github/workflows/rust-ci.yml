@@ -85,8 +85,13 @@ jobs:
     # capacity is unavailable a job is rejected before a runner is assigned --
     # zero steps, no log, seconds to "failure" -- so this sentinel reported the
     # PR broken without ever evaluating the enforcement mode it exists to
-    # report. It is pure bash (echo and date), so any POSIX lane runs it.
-    runs-on: [self-hosted, Linux, X64]
+    # report. It is pure bash (echo and date), so any POSIX lane runs it --
+    # which is why the architecture is not pinned. `X64` here bought nothing
+    # and cost capacity: this job needs a shell and a clock, and excluding
+    # arm64 kept it queueing behind a saturated x64 pool for no reason. The
+    # canonical copy in maxi-config has been `[self-hosted, Linux]` for a
+    # while; this brings the two back into agreement.
+    runs-on: [self-hosted, Linux]
     permissions:
       contents: read
     steps:
