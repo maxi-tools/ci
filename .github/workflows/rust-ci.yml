@@ -71,7 +71,7 @@ jobs:
     # the workflow file from the PR's merge commit, so a fork PR supplies this
     # `run:` block along with everything else in the file. "Inspect what the
     # shell body currently does" is a review of the base branch, not a boundary
-    # around what will execute on `[self-hosted, Linux, X64]`.
+    # around what will execute on `[self-hosted, Linux]`.
     #
     # Stated plainly because the guard is easy to over-read: this closes the
     # DECLARED lanes. A fork PR can also add a job that was never here, and no
