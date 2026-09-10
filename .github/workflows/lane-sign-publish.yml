@@ -1,0 +1,72 @@
+# Reusable sign-publish lane for maxi-tools Rust CI.
+name: CI lane / sign-publish
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      should_run:
+        required: true
+        type: boolean
+      skip_reason:
+        required: false
+        type: string
+        default: lane skipped/deferred by workflow policy
+      artifact_name:
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+jobs:
+  lane-sign-publish:
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    permissions:
+      contents: write
+      id-token: write
+      pages: write
+    steps:
+      - name: Report skipped lane
+        if: ${{ !inputs.should_run }}
+        run: |
+          {
+            echo "## lane-sign-publish summary"
+            echo "- lane skipped/deferred: ${{ inputs.skip_reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        timeout-minutes: 10
+        if: ${{ inputs.should_run }}
+        with:
+          persist-credentials: false
+
+      - name: Download package artifacts
+        if: ${{ inputs.should_run && inputs.artifact_name != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: release-artifacts
+
+      - name: Sign or publish
+        if: ${{ inputs.should_run }}
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ARTIFACT_NAME" ]; then
+            test -d release-artifacts
+            echo "using package artifact: $ARTIFACT_NAME"
+          fi
+          echo "sign-publish lane reached a trusted release ref"
+
+      - name: Lane summary
+        if: ${{ inputs.should_run }}
+        run: |
+          {
+            echo "## lane-sign-publish summary"
+            echo "- sign-publish lane ran"
+          } >> "$GITHUB_STEP_SUMMARY"

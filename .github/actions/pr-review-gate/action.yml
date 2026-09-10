@@ -1,0 +1,40 @@
+name: PR review gate
+description: Fail a pull request that has unresolved review threads, or that nobody but its author has reviewed.
+inputs:
+  payload-path:
+    description: Path to the collected JSON payload describing the PR's reviews and review threads.
+    required: true
+  condition:
+    description: >
+      Which condition to judge: `threads` (no unresolved review threads),
+      `non-author-review` (someone other than the author has reviewed), or
+      `all` (both). Callers report the two separately so each check's NAME can
+      state the action it wants; a single check covering both can only be named
+      for its passing state, which readers negate into the wrong half.
+    required: false
+    default: all
+outputs:
+  waiver:
+    description: >
+      The label a condition was waived by, or empty when the verdict was reached
+      on evidence. A caller publishing a commit status should say this in the
+      description instead of the passing state's wording: recording a PR that
+      merged under `review-infra-unavailable` as "reviewed by a non-author"
+      claims work that did not happen, which is the defect this waiver replaced.
+    value: ${{ steps.judge.outputs.waiver }}
+runs:
+  using: composite
+  steps:
+    # Inputs go through `env:`, never into the script text. `${{ }}` is
+    # substituted BEFORE bash parses the line, so quoting the expansion does
+    # not contain a hostile value -- it is already part of the program by then.
+    # As env vars they are data to bash, whatever they contain (CWE-94). An
+    # unknown --only value still fails closed in the script rather than
+    # widening or narrowing what is judged.
+    - id: judge
+      shell: bash
+      env:
+        GATE_CONDITION: ${{ inputs.condition }}
+        GATE_PAYLOAD_PATH: ${{ inputs.payload-path }}
+        GATE_SCRIPT: ${{ github.action_path }}/pr_review_gate.py
+      run: python3 "$GATE_SCRIPT" --only "$GATE_CONDITION" "$GATE_PAYLOAD_PATH"

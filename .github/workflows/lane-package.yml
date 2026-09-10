@@ -1,0 +1,297 @@
+# Reusable package lane for maxi-tools Rust CI.
+name: CI lane / package
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      should_run:
+        required: true
+        type: boolean
+      skip_reason:
+        required: false
+        type: string
+        default: lane skipped/deferred by workflow policy
+    outputs:
+      artifact_name:
+        description: Cargo release artifact uploaded by the package lane.
+        value: ${{ jobs.lane-package.outputs.artifact_name }}
+
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+
+permissions: {}
+
+# Callers set CARGO_NET_GIT_FETCH_WITH_CLI at their workflow level, but env
+# does not cross the reusable-workflow boundary: without it here, cargo
+# fetches git deps with libgit2, which cannot use the app-token insteadOf
+# rewrite, and private git dependencies fail to authenticate.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: always
+  # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
+  # (e.g. a shared farm cache in the runner service .env) can never redirect
+  # build output or make concurrent jobs serialize on one build-dir flock,
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Fleet
+  # policy: cross-run reuse belongs in sccache; Cargo target dirs stay
+  # workspace-local and disposable.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  lane-package:
+    # Same as lane-check.yml. Not a required context anywhere today, but kept
+    # on the job for the same reason, so the row stays present and honest.
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    # Backstop against a wedged job holding a runner for GitHub's 6h default.
+    # Packaging builds release artifacts, so it gets the most headroom of the
+    # rust lanes; see lane-check.yml for the incident.
+    timeout-minutes: 90
+    outputs:
+      artifact_name: ${{ steps.artifact-key.outputs.name }}
+    permissions:
+      contents: read
+    steps:
+      - name: Report skipped lane
+        if: ${{ !inputs.should_run }}
+        run: |
+          {
+            echo "## lane-package summary"
+            echo "- lane skipped/deferred: ${{ inputs.skip_reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        timeout-minutes: 10
+        if: ${{ inputs.should_run }}
+        with:
+          persist-credentials: false
+
+      # Repos with native system-library deps (e.g. alsa-sys behind a midi
+      # feature) declare them in ci/apt-packages.txt — one package per line,
+      # '#' comments allowed. Absent file means no extra packages.
+      - name: Install repo-declared system packages
+        if: ${{ inputs.should_run && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          list="ci/apt-packages.txt"
+          [ -f "$list" ] || exit 0
+          packages="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$list" | xargs)"
+          [ -n "$packages" ] || exit 0
+
+          # Not every self-hosted Linux runner is Debian-family with a sudoer
+          # build user. Some run a declaratively-configured distribution with
+          # neither apt-get nor sudo, taking system libraries from the machine's
+          # own configuration instead — so hard-coding `sudo apt-get` failed
+          # every lane at provisioning with `sudo: command not found`, seconds
+          # in, before compiling anything.
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::notice::No apt-get on this runner; expecting its image to provide: $packages"
+            exit 0
+          fi
+
+          # Root needs no sudo, and a non-root user without it cannot install.
+          # Saying so beats failing the lane over packages the image may
+          # already have.
+          elevate=()
+          if [ "$(id -u)" -ne 0 ]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+              echo "::warning::Cannot install system packages (not root, no sudo); expecting this runner's image to provide: $packages"
+              exit 0
+            fi
+            elevate=(sudo)
+          fi
+
+          "${elevate[@]}" apt-get update
+          # shellcheck disable=SC2086
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
+
+      - name: Generate org repo token
+        if: ${{ inputs.should_run }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          # Deliberately still `app-id` rather than `client-id`.
+          #
+          # This is a `workflow_call` workflow: it sees only the secrets its
+          # CALLER passes, and the wrapper that consumers vendor forwards
+          # `APP_ID` by name. Flipping to `client-id` takes effect in every
+          # consumer the moment this file lands on main, while their wrappers
+          # still forward only `APP_ID` -- an empty client-id and a failing
+          # token step fleet-wide. The org secret existing does not help; a
+          # called workflow cannot read a secret nobody handed it.
+          #
+          # Order of operations: thread `APP_CLIENT_ID` through the wrapper
+          # template first, let the fan-out deliver it, then flip the call
+          # sites.
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          # Scoped deliberately. Without a `permission-*` input this mint
+          # inherits the whole App installation rather than the read this lane
+          # needs, which is a large over-grant handed to a job that only reads
+          # files. Always state the permissions.
+          #
+          # The reasoning, the incident and the scope tables are recorded
+          # privately in maxi-config.
+          permission-contents: read
+
+      - name: Install Rust toolchain
+        if: ${{ inputs.should_run }}
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+
+      - name: Fetch maxi-config rust-lane policy
+        if: ${{ inputs.should_run }}
+        # One implementation, in .github/actions/fetch-policy. This block
+        # existed in four near-identical copies until #462, which is how #460
+        # fixed a live bug in a file nothing runs. Its reasoning -- the
+        # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
+        # the success condition -- moved into the action unchanged, along with
+        # why that action is referenced by its full owner/repo path.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@main
+        with:
+          policy-files: |
+            scripts/select-rust-toolchain.sh
+            scripts/emit-runner-paths.sh
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Expose installed macOS native build tools
+        if: ${{ inputs.should_run && runner.os == 'macOS' }}
+        shell: bash
+        run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
+      - name: Verify installed Rust toolchain before cache restore
+        if: ${{ inputs.should_run }}
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
+      - name: Cache Rust dependencies
+        if: ${{ inputs.should_run }}
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Verify installed Rust toolchain after cache restore
+        if: ${{ inputs.should_run }}
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
+      - name: Configure git for private deps
+        if: ${{ inputs.should_run }}
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Persistent runners can retain this job-owned directory after a
+          # cancellation or host loss. Remove it before writing the new token
+          # so an expired equal-length insteadOf rewrite cannot win.
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rust-lane"
+          gitconfig="$RUNNER_TEMP/rust-lane/.gitconfig-ci"
+          cat > "$gitconfig" <<GITEOF
+          [url "https://x-access-token:${GH_APP_TOKEN}@github.com/maxi-tools/"]
+            insteadOf = https://github.com/maxi-tools/
+            insteadOf = git@github.com:maxi-tools/
+            insteadOf = ssh://git@github.com/maxi-tools/
+          [http]
+            lowSpeedLimit = 1000
+            lowSpeedTime = 300
+          GITEOF
+          # Abort a stalled fetch instead of hanging forever — see lane-check.yml
+          # for the incident. git has no default stall timeout, so a dead HTTPS
+          # connection parks `git remote-https` at 0% CPU indefinitely.
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
+      - name: Fetch private dependencies
+        if: ${{ inputs.should_run }}
+        run: |
+          if [ -f Cargo.lock ]; then
+            cargo fetch --locked
+          else
+            cargo fetch
+          fi
+
+      - name: Remove private dependency auth
+        if: always()
+        run: |
+          # Unconditional by design: `rm -rf` succeeds when absent, and a
+          # deferred lane must still clear residue from an interrupted run.
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          # Keep later `git config --global` calls writable while making the
+          # credential scope empty. This file is a sibling under the
+          # runner-provided $RUNNER_TEMP, not inside the removed directory.
+          (umask 077 && : > "$RUNNER_TEMP/gitconfig-empty")
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig-empty" >> "$GITHUB_ENV"
+
+      - name: Build release artifacts
+        if: ${{ inputs.should_run }}
+        run: cargo build --workspace --release
+
+      - name: Build release artifact identity
+        id: artifact-key
+        if: ${{ inputs.should_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          segment() {
+            printf '%s' "$1" \
+              | tr '[:upper:]' '[:lower:]' \
+              | tr -cs 'a-z0-9._-' '-' \
+              | sed 's/^-//;s/-$//'
+          }
+          trust=trusted
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            trust=untrusted-pr
+          fi
+          toolchain="$(rustc -V)"
+          toolchain="${toolchain#rustc }"
+          toolchain="${toolchain%% *}"
+          repo="$(segment "$GITHUB_REPOSITORY")"
+          commit="$(segment "$GITHUB_SHA")"
+          target="$(segment "${RUNNER_OS}-${RUNNER_ARCH}")"
+          toolchain="$(segment "$toolchain")"
+          name="cargo-target-v1--${repo}--${commit}--${target}--${toolchain}--default--workspace--release--${trust}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Upload release artifacts
+        # Only lane-sign-publish and lane-release-verify consume this artifact,
+        # and rust-ci gates both on `refs/heads/main` or `refs/heads/release/*`.
+        # On a pull request neither runs, so the upload has no consumer: the name
+        # is keyed by commit SHA (so it is not a cache reused across runs), it is
+        # tagged `untrusted-pr`, retained one day, and downloaded by nothing.
+        #
+        # Shipping the whole target/release/ tree on every PR across every repo
+        # is a large, continuous draw on shared artifact storage, and storage
+        # pressure turns `if-no-files-found: error` into a red required check on
+        # PRs whose code is fine.
+        #
+        # The lane still BUILDS on pull requests; that is the PR-time packaging
+        # verification and it is unchanged. This only stops publishing a tree
+        # nobody fetches.
+        if: ${{ inputs.should_run && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.artifact-key.outputs.name }}
+          path: |
+            target/release/
+            !target/release/deps/
+            !target/release/build/
+            !target/release/incremental/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Lane summary
+        if: ${{ inputs.should_run }}
+        run: |
+          {
+            echo "## lane-package summary"
+            echo "- package-bundle lane ran"
+            if [ "$GITHUB_REF" = "refs/heads/main" ] || case "$GITHUB_REF" in refs/heads/release/*) true;; *) false;; esac; then
+              echo "- Uploaded artifact: ${ARTIFACT_NAME}"
+            else
+              echo "- Built ${ARTIFACT_NAME}; upload skipped (no consumer off main/release)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,118 @@
+name: Fetch maxi-config rust-lane policy
+description: >
+  Download maxi-config policy files into .maxi-config/ over the Contents API,
+  retrying until each one arrives with a non-empty body.
+
+  This block previously existed in four near-identical copies -- a template
+  plus lane-check.yml, lane-test.yml and lane-package.yml -- and that is how a
+  real bug came to be fixed in the template alone, where it reached no
+  consumer. Nothing in the tree marked which copies were live, so grepping,
+  editing and confirming the fix all behaved identically against a file nothing
+  executes. The fix had to be reapplied to the three live lanes afterwards;
+  this action is the collapse.
+
+  A composite action rather than a shared script, because a script would have
+  to be fetched, and the policy fetch cannot depend on a fetched policy file.
+  A checkout of maxi-config is not an option either: that is the partial-clone
+  hang the run body below documents.
+
+  Referenced by its full owner/repo path (maxi-tools/ci/...@main).
+  `./.github/actions/...` would resolve against the CALLER's workspace, which
+  in a consumer repo does not contain this action at all. The cost is that a
+  change here is exercised by main rather than by the PR that makes it. The
+  policy FILES it fetches are still pinned to the PR's sha where that applies,
+  which is what POLICY_REF below is for.
+
+  This action lives in a PUBLIC repository so that public consumers can resolve
+  it. It contains no policy: it fetches policy from the private repository at
+  run time, authenticated by the caller's token.
+
+inputs:
+  policy-files:
+    description: >
+      Newline-separated repo-relative paths in maxi-tools/maxi-config to fetch
+      into .maxi-config/, preserving their directory structure. Blank lines are
+      skipped so callers can use a block scalar.
+    required: true
+  token:
+    description: >
+      Token for the Contents API reads. Needs contents:read on
+      maxi-tools/maxi-config.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch maxi-config rust-lane policy
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        # In maxi-config's own runs the policy is read at the sha under test,
+        # so a PR that changes a policy file is judged by the version it ships
+        # rather than by main's. Everywhere else this is empty and the Contents
+        # API serves the default branch.
+        POLICY_REF: ${{ github.repository == 'maxi-tools/maxi-config' && github.sha || '' }}
+        POLICY_FILES: ${{ inputs.policy-files }}
+      run: |
+        # These files used to arrive via an actions/checkout of maxi-config
+        # with sparse-checkout, which implies a PARTIAL CLONE. That fetch
+        # intermittently hung until the 10-minute action timeout killed it,
+        # taking the whole lane with it: every later step is then skipped, so
+        # the lane reports FAILED while having produced no check, lint or
+        # test evidence at all. Seen repeatedly on one runner while the same
+        # step finished in seconds elsewhere.
+        #
+        # Plain HTTP GETs instead: no git, no promisor negotiation, bounded
+        # by --max-time AND --retry-max-time, and retried rather than hung.
+        set -euo pipefail
+        while IFS= read -r rel; do
+          [ -z "$rel" ] && continue
+          mkdir -p ".maxi-config/$(dirname "$rel")"
+          url="https://api.github.com/repos/maxi-tools/maxi-config/contents/${rel}"
+          if [ -n "${POLICY_REF}" ]; then
+            url="${url}?ref=${POLICY_REF}"
+          fi
+          # curl's own retries cover transport and HTTP errors. They do NOT
+          # cover the failure actually seen in the field: a 2xx carrying an
+          # empty body. That is not an error, so --fail
+          # passes it, --retry-all-errors skips it, and the first bad
+          # response becomes the final answer — a permanent lane failure out
+          # of a transient fetch. So the emptiness check retries too.
+          status=""
+          for attempt in 1 2 3 4 5; do
+            # --retry stays low because this loop is itself the retry: 5
+            # iterations x curl's own attempts is the real bound, and a total
+            # outage should fail in a useful time, not 25 attempts later.
+            status="$(curl --silent --show-error --location \
+                 --retry 2 --retry-all-errors --retry-delay 2 \
+                 --connect-timeout 10 --max-time 60 --retry-max-time 120 \
+                 -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github.raw" \
+                 -H "X-GitHub-Api-Version: 2022-11-28" \
+                 --write-out '%{http_code}' \
+                 -o ".maxi-config/${rel}" "${url}")" || status="curl-exit-$?"
+            # An empty policy helper defines no functions and fails obscurely
+            # several steps later, so a non-empty body is the real success
+            # condition — not the status code.
+            if [ "${status}" = "200" ] && [ -s ".maxi-config/${rel}" ]; then
+              break
+            fi
+            if [ -f ".maxi-config/${rel}" ]; then
+              # wc pads its output; $(( )) trims it so the log reads cleanly.
+              bytes=$(( $(wc -c < ".maxi-config/${rel}") ))
+            else
+              bytes=0
+            fi
+            echo "::warning::policy fetch attempt ${attempt}/5 for ${rel}:" \
+                 "status=${status} bytes=${bytes}"
+            rm -f ".maxi-config/${rel}"
+            sleep $(( attempt * 2 ))
+          done
+          if [ ! -s ".maxi-config/${rel}" ]; then
+            echo "::error::policy fetch failed after 5 attempts: ${rel}" \
+                 "(last status=${status}). The file exists upstream; an empty" \
+                 "body from a 2xx is the known failure mode."
+            exit 1
+          fi
+          echo "fetched ${rel} ($(wc -c < ".maxi-config/${rel}") bytes)"
+        done <<< "${POLICY_FILES}"

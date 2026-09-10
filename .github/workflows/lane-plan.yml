@@ -1,0 +1,306 @@
+# Reusable plan lane for maxi-tools Rust CI.
+name: CI lane / plan
+
+on:
+  workflow_call:
+    inputs:
+      lane:
+        required: false
+        type: string
+        default: linux-x64
+      workflow_family:
+        required: false
+        type: string
+        default: rust
+      packaging_policy_path:
+        required: false
+        type: string
+        default: .maxi-config/ci/packaging-paths.toml
+      base_ref:
+        required: false
+        type: string
+        default: origin/main
+      planner_runs_on:
+        description: >
+          Runner label for the PLAN job itself, as a bare label or a JSON
+          array string. Deliberately NOT named runs_on: this workflow already
+          has an OUTPUT called runs_on, and it means the opposite end of the
+          pipeline -- where the resolved BUILD lanes go. Conflating the two
+          would let a caller think it was routing the build when it was
+          routing the router.
+        required: false
+        type: string
+        default: '["self-hosted", "Linux", "X64"]'
+    outputs:
+      runs_on:
+        value: ${{ jobs.lane-plan.outputs.runs_on }}
+      provider:
+        value: ${{ jobs.lane-plan.outputs.provider }}
+      packaging_impact:
+        value: ${{ jobs.lane-plan.outputs.packaging_impact }}
+      packaging_reason:
+        value: ${{ jobs.lane-plan.outputs.packaging_reason }}
+
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+
+permissions: {}
+
+jobs:
+  lane-plan:
+    # Routed to a self-hosted lane rather than a hosted runner.
+    #
+    # The durable rule, which is the part worth keeping: route by what a pool
+    # can UNIQUELY do, not only by how deep its queue is today. This job is a
+    # router -- it builds nothing, resolves a runner, lists changed files over
+    # the API and runs a short awk script. Putting a capability-free job into
+    # the queue of the only pool that can serve hardware-bound work costs
+    # those lanes a runner and buys this job nothing.
+    #
+    # It is the worst job in the chain to leave queueing: check, test, package
+    # and release-verify are all SKIPPED behind it, so one queued router gates
+    # an entire repository's build chain.
+    #
+    # A default, not a pin -- pass `planner_runs_on` to route it elsewhere.
+    # The decode below is the same idiom as lane-check.yml: a bare label passes
+    # through, a JSON array string is parsed into a label list.
+    #
+    # Fleet inventory, pool sizes and the measurements behind this choice are
+    # recorded privately in maxi-config; they change faster than this file.
+    runs-on: ${{ (startsWith(inputs.planner_runs_on, '[') || startsWith(inputs.planner_runs_on, '"')) && fromJSON(inputs.planner_runs_on) || inputs.planner_runs_on }}
+    # Control-plane job: observed runs are ~0.2 min. A tight bound keeps a
+    # wedged router from stalling the whole lane chain behind it.
+    timeout-minutes: 15
+    outputs:
+      runs_on: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on }}
+      provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}
+      packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}
+      packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      # This job needs gh and python3. It does NOT need standalone jq -- the
+      # only --jq below is gh's own built-in, which is compiled into gh -- so
+      # jq is deliberately not required here. Demanding a tool the job never
+      # runs would fail boxes closed for no reason.
+      #
+      # Checked, not provisioned. These tools arrive with the runner image, so
+      # a box without one is a box to fix rather than a job to patch.
+      #
+      # The step stays, and stays FIRST, for the reason python3 was always
+      # checked here: the resolve-runner action finds its own interpreter and
+      # fails with its own message, but it runs FOUR steps in -- after two
+      # checkouts and a minted app token. Failing here costs about a second
+      # and names the tool. This router is what every downstream lane is
+      # SKIPPED behind; its failures have to say why.
+      - name: Check the planner's tools are on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in gh python3; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::${missing[*]} absent on ${RUNNER_NAME:-this runner}; the plan lane cannot resolve a runner"
+            exit 1
+          fi
+
+      - name: Checkout caller repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        timeout-minutes: 10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Dependabot-triggered runs get the DEPENDABOT secrets scope, not the
+      # ordinary Actions one, and this org holds no Dependabot secrets -- so
+      # secrets.APP_ID / APP_PRIVATE_KEY arrive as empty strings, this step dies
+      # with `The 'client-id' (or deprecated 'app-id') input must be set to a
+      # non-empty string`, and lane-plan fails ~5s in. Every downstream lane
+      # `needs:` this router, so all of them are then SKIPPED and the repo's
+      # merge-gate reports a dependency bump as broken CI. Observed repeatedly
+      # before this guard existed.
+      #
+      # Keyed on `github.actor`, not on the PR author, because the actor is what
+      # GitHub keys the secrets restriction on: when a human pushes to a
+      # dependabot/* branch the actor becomes that human and ordinary secrets
+      # ARE available, so the real routing policy should be read. The other
+      # dependabot guards in this fleet are keyed the same way.
+      - name: Generate org repo token
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          # Deliberately still `app-id` rather than `client-id`.
+          #
+          # This is a `workflow_call` workflow: it sees only the secrets its
+          # CALLER passes, and the wrapper that consumers vendor forwards
+          # `APP_ID` by name. Flipping to `client-id` takes effect in every
+          # consumer the moment this file lands on main, while their wrappers
+          # still forward only `APP_ID` -- an empty client-id and a failing
+          # token step fleet-wide. The org secret existing does not help; a
+          # called workflow cannot read a secret nobody handed it.
+          #
+          # Order of operations: thread `APP_CLIENT_ID` through the wrapper
+          # template first, let the fan-out deliver it, then flip the call
+          # sites.
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          # The resolver probe reads the org runner inventory and the CALLER
+          # repo's queued runs, so the token must include the caller repo —
+          # maxi-config alone 404s in every consumer repo (maxi-config#162).
+          repositories: |
+            maxi-config
+            ${{ github.event.repository.name }}
+          # Scoped to the three things this token is used for:
+          #   contents: read      -- the sparse checkout of the policy repo
+          #   actions: read       -- the resolver's queued-run probe,
+          #                          GET /repos/{owner}/{repo}/actions/runs
+          #   organization_self_hosted_runners: read
+          #                       -- the resolver's fleet probe,
+          #                          GET /orgs/{owner}/actions/runners
+          #
+          # The org endpoint is why `actions: read` alone is not enough: a repo
+          # permission does not cover an org route, and the probe then 403s.
+          #
+          # State them. Without a `permission-*` input this mint inherits the
+          # whole App installation rather than the read this lane needs -- a
+          # large over-grant handed to a job that only reads files. The
+          # incident and the scope tables are recorded privately in
+          # maxi-config.
+          permission-contents: read
+          permission-actions: read
+          permission-organization-self-hosted-runners: read
+
+      - name: Checkout maxi-config policy
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        timeout-minutes: 10
+        with:
+          repository: maxi-tools/maxi-config
+          path: .maxi-config
+          sparse-checkout: |
+            /.github/actions/resolve-runner
+            /ci/runner-routing.toml
+            /ci/packaging-paths.toml
+            /scripts/plan-packaging-impact.sh
+          # Cone mode (the default) only accepts DIRECTORIES. Every path below
+          # except the action directory is a FILE, and naming a file is fatal:
+          #   fatal: 'ci/runner-routing.toml' is not a directory
+          # It went unnoticed because git can only run that check when the index
+          # has entries. A hosted runner is a fresh VM -> empty index -> file
+          # paths are silently accepted. A persistent self-hosted runner REUSES
+          # the clone -> populated index -> fatal. Reproduced against git 2.55.0,
+          # the build the fleet runs: empty index exit 0, 243-entry index exit
+          # 128, same command.
+          #
+          # So this broke the moment the lanes moved to persistent runners, and
+          # it breaks on the SECOND job to land on a given runner, not the
+          # first -- which is why one lane passed and its sibling failed on a
+          # different box in the same hour.
+          #
+          # Non-cone mode takes gitignore-style patterns, so files work. The
+          # leading slashes anchor each pattern to the repo root; git warns and
+          # matches at any depth without them.
+          sparse-checkout-cone-mode: false
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Resolve runner
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        id: resolve
+        uses: ./.maxi-config/.github/actions/resolve-runner
+        with:
+          lane: ${{ inputs.lane }}
+          repo: ${{ github.event.repository.name }}
+          job: ${{ inputs.workflow_family }}
+          policy-path: .maxi-config/ci/runner-routing.toml
+          github-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Collect changed files
+        id: files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files="$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')"
+          else
+            before="$BASE_REF"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              before="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            fi
+            files="$(git diff --name-only "$before" "${{ github.sha }}" || printf '%s\n' Cargo.lock)"
+          fi
+          # 16 random bytes from /dev/urandom, not uuidgen: some runners carry
+          # coreutils but no util-linux, so uuidgen is absent there and this
+          # step died on an unbound delimiter. od is coreutils, present
+          # everywhere, and 128 bits is the same collision margin a UUID gave.
+          delimiter="CI_LANE_CHANGED_FILES_$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+          {
+            echo "changed_files<<$delimiter"
+            printf '%s\n' "$files"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Plan packaging impact
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        id: packaging
+        shell: bash
+        env:
+          PACKAGING_PATHS_POLICY: ${{ inputs.packaging_policy_path }}
+          CHANGED_FILES: ${{ steps.files.outputs.changed_files }}
+        run: |
+          set -euo pipefail
+          output="$(printf '%s\n' "$CHANGED_FILES" | .maxi-config/scripts/plan-packaging-impact.sh)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" >> "$GITHUB_OUTPUT"
+
+      # Fail closed onto the lane's NATIVE runner set rather than letting the
+      # router fail: without this, the guards above turn "dependency PRs route
+      # to a hardcoded lane" into "dependency PRs can never run any lane at
+      # all", because every downstream lane is skipped behind a failed router.
+      # Same trade the consumer-side dependabot fallbacks state.
+      #
+      # The value is not invented: it is the label set the routing policy
+      # declares as the native self-hosted target for this workflow's default
+      # lane, which is the one answer the resolver has for it. `inputs.lane` is
+      # left at its default by rust-ci.yml's `plan` job, which passes only
+      # `base_ref`.
+      #
+      # packaging_impact=false is the honest answer, not an optimistic one.
+      # The packaging policy does count Cargo.lock and Cargo.toml, so a
+      # Cargo bump WOULD have impact -- but the package lane is advisory on a
+      # pull request (rust-ci.yml gates `should_run` on the ref as well), and
+      # the merge to main re-runs this chain with an actor that is not
+      # Dependabot, where the real policy is read and packaging is planned
+      # properly. Nothing durable is skipped; only the PR-time preview is.
+      - name: Use native lane for Dependabot
+        if: ${{ github.actor == 'dependabot[bot]' }}
+        id: dependabot-fallback
+        run: |
+          {
+            echo 'runs-on=["self-hosted","Linux","X64"]'
+            echo 'provider=self-hosted'
+            echo 'packaging_impact=false'
+            echo 'packaging_reason=dependabot: routing and packaging policy are unreadable without an app token; planned on merge to main instead'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Lane summary
+        run: |
+          {
+            echo "## lane-plan summary"
+            echo "- Runner: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on }}"
+            echo "- Provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}"
+            echo "- Packaging impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}"
+            echo "- Packaging reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"

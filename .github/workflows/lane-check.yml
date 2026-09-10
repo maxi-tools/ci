@@ -1,0 +1,277 @@
+# Reusable formatting, lint, and typecheck lane for maxi-tools Rust CI.
+name: CI lane / check
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      advisory:
+        required: false
+        type: boolean
+        default: false
+      checkout_submodules:
+        required: false
+        type: boolean
+        default: false
+      skip_swift_build:
+        description: Skip repository Swift build scripts in Rust-only lanes.
+        required: false
+        type: boolean
+        default: false
+      allow_unwrap_used:
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+
+permissions: {}
+
+# Callers set CARGO_NET_GIT_FETCH_WITH_CLI at their workflow level, but env
+# does not cross the reusable-workflow boundary: without it here, cargo
+# fetches git deps with libgit2, which cannot use the app-token insteadOf
+# rewrite, and private git dependencies fail to authenticate.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: always
+  # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
+  # (e.g. a shared farm cache in the runner service .env) can never redirect
+  # build output or make concurrent jobs serialize on one build-dir flock,
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Fleet
+  # policy: cross-run reuse belongs in sccache; Cargo target dirs stay
+  # workspace-local and disposable.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  MAXI_ALLOW_UNWRAP_USED: ${{ inputs.allow_unwrap_used }}
+  MAXI_TRAY_SKIP_SWIFT_BUILD: ${{ inputs.skip_swift_build && '1' || '' }}
+
+jobs:
+  lane-check:
+    # Skipped for Dependabot, and skipped HERE rather than at the caller.
+    #
+    # This lane needs the app token to fetch maxi-config's Rust policy itself
+    # (scripts/select-rust-toolchain.sh, hooks/clippy-strict-lints.sh) over the
+    # private Contents API, and a Dependabot-triggered run gets the DEPENDABOT
+    # secrets scope, which this org has never populated. Unlike lane-plan --
+    # which needs the token only to READ a routing policy and so can fall back
+    # to that lane's declared native runners -- there is no honest fallback
+    # here: without its policy this lane cannot enforce the deny tier it exists
+    # for, and "the gate passed on input it could not judge" is the failure
+    # this org keeps getting burned by.
+    #
+    # WHY THE GUARD IS ON THIS JOB AND NOT ON THE CALLER, which is the whole
+    # point and was got wrong first: skipping the CALLER's job skips the
+    # reusable workflow, so the nested check run is never created at all. On a
+    # skipped caller GitHub publishes `merge-gate / check` and nothing else --
+    # `merge-gate / check / lane-check` is ABSENT, not skipped. That context is
+    # a REQUIRED context in many consumer repositories' rulesets, and an
+    # absent required context is not
+    # "pending until it runs", it is a PR that can never merge. Guarding the
+    # job inside the reusable workflow keeps the check run present with
+    # conclusion `skipped`, which required-status-check evaluation accepts.
+    #
+    # Keyed on `github.actor`: GitHub keys the secrets restriction on the
+    # actor, so a human pushing to a dependabot/* branch has ordinary secrets
+    # and this lane runs for real. Spelled the same way fleet-wide.
+    #
+    # The durable fix is org-level DEPENDABOT secrets for APP_ID /
+    # APP_PRIVATE_KEY, which would make this guard inert rather than wrong.
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    continue-on-error: ${{ inputs.advisory }}
+    # Backstop against a wedged job holding a runner for GitHub's 6h default.
+    # Observed healthy lane-check runs are 0.1-2.5 min; 45 is ~18x the p95 and
+    # will not trip a legitimate build, but caps a hang at 45 min instead of 6h.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        # Checkout is where jobs actually wedge: git has no default stall
+        # timeout, so a dead HTTPS fetch parks `git remote-https` at 0% CPU
+        # forever. Two runners were held 33min and 2h04m this way on
+        # 2026-07-31, and neither stall-guard nor cpu-liveness wraps this step.
+        # A shallow clone takes seconds; 10 minutes is pure headroom.
+        timeout-minutes: 10
+        with:
+          persist-credentials: false
+          submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
+
+      # Repos with native system-library deps (e.g. alsa-sys behind a midi
+      # feature) declare them in ci/apt-packages.txt — one package per line,
+      # '#' comments allowed. Absent file means no extra packages.
+      - name: Install repo-declared system packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          list="ci/apt-packages.txt"
+          [ -f "$list" ] || exit 0
+          packages="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$list" | xargs)"
+          [ -n "$packages" ] || exit 0
+
+          # Not every self-hosted Linux runner is Debian-family with a sudoer
+          # build user. Some run a declaratively-configured distribution with
+          # neither apt-get nor sudo, taking system libraries from the machine's
+          # own configuration instead — so hard-coding `sudo apt-get` failed
+          # every lane at provisioning with `sudo: command not found`, seconds
+          # in, before compiling anything.
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::notice::No apt-get on this runner; expecting its image to provide: $packages"
+            exit 0
+          fi
+
+          # Root needs no sudo, and a non-root user without it cannot install.
+          # Saying so beats failing the lane over packages the image may
+          # already have.
+          elevate=()
+          if [ "$(id -u)" -ne 0 ]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+              echo "::warning::Cannot install system packages (not root, no sudo); expecting this runner's image to provide: $packages"
+              exit 0
+            fi
+            elevate=(sudo)
+          fi
+
+          "${elevate[@]}" apt-get update
+          # shellcheck disable=SC2086
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
+
+      - name: Generate org repo token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          # Deliberately still `app-id` rather than `client-id`.
+          #
+          # This is a `workflow_call` workflow: it sees only the secrets its
+          # CALLER passes, and the wrapper that consumers vendor forwards
+          # `APP_ID` by name. Flipping to `client-id` takes effect in every
+          # consumer the moment this file lands on main, while their wrappers
+          # still forward only `APP_ID` -- an empty client-id and a failing
+          # token step fleet-wide. The org secret existing does not help; a
+          # called workflow cannot read a secret nobody handed it.
+          #
+          # Order of operations: thread `APP_CLIENT_ID` through the wrapper
+          # template first, let the fan-out deliver it, then flip the call
+          # sites.
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          # Scoped deliberately. Without a `permission-*` input this mint
+          # inherits the whole App installation rather than the read this lane
+          # needs, which is a large over-grant handed to a job that only reads
+          # files. Always state the permissions.
+          #
+          # The reasoning, the incident and the scope tables are recorded
+          # privately in maxi-config.
+          permission-contents: read
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: rustfmt, clippy
+
+      - name: Fetch maxi-config rust-lane policy
+        # One implementation, in .github/actions/fetch-policy. This block
+        # existed in four near-identical copies until #462, which is how #460
+        # fixed a live bug in a file nothing runs. Its reasoning -- the
+        # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
+        # the success condition -- moved into the action unchanged, along with
+        # why that action is referenced by its full owner/repo path.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@main
+        with:
+          policy-files: |
+            scripts/select-rust-toolchain.sh
+            scripts/emit-runner-paths.sh
+            hooks/clippy-strict-lints.sh
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Expose installed macOS native build tools
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
+      - name: Verify installed Rust toolchain before cache restore
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Verify installed Rust toolchain after cache restore
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
+      - name: Configure git for private deps
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Persistent runners can retain this job-owned directory after a
+          # cancellation or host loss. Remove it before writing the new token
+          # so an expired equal-length insteadOf rewrite cannot win.
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rust-lane"
+          gitconfig="$RUNNER_TEMP/rust-lane/.gitconfig-ci"
+          cat > "$gitconfig" <<GITEOF
+          [url "https://x-access-token:${GH_APP_TOKEN}@github.com/maxi-tools/"]
+            insteadOf = https://github.com/maxi-tools/
+            insteadOf = git@github.com:maxi-tools/
+            insteadOf = ssh://git@github.com/maxi-tools/
+          [http]
+            lowSpeedLimit = 1000
+            lowSpeedTime = 300
+          GITEOF
+          # Abort a fetch that has stalled rather than hanging forever. git has
+          # no default stall timeout, so a dead HTTPS connection leaves
+          # `git remote-https` parked at 0% CPU indefinitely — two runners were
+          # held that way for 33min and 2h04m on 2026-07-31, and neither
+          # stall-guard nor cpu-liveness wraps the checkout step. 1KB/s over 5
+          # minutes is far below any healthy transfer, including cold submodule
+          # fetches, so this only fires on a genuinely dead connection.
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
+      - name: Fetch private dependencies
+        run: |
+          if [ -f Cargo.lock ]; then
+            cargo fetch --locked
+          else
+            cargo fetch
+          fi
+
+      - name: Remove private dependency auth
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          # Point at an empty real file, not /dev/null: later steps (e.g. the
+          # clippy-policy checkout) run `git config --global`, and git cannot
+          # take a lock on /dev/null ("could not lock config file").
+          # This is a sibling under the runner-provided $RUNNER_TEMP, not a
+          # child of the rust-lane directory removed above.
+          (umask 077 && : > "$RUNNER_TEMP/gitconfig-empty")
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig-empty" >> "$GITHUB_ENV"
+
+      - name: lane-check summary
+        run: |
+          {
+            echo "## lane-check summary"
+            echo "- Lane: lane-check"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .maxi-config/hooks/clippy-strict-lints.sh
+          echo "Deny-tier flags:"
+          get_clippy_deny_flags
+          # Word-splitting of the trusted flag list is intentional.
+          # shellcheck disable=SC2046
+          cargo clippy --workspace --all-targets -- $(get_clippy_deny_flags)

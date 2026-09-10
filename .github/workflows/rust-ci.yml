@@ -1,0 +1,221 @@
+# Shared Rust CI lane composition for maxi-tools repos.
+# packaging/signing lanes must not be required PR checks; require merge-gate, check, and test instead.
+
+name: CI / Rust lanes
+
+on:
+  workflow_call:
+    inputs:
+      repo_policy:
+        description: Consumer repository policy profile.
+        required: false
+        type: string
+        default: standard-rust
+      checkout_submodules:
+        description: Recursively initialize Git submodules before Cargo runs.
+        required: false
+        type: boolean
+        default: false
+      skip_swift_build:
+        description: Skip repository Swift build scripts in Rust-only lanes.
+        required: false
+        type: boolean
+        default: false
+      allow_unwrap_used:
+        description: Temporarily allow unwrap_used for repositories with a legacy baseline.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      APP_ID:
+        description: GitHub App ID used for read-only private repository access.
+        required: true
+      APP_PRIVATE_KEY:
+        description: GitHub App private key paired with APP_ID.
+        required: true
+
+# workflow_call ONLY, unlike the copy this was moved from.
+#
+# In maxi-config this file also carried `push`, `pull_request` and
+# `workflow_dispatch`, because maxi-config is itself a Rust workspace and those
+# triggers ran its own CI -- redundantly, since maxi-config also vendors the
+# wrapper. Two things are true here and neither was true there: this repository
+# contains no Cargo workspace, so a self-triggered lane would `cargo fmt` a tree
+# with no Cargo.toml and be permanently red; and a repository that exists to be
+# CALLED should not also be a caller, or its own runs become indistinguishable
+# from its consumers' on the Actions tab.
+#
+# Consumers are unaffected -- they reach this file through `uses:`, which is the
+# `workflow_call` trigger, and every `github.event_name` test below reads the
+# CALLER's event, not this file's triggers.
+permissions: {}
+
+env:
+  CI_ENFORCEMENT_MODE: ${{ vars.CI_ENFORCEMENT_MODE || 'degraded' }}
+  CI_DEGRADED_UNTIL: ${{ vars.CI_DEGRADED_UNTIL || '2026-08-01' }}
+  CARGO_TERM_COLOR: always
+  # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
+  # (e.g. a shared farm cache in the runner service .env) can never redirect
+  # build output or make concurrent jobs serialize on one build-dir flock,
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU.
+  # Fleet policy: cross-run reuse belongs in sccache; Cargo target dirs stay
+  # workspace-local and disposable.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  merge-gate:
+    # Same-repo PRs only. This job is pure bash today -- it echoes two workflow
+    # variables and runs `date` -- and that is NOT why it is safe, because it is
+    # not a property a fork has to leave alone. For `pull_request`, GitHub runs
+    # the workflow file from the PR's merge commit, so a fork PR supplies this
+    # `run:` block along with everything else in the file. "Inspect what the
+    # shell body currently does" is a review of the base branch, not a boundary
+    # around what will execute on `[self-hosted, Linux, X64]`.
+    #
+    # Stated plainly because the guard is easy to over-read: this closes the
+    # DECLARED lanes. A fork PR can also add a job that was never here, and no
+    # `if:` in this file constrains that -- the boundary for that is the org's
+    # "self-hosted runners for fork pull requests" setting plus required
+    # approval for outside contributors, both of which are set at org level.
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    # Deliberately self-hosted rather than a hosted runner: when hosted
+    # capacity is unavailable a job is rejected before a runner is assigned --
+    # zero steps, no log, seconds to "failure" -- so this sentinel reported the
+    # PR broken without ever evaluating the enforcement mode it exists to
+    # report. It is pure bash (echo and date), so any POSIX lane runs it.
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+    steps:
+      - name: Report CI enforcement mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CI enforcement mode: $CI_ENFORCEMENT_MODE"
+          echo "CI degraded mode expires: $CI_DEGRADED_UNTIL"
+          if [ "$CI_ENFORCEMENT_MODE" = "degraded" ]; then
+            {
+              echo "## CI enforcement mode"
+              echo "- mode: degraded"
+              echo "- expires: $CI_DEGRADED_UNTIL"
+              echo "- required lanes stay lightweight while runner/network work is restored"
+            } >> "$GITHUB_STEP_SUMMARY"
+            today="$(date -u +%Y-%m-%d)"
+            if [ "$today" \> "$CI_DEGRADED_UNTIL" ]; then
+              echo "::error::CI degraded mode expired on $CI_DEGRADED_UNTIL; set CI_ENFORCEMENT_MODE=strict or extend CI_DEGRADED_UNTIL with an explicit owner."
+              exit 1
+            fi
+          elif [ "$CI_ENFORCEMENT_MODE" != "strict" ]; then
+            echo "::error::Unknown CI_ENFORCEMENT_MODE=$CI_ENFORCEMENT_MODE"
+            exit 1
+          fi
+          {
+            echo "## merge-gate summary"
+            echo "- check and test lanes provide PR confidence"
+            echo "- package/sign/release lanes are deferred unless packaging impact or trusted release refs require them"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  plan:
+    # The gate for the WHOLE lane chain. `check`, `test`, `package`,
+    # `sign-publish` and `release-verify` all require
+    # `needs.plan.result == 'success'`, so a condition here is the one place
+    # that decides whether any of them reach the fleet.
+    #
+    # Two clauses, two different holes. The first keeps fork pull requests out:
+    # the lanes below check out the head tree and run cargo over it on
+    # persistent runners holding an org App token.
+    #
+    # The second is the dispatch hole the first one hid. A `workflow_dispatch`
+    # is not a pull request, so `github.event_name != 'pull_request'` cleared
+    # it unconditionally -- and `gh workflow run --ref` accepts ANY branch, so
+    # anyone with write access to a consumer repository could dispatch its CI
+    # at a branch of their own and have the fleet build that branch. Pinned to
+    # the owner by numeric id, which the trusted-actor policy also pins; logins
+    # can be reassigned, ids cannot. The ref is deliberately NOT pinned:
+    # dispatching CI at a work-in-progress branch is the normal use.
+    #
+    # `push` keeps its unconditional clearance -- this workflow's push trigger
+    # is `branches: [main, release/**]`, i.e. post-merge code.
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || github.event.sender.id == 874012) }}
+    uses: ./.github/workflows/lane-plan.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    with:
+      base_ref: ${{ github.event.before || 'origin/main' }}
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+  check:
+    needs: plan
+    uses: ./.github/workflows/lane-check.yml
+    permissions:
+      contents: read
+    with:
+      runs_on: ${{ needs.plan.outputs.runs_on }}
+      advisory: ${{ github.event_name == 'pull_request' && vars.CI_ENFORCEMENT_MODE != 'strict' }}
+      checkout_submodules: ${{ inputs.checkout_submodules == true }}
+      skip_swift_build: ${{ inputs.skip_swift_build == true }}
+      allow_unwrap_used: ${{ inputs.allow_unwrap_used == true }}
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+  test:
+    needs: plan
+    uses: ./.github/workflows/lane-test.yml
+    permissions:
+      contents: read
+    with:
+      runs_on: ${{ needs.plan.outputs.runs_on }}
+      advisory: ${{ github.event_name == 'pull_request' && vars.CI_ENFORCEMENT_MODE != 'strict' }}
+      checkout_submodules: ${{ inputs.checkout_submodules == true }}
+      skip_swift_build: ${{ inputs.skip_swift_build == true }}
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+  package:
+    if: ${{ always() && needs.plan.result == 'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    needs: [plan, check, test]
+    uses: ./.github/workflows/lane-package.yml
+    permissions:
+      contents: read
+    with:
+      runs_on: ${{ needs.plan.outputs.runs_on }}
+      should_run: ${{ needs.plan.outputs.packaging_impact == 'true' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
+      skip_reason: no packaging impact on an ordinary PR
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+  sign-publish:
+    if: ${{ always() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+    needs: [plan, package]
+    uses: ./.github/workflows/lane-sign-publish.yml
+    permissions:
+      contents: write
+      id-token: write
+      pages: write
+    with:
+      runs_on: ${{ needs.plan.outputs.runs_on }}
+      should_run: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
+      skip_reason: sign-publish is restricted to trusted release refs
+      artifact_name: ${{ needs.package.outputs.artifact_name }}
+
+  release-verify:
+    if: ${{ always() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (needs.sign-publish.result == 'success' || needs.sign-publish.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+    needs: [plan, package, sign-publish]
+    uses: ./.github/workflows/lane-release-verify.yml
+    permissions:
+      contents: read
+    with:
+      runs_on: ${{ needs.plan.outputs.runs_on }}
+      should_run: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
+      skip_reason: release verification is restricted to trusted release refs
+      artifact_name: ${{ needs.package.outputs.artifact_name }}

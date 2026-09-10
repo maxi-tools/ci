@@ -1,0 +1,152 @@
+name: Collect PR review state
+description: >
+  Read a pull request's reviews and review threads into payload.json, failing
+  closed on anything that cannot be trusted.
+
+  Split out of review-gate-reusable.yml so the gate's two conditions can be
+  reported as two separate checks without this collection existing twice in
+  source. Each condition still gets its own job -- a job IS a check, and the
+  check name is the only part of a verdict that reliably gets read -- so the
+  two reads do run once per condition. That is the price of a name that cannot
+  be misread, on a job that is two GraphQL queries and a python script.
+
+  The tools preflight deliberately did NOT move here. The caller checks for gh
+  and posts a pending status with it BEFORE reaching this action; a composite
+  action cannot run earlier than the step that invokes it, so bundling the two
+  would leave that post unchecked on any lane where gh is absent.
+
+inputs:
+  github-token:
+    description: "Token for the two GraphQL reads. Needs scope: pull-requests read."
+    required: true
+  owner:
+    description: Repository owner login.
+    required: true
+  repo:
+    description: Repository name.
+    required: true
+  pr:
+    description: Pull request number.
+    required: true
+
+outputs:
+  payload-path:
+    description: >
+      Path to the JSON payload this action wrote. Callers should pass THIS to
+      the gate rather than re-spelling the filename: composite steps inherit
+      the caller's working directory, so two independent relative paths agree
+      only while that stays true.
+    value: ${{ steps.collect.outputs.payload-path }}
+
+runs:
+  using: composite
+  steps:
+    # No checkout: the action is referenced by its full owner/repo path, so
+    # the logic that judges a PR always comes from this repository's main and
+    # is never supplied by the pull request under test.
+    - name: Collect reviews and review threads
+      id: collect
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        OWNER: ${{ inputs.owner }}
+        REPO: ${{ inputs.repo }}
+        PR: ${{ inputs.pr }}
+      run: |
+        set -euo pipefail
+        if [ -z "${PR:-}" ]; then
+          echo "::error::no pull request number in the event payload"
+          exit 1
+        fi
+
+        # Both queries paginate. A reviewThreads page caps at 100, and a busy
+        # PR exceeds that; judging only the first page would report a clean
+        # PR while later pages held unresolved conversations -- the exact
+        # shape of failure this gate exists to prevent.
+        gh api graphql --paginate --slurp \
+          -f owner="$OWNER" -f repo="$REPO" -F pr="$PR" \
+          -f query='
+            query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$pr){
+                  author{login}
+                  isDraft
+                  headRefName
+                  # For the review-infra-unavailable waiver the gate honours.
+                  # Unpaginated at 100 deliberately: truncation can only LOSE
+                  # the waiver label, which makes the gate enforce -- the safe
+                  # direction. Paginating a second connection alongside
+                  # reviewThreads would need a second cursor and buys nothing.
+                  labels(first:100){nodes{name}}
+                  reviewThreads(first:100,after:$endCursor){
+                    pageInfo{hasNextPage endCursor}
+                    nodes{
+                      isResolved
+                      isOutdated
+                      comments(first:1){nodes{author{login} path url}}
+                    }
+                  }
+                }
+              }
+            }' > threads.json
+
+        gh api graphql --paginate --slurp \
+          -f owner="$OWNER" -f repo="$REPO" -F pr="$PR" \
+          -f query='
+            query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$pr){
+                  reviews(first:100,after:$endCursor){
+                    pageInfo{hasNextPage endCursor}
+                    nodes{ author{login} state }
+                  }
+                }
+              }
+            }' > reviews.json
+
+        # Assert both queries actually returned a pull request before shaping
+        # anything. jq turns a missing field into null without complaint, and
+        # null flows onward as an empty list -- which would present a PR full
+        # of unresolved threads as having none.
+        # GraphQL answers 200 with partial .data AND a non-empty .errors
+        # array. An error touching a nullable field -- thread metadata, one
+        # review's author -- survives the shaping below and the gate would
+        # pass on a collection that is explicitly untrustworthy. Reject any
+        # errors on ANY page, the way the fan-out verifier already does.
+        #
+        # EVERY page, not just the first: --paginate --slurp yields an array,
+        # and checking .[0] alone would judge one page of many.
+        for f in threads.json reviews.json; do
+          jq -e 'all(.[]; (.errors // []) | length == 0)' "$f" > /dev/null \
+            || { echo "::error::$f contains GraphQL errors; refusing to judge this PR"; \
+                 jq -c '[.[] | .errors // empty]' "$f"; exit 1; }
+          jq -e 'all(.[]; .data.repository.pullRequest != null)' "$f" > /dev/null \
+            || { echo "::error::$f has a page with no pullRequest"; exit 1; }
+        done
+
+        jq -n --slurpfile t threads.json --slurpfile r reviews.json '
+          {
+            author:  ($t[0][0].data.repository.pullRequest.author.login // null),
+            isDraft: ($t[0][0].data.repository.pullRequest.isDraft // false),
+            # The gate bypasses maxi-config fan-out branches, whose reviewers
+            # are deliberately suppressed at source. `// null` rather than
+            # `// ""`: a branch name we could not read must not become a value
+            # that could be prefix-matched, and the gate treats a non-string as
+            # "not a fan-out branch" -- i.e. it still enforces.
+            headRefName: ($t[0][0].data.repository.pullRequest.headRefName // null),
+            # Names only, and only strings. A label list we could not read
+            # becomes [], which the gate treats as "no waiver applied" -- i.e.
+            # it still enforces. Fail closed, like every other field here.
+            labels: [ $t[0][0].data.repository.pullRequest.labels.nodes[]?
+                      | .name | select(type == "string") ],
+            threads: [ $t[0][] | .data.repository.pullRequest.reviewThreads.nodes[]
+                       | { isResolved, isOutdated,
+                           author: (.comments.nodes[0].author.login // null),
+                           path:   (.comments.nodes[0].path // null),
+                           url:    (.comments.nodes[0].url // null) } ],
+            reviews: [ $r[0][] | .data.repository.pullRequest.reviews.nodes[]
+                       | { author: (.author.login // null), state } ]
+          }' > payload.json
+
+        echo "collected $(jq '.threads|length' payload.json) thread(s), $(jq '.reviews|length' payload.json) review(s)"
+        echo "payload-path=$PWD/payload.json" >> "$GITHUB_OUTPUT"
