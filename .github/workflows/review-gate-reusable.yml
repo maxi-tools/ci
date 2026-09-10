@@ -193,10 +193,10 @@ jobs:
             ok_description: no unresolved review threads
             fail_description: unresolved review threads - resolve them
           - condition: non-author-review
-            check: 'per-run: get-a-non-author-review'
+            check: 'per-run: awaiting-non-author-review-bots-included'
             status_context: review-gate/non-author-review
             ok_description: reviewed by a non-author
-            fail_description: no non-author review yet - any review bot satisfies this
+            fail_description: no non-author review yet - resolves itself when any review bot posts; no human action needed
     # `per-run:` is load-bearing, not decoration.
     #
     # This gate judges the PR's CURRENT review state, so it re-runs on every
