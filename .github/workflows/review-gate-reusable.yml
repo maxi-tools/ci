@@ -327,11 +327,11 @@ jobs:
       #   contexts pending. A repository that needs fork PRs to be mergeable
       #   should require the check run as well as, or instead of, the status.
       #
-      #   TWO PRs AT ONE SHA share this context, because a status belongs to
-      #   the commit rather than to the pull request. This is a live gap, not a
-      #   curiosity: it is tracked, with the mechanism and a proposed
-      #   fail-closed fix, at maxi-tools/maxi-config#625. Deliberately not
-      #   restated here.
+      # A SECOND limit was listed here -- two open PRs at one head SHA sharing
+      # this context, because a status belongs to the commit rather than to the
+      # pull request, with the last writer deciding for both. It is CLOSED, by
+      # the guard in the publish step below; the reasoning lives with the
+      # guard. Tracked at maxi-tools/maxi-config#625.
       #
       # While a ruleset names the check run, this status is additive.
       - name: Publish the verdict as a commit status
@@ -353,6 +353,10 @@ jobs:
           # Empty unless a condition passed on a human's assertion rather than
           # on evidence -- today only `review-infra-unavailable`. See below.
           GATE_WAIVER: ${{ steps.gate.outputs.waiver }}
+          # Which pull request this run is entitled to speak for. The shared-SHA
+          # guard below needs it to tell "the open PRs at this commit" from
+          # "the open PRs at this commit that are not me".
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -425,12 +429,151 @@ jobs:
               exit 0
             fi
           fi
+          # FAIL CLOSED WHEN THIS COMMIT IS NOT THIS PULL REQUEST'S ALONE.
+          #
+          # A status belongs to the COMMIT. Two open PRs whose heads are the
+          # same commit share `review-gate/threads` and
+          # `review-gate/non-author-review`, statuses are last-write-wins per
+          # context, and so the run that posts last decides for BOTH. Push a
+          # second branch at the head of a PR that is red, open a throwaway PR
+          # from it, and that PR -- which has no review threads at all, and
+          # which the first review bot to look at satisfies -- publishes
+          # `success` over the red one. One extra branch, one extra PR, no race
+          # to win, durable until the two heads diverge. (maxi-tools/maxi-config#625.)
+          #
+          # The staleness guard immediately above cannot see this and is not
+          # broken: the throwaway PR's run genuinely IS the freshest run for
+          # this SHA. It is a newer evaluation -- of a different pull request.
+          #
+          # "It needs push access to post the status" is not a mitigation.
+          # Push access is precisely the population this gate exists to
+          # constrain: the gate's whole job is to stop someone who can already
+          # merge from merging their own unreviewed work.
+          #
+          # So: if any OTHER open PR has this head, publish `error` and no
+          # verdict. Three things make that the right shape rather than a
+          # bigger evaluation:
+          #
+          #   `error`, not `failure`, for the same reason the case above draws
+          #   that line -- the gate reached no verdict FOR THIS COMMIT, which
+          #   is not the sentence "this PR failed review". Both block a merge,
+          #   so telling them apart loosens nothing.
+          #
+          #   Every sharing PR's run computes the same `error` from the same
+          #   commit, so last-write-wins stops mattering: there are no longer
+          #   two answers for the race to choose between. That invariance, not
+          #   the ordering, is what closes the hole.
+          #
+          #   It blocks the innocent PR too, and that is the correct
+          #   direction, the same one the soft-supersede branch below takes:
+          #   the worst outcome becomes "two PRs wait until their heads
+          #   diverge", not "an unreviewed PR shows green".
+          #
+          # `.head.sha == env.HEAD_SHA` IS LOAD-BEARING, NOT BELT AND BRACES.
+          # That endpoint lists the open PRs ASSOCIATED with a commit, which
+          # includes every PR whose branch merely CONTAINS it -- so a stacked
+          # child counts, and an unfiltered count would publish `error` on a
+          # perfectly ordinary PR the moment someone branched off it. Measured
+          # on this repo: with #631 and #632 at a1271e7 and #636 stacked on top
+          # of #631, the unfiltered query returned all three and the filtered
+          # one returned exactly the two whose head IS that commit. Without the
+          # filter this guard would redden the normal case, which is a worse
+          # outcome than the bypass it closes. (cubic, on the PR that landed
+          # this.)
+          #
+          # ONLY THE VERDICT PUBLISHER NEEDS THIS. The `invalidate` job writes
+          # to the same shared contexts and is deliberately left alone: it
+          # writes `pending`, `pending` blocks a merge, and this step is the
+          # only place in this file that can write `success`. Guarding a writer
+          # that cannot produce a passing state buys nothing and costs every
+          # run an API call.
+          #
+          # FAILS CLOSED, unlike the staleness lookup above, and the difference
+          # is not a change of heart. That lookup fails open because
+          # `actions: read` is a scope a caller may genuinely not have granted
+          # yet -- consumers take this file at @main before their wrapper is
+          # updated. This lookup reads `pull-requests`, which this job has
+          # ALREADY spent: the collect step's GraphQL reads need it, and without
+          # them `steps.gate.outcome` is never `success`, so no caller can reach
+          # a passing publish without the scope this call wants. An unreadable
+          # answer here is therefore not a missing grant, it is an unanswered
+          # question about whose commit this is -- and a verdict may not be
+          # published without it. Retried first, because one API blip must not
+          # redden every PR in every consumer.
+          other_open_pulls_at_head() {
+            local raw="" attempt="" number="" n=0
+            for attempt in 1 2 3; do
+              if raw="$(gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls?per_page=100" \
+                --jq '.[] | select(.state == "open" and .head.sha == env.HEAD_SHA) | .number' 2>/dev/null)"; then
+                # Unquoted on purpose: the lookup emits one PR number per line
+                # and word splitting on whitespace is exactly the parse wanted.
+                for number in $raw; do
+                  [ "$number" = "${PR_NUMBER:-}" ] || n=$(( n + 1 ))
+                done
+                printf '%s' "$n"
+                return 0
+              fi
+              [ "$attempt" = 3 ] || sleep $(( attempt * 3 ))
+            done
+            printf 'failed'
+          }
+          others="$(other_open_pulls_at_head)"
+          if [ "$others" = failed ]; then
+            state=error
+            desc="could not check whether other open PRs share this head SHA"
+            echo "::warning::could not list the open pull requests at $HEAD_SHA; refusing to publish a verdict for a commit that may not be this PR's alone (maxi-tools/maxi-config#625)"
+          elif [ "$others" -gt 0 ]; then
+            state=error
+            desc="head SHA shared with $others other open PR(s); one commit status cannot decide for all of them"
+            echo "::warning::$HEAD_SHA is the head of $others open pull request(s) other than #${PR_NUMBER:-?}; publishing error rather than a verdict that would decide for all of them (maxi-tools/maxi-config#625)"
+          fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
             -f state="$state" \
             -f context="$STATUS_CONTEXT" \
             -f description="$desc" \
             -f target_url="$RUN_URL" >/dev/null
           echo "posted $STATUS_CONTEXT=$state for $HEAD_SHA"
+
+          # The guard above is a check-then-write too, and one PR lifecycle
+          # removed from the race the block below handles. A PR opened AFTER
+          # that lookup and before this POST is not in the count this run used,
+          # so a `success` written here is inherited by a PR that never earned
+          # it. The run-freshness re-check below catches that only once the new
+          # PR's own run has STARTED, which is seconds to minutes later.
+          #
+          # So ask the cheap question again, and if the answer CHANGED, take
+          # the context to `error`. Only from a `success`: `failure` and
+          # `error` already block, and rewriting them would spend an API call
+          # to change nothing. This does not close the race -- nothing here can
+          # -- it keeps it falling the same way as everything else in this
+          # step: the residual failure is "blocked until the heads diverge",
+          # never "an unreviewed PR shows green". (cubic, on the PR that landed
+          # this.)
+          #
+          # An unreadable answer HERE does not withdraw, where an unreadable
+          # answer before the write refuses to publish at all. The asymmetry is
+          # the evidence, not the appetite: before the write there was no
+          # answer, so a verdict could not be justified; here a successful
+          # lookup seconds ago said this commit was this PR's alone, and a blip
+          # is not evidence that changed. Withdrawing on no evidence would turn
+          # every API hiccup into a red gate. The cost of being wrong is also
+          # bounded: a PR opened in this window triggers its OWN gate run,
+          # whose `invalidate` job writes `pending` over anything standing
+          # here. This check shortens that window; it is not what closes it.
+          if [ "$state" = success ]; then
+            after_others="$(other_open_pulls_at_head)"
+            if [ "$after_others" = failed ]; then
+              echo "::warning::could not re-check the open PRs at $HEAD_SHA after publishing; leaving the verdict this run's earlier successful lookup justified"
+            elif [ "$after_others" -gt 0 ]; then
+              echo "::warning::the open PRs at $HEAD_SHA changed while $GITHUB_RUN_ID was publishing; withdrawing the verdict (maxi-tools/maxi-config#625)"
+              gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+                -f state="error" \
+                -f context="$STATUS_CONTEXT" \
+                -f description="head SHA became shared while this verdict was publishing" \
+                -f target_url="$RUN_URL" >/dev/null
+            fi
+          fi
 
           # The check above is a check-then-write, and it cannot be made atomic:
           # the statuses API has no compare-and-swap, so a run that starts
