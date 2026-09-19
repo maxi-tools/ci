@@ -10,10 +10,11 @@ description: >
   two reads do run once per condition. That is the price of a name that cannot
   be misread, on a job that is two GraphQL queries and a python script.
 
-  The tools preflight deliberately did NOT move here. The caller checks for gh
-  and posts a pending status with it BEFORE reaching this action; a composite
-  action cannot run earlier than the step that invokes it, so bundling the two
-  would leave that post unchecked on any lane where gh is absent.
+  The tools preflight deliberately did NOT move here. It provisions gh, and the
+  caller posts a pending status with gh BEFORE reaching this action; a
+  composite action cannot run earlier than the step that invokes it, so
+  bundling the two would leave that post unprovisioned on the NixOS lane, where
+  gh is absent from the default profile. (codex, #379.)
 
 inputs:
   github-token:
@@ -35,15 +36,15 @@ outputs:
       Path to the JSON payload this action wrote. Callers should pass THIS to
       the gate rather than re-spelling the filename: composite steps inherit
       the caller's working directory, so two independent relative paths agree
-      only while that stays true.
+      only while that stays true. (coderabbit, #379.)
     value: ${{ steps.collect.outputs.payload-path }}
 
 runs:
   using: composite
   steps:
     # No checkout: the action is referenced by its full owner/repo path, so
-    # the logic that judges a PR always comes from this repository's main and
-    # is never supplied by the pull request under test.
+    # the logic that judges a PR always comes from maxi-config's main and is
+    # never supplied by the pull request under test.
     - name: Collect reviews and review threads
       id: collect
       shell: bash
@@ -112,7 +113,7 @@ runs:
         # array. An error touching a nullable field -- thread metadata, one
         # review's author -- survives the shaping below and the gate would
         # pass on a collection that is explicitly untrustworthy. Reject any
-        # errors on ANY page, the way the fan-out verifier already does.
+        # errors on ANY page, the way scripts/verify_fanout.sh already does.
         #
         # EVERY page, not just the first: --paginate --slurp yields an array,
         # and checking .[0] alone would judge one page of many.
@@ -123,6 +124,53 @@ runs:
           jq -e 'all(.[]; .data.repository.pullRequest != null)' "$f" > /dev/null \
             || { echo "::error::$f has a page with no pullRequest"; exit 1; }
         done
+
+        # Fetch the PR's HEAD SHA so the roster status can be looked up.
+        # `review-roster` is a commit status, not a pull-request property,
+        # and the GraphQL `pullRequest.Commits` edge is its own paginated
+        # connection that would force a second cursor for no benefit. The
+        # REST shape gives us the head SHA directly and is the same API the
+        # gate's own status publisher below uses.
+        #
+        # Fails closed on a missing PR: a non-existent pullRequest is a
+        # malformed payload, the same shape the GraphQL checks above refuse.
+        gh api "repos/$OWNER/$REPO/pulls/$PR" --jq '.head.sha' > head_sha.txt
+        HEAD_SHA="$(tr -d '\r\n[:space:]' < head_sha.txt)"
+        if [ -z "$HEAD_SHA" ]; then
+          echo "::error::could not determine the head SHA for PR #$PR"
+          exit 1
+        fi
+
+        # Fetch the commit status for the head SHA. The status endpoint
+        # returns one entry per context, newest first. We pull down the
+        # full list and filter for `review-roster` rather than asking the
+        # API for that context directly: the API has no per-context
+        # endpoint, so an attempt to ask for one would either 404 or
+        # return the whole list anyway.
+        #
+        # FAILS OPEN on a roster lookup failure: the gate has an explicit
+        # `roster=absent` fallback (the pre-roster rule), and an unreadable
+        # status endpoint must not strand every gate run in the org on a
+        # transient API blip. The two GraphQL reads above are the load-
+        # bearing ones; this is a one-step optimisation on a path that
+        # already has a defined absence fallback.
+        #
+        # A genuine roster the script cannot parse still fails closed: the
+        # gate's parse_roster raises Malformed on a `band=...` description
+        # it cannot shape-match, and that propagates through evaluate().
+        # An UNRELATED status description ("reviewed by a non-author",
+        # etc.) returns None and lands on `roster=absent`.
+        if ! gh api "repos/$OWNER/$REPO/commits/$HEAD_SHA/statuses" \
+            > roster_statuses.json 2>/dev/null; then
+          echo "::warning::could not read commit statuses for $HEAD_SHA; gate will fall back to roster=absent"
+          ROSTER_DESCRIPTION=""
+        else
+          ROSTER_DESCRIPTION="$(
+            jq -r --arg ctx 'review-roster' \
+              '[.[] | select(.context == $ctx)][0].description // ""' \
+              roster_statuses.json
+          )"
+        fi
 
         jq -n --slurpfile t threads.json --slurpfile r reviews.json '
           {
@@ -147,6 +195,45 @@ runs:
             reviews: [ $r[0][] | .data.repository.pullRequest.reviews.nodes[]
                        | { author: (.author.login // null), state } ]
           }' > payload.json
+
+        # Embed the parsed roster (or the absence of one) into the payload
+        # as `roster`. The gate reads this field; absence means "no roster
+        # was published for this head SHA" and the gate falls back to the
+        # pre-roster rule with `roster=absent` in its output.
+        #
+        # The parsing lives here, in the collector, rather than in the
+        # gate -- the gate is a pure function of its payload. Putting the
+        # parser in the collector keeps a parse failure a step away from
+        # the gate's verdict logic and lets `tests/test_pr_review_gate.py`
+        # cover the parser's truth table independently of any I/O.
+        if [ -n "$ROSTER_DESCRIPTION" ]; then
+          echo "review-roster status present for $HEAD_SHA; parsing it into payload.roster"
+          # Write the description to a file so jq reads the description as
+          # data, not as a literal argument. An attacker-chosen roster
+          # description is one PR comment away from a `gh` argument; the
+          # file indirection keeps it in jq's input channel.
+          printf '%s' "$ROSTER_DESCRIPTION" > roster_desc.txt
+          if ! ROSTER_PARSED="$(
+            jq -R -r '
+              def parse:
+                if test("^band=[a-z]+\\s+asked=\\[[^\\]]*\\]\\s+skipped=\\[[^\\]]*\\]\\s+profiles=\\S+\\s*$") then
+                  capture("^band=[a-z]+\\s+asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=\\[(?<skipped>[^\\]]*)\\]\\s+profiles=\\S+\\s*$")
+                  | { asked: (.asked | split(",") | map(select(length > 0))),
+                      skipped: (.skipped | split(",") | map(select(length > 0))) }
+                else
+                  error("malformed review-roster description: " + .)
+                end;
+              parse
+            ' < roster_desc.txt
+          )"; then
+            echo "::error::review-roster description for $HEAD_SHA is not in the expected shape: $ROSTER_DESCRIPTION"
+            exit 1
+          fi
+          jq --argjson r "$ROSTER_PARSED" '. + {roster: $r}' payload.json > payload.json.tmp \
+            && mv payload.json.tmp payload.json
+        else
+          echo "no review-roster status for $HEAD_SHA; payload omits roster (gate will report roster=absent)"
+        fi
 
         echo "collected $(jq '.threads|length' payload.json) thread(s), $(jq '.reviews|length' payload.json) review(s)"
         echo "payload-path=$PWD/payload.json" >> "$GITHUB_OUTPUT"
