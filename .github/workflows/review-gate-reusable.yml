@@ -201,68 +201,41 @@ jobs:
       # `read` -- see the job-level rationale above.
       pull-requests: write
     steps:
-      # The script lives in maxi-tools/maxi-config, not in the consumer
-      # repo. Same sparse-checkout shape as maxi-review.yml uses to fetch
-      # the same helper: only the maxi-review/ directory, nothing else,
-      # which keeps the wire cost small on every gate run in every
-      # fanned-out consumer.
-      # `continue-on-error`, and the run step below is conditioned on this
-      # step's outcome rather than on the assumption that it succeeded.
+      # Composite action in this same repo, mirroring the
+      # collect-pr-review-state and pr-review-gate steps the `gate` job
+      # uses below. The script is co-located with action.yml at
+      # maxi-tools/ci/.github/actions/dedupe-pr-review-threads, so the
+      # reference below resolves at @main without a cross-repo checkout --
+      # which a reusable workflow's job GITHUB_TOKEN cannot make anyway
+      # (it is scoped to the consumer repo and 404s against
+      # maxi-tools/maxi-config). Measured 2026-09-19 on maxi-core#4348
+      # (run 35443912643, job 105914866589): the prior shape's
+      # `actions/checkout` of maxi-config answered `Not Found`, the run
+      # step then died with `No such file or directory` and exit 127, and
+      # the JOB failed -- so `gate: needs: [dedupe]` skipped the gate
+      # and the fix for that morning's org-wide startup failure would
+      # have shipped a gate that publishes no verdict at all, in 42
+      # repos.
       #
-      # A CONSUMER'S `GITHUB_TOKEN` CANNOT READ THE HELPER'S REPO. It is
-      # scoped to the repository the workflow runs in, so this checkout
-      # answers 404 -- `Not Found` -- in every fanned-out consumer, and
-      # succeeds only in the repo that owns the helper. Measured 2026-09-19 on
-      # maxi-core#4348: the checkout errored, the run step then died with
-      # `No such file or directory` and exit 127, and because only the RUN
-      # step carried `continue-on-error` the JOB failed. `gate: needs: [...,
-      # dedupe]` then skipped the gate outright -- so the fix for that
-      # morning's org-wide startup failure would have shipped a gate that
-      # publishes no verdict at all, in 42 repos.
-      #
-      # The job header above already asserts that the job itself succeeds on
-      # continue-on-error, so the gate's `needs: dedupe` is satisfied and the
-      # gate still runs. That was true of the run step and never of this one.
-      # Now it is true of both -- and the `if:` on the gate job below makes it
-      # true even when neither holds.
-      - name: Fetch maxi-review helper for dedupe
-        id: helper
+      # `continue-on-error` stays: this job may only ever make the gate
+      # LOOSER, never stricter, and the same fail-open discipline the
+      # prior shape had applies to this step's failure mode (a flaky
+      # GraphQL call, a transient bot-loop cap hit) as much as it did to
+      # the prior shape's 404. The job header above asserts the job
+      # succeeds on continue-on-error, which is what makes the gate's
+      # `needs: dedupe` satisfied and the gate still run -- a separate
+      # `if: !cancelled()` on the gate job below is what covers the case
+      # where THIS step is skipped outright (its own `if:` on fork PRs).
+      - name: Dedupe bot review threads
+        id: dedupe
+        if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: maxi-tools/ci/.github/actions/dedupe-pr-review-threads@main
         with:
-          repository: maxi-tools/maxi-config
-          path: .maxi-config
-          sparse-checkout: maxi-review
-          persist-credentials: false
-          token: ${{ github.token }}
-
-      - name: Run dedupe
-        if: ${{ !cancelled() && steps.helper.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          .maxi-config/maxi-review/dedupe-review-threads.py \
-            --owner "$GITHUB_REPOSITORY_OWNER" \
-            --repo "${GITHUB_REPOSITORY##*/}" \
-            --pr "$PR_NUMBER" \
-            --apply 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
-
-      # Named, because the two causes want different fixes. A 404 is "this
-      # consumer's token cannot read the helper's repo", which is the steady
-      # state until the helper lives somewhere a consumer token can reach --
-      # the composite actions this file already calls are exactly that shape.
-      # Anything else is worth opening the step log for.
-      - name: Say why the dedupe did not run
-        if: ${{ !cancelled() && steps.helper.outcome != 'success' }}
-        shell: bash
-        env:
-          HELPER_OUTCOME: ${{ steps.helper.outcome }}
-        run: |
-          set -euo pipefail
-          echo "::warning::the maxi-review helper could not be fetched (${HELPER_OUTCOME}); skipping the dedupe. The gate still runs -- this job only ever makes it looser, never stricter."
+          github-token: ${{ github.token }}
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          pr: ${{ github.event.pull_request.number }}
 
   gate:
     needs: [invalidate, dedupe]
