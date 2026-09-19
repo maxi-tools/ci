@@ -45,10 +45,13 @@ on:
         # wrong machines the day that hardware changes.
         #
         # This job is two API calls and a python script; nothing here is arch-
-        # or platform-specific. Any caller that wants a different lane can pass
-        # `runs_on`; this is a default, not a pin. Because this file is consumed
-        # @main, changing it takes effect everywhere without a fan-out.
-        default: '["self-hosted", "Linux", "X64"]'
+        # or platform-specific -- so no arch label either. `Linux` alone keeps
+        # Windows out and admits both Linux pools; measured 2026-09-18 the X64
+        # pool was 14/14 busy with 71 jobs queued while ARM64 had a slot idle.
+        # Any caller that wants a different lane can pass `runs_on`; this is a
+        # default, not a pin. Because this file is consumed @main, changing it
+        # takes effect everywhere without a fan-out.
+        default: '["self-hosted", "Linux"]'
 
 permissions: {}
 
