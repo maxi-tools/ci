@@ -156,8 +156,30 @@ jobs:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
+  # NOT ON THE FAN-OUT. A `maxi-config-sync/*` PR carries a byte-for-byte copy
+  # of a payload already tested on the canon, so building and testing the
+  # workspace in every consumer re-derives one answer ~38 times.
+  #
+  # Measured 2026-09-19: one distribute run touched 48 consumer PRs. With all
+  # 35 runners busy the resulting queue stalled unrelated work for 15+
+  # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
+  # not queue time, and rerun_stalled_jobs.py only catches a job a runner
+  # ACCEPTED and never started, not one that was never assigned.
+  #
+  # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
+  # AND the distributor identity. A head ref is chosen by whoever pushes the
+  # branch, so a prefix-only test would let anyone skip CI by naming a
+  # branch. The review lanes have applied this rule for months
+  # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
+  # and nothing recorded that as deliberate -- because it was not.
+  #
+  # `merge-gate` and `plan` still run, so the PR reports and can merge;
+  # `package` already tolerates check/test being skipped.
   check:
     needs: plan
+    if: >
+      !(startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
+        github.event.pull_request.user.login == 'maxi-tools-auth[bot]')
     uses: ./.github/workflows/lane-check.yml
     permissions:
       contents: read
@@ -171,8 +193,30 @@ jobs:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
+  # NOT ON THE FAN-OUT. A `maxi-config-sync/*` PR carries a byte-for-byte copy
+  # of a payload already tested on the canon, so building and testing the
+  # workspace in every consumer re-derives one answer ~38 times.
+  #
+  # Measured 2026-09-19: one distribute run touched 48 consumer PRs. With all
+  # 35 runners busy the resulting queue stalled unrelated work for 15+
+  # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
+  # not queue time, and rerun_stalled_jobs.py only catches a job a runner
+  # ACCEPTED and never started, not one that was never assigned.
+  #
+  # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
+  # AND the distributor identity. A head ref is chosen by whoever pushes the
+  # branch, so a prefix-only test would let anyone skip CI by naming a
+  # branch. The review lanes have applied this rule for months
+  # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
+  # and nothing recorded that as deliberate -- because it was not.
+  #
+  # `merge-gate` and `plan` still run, so the PR reports and can merge;
+  # `package` already tolerates check/test being skipped.
   test:
     needs: plan
+    if: >
+      !(startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
+        github.event.pull_request.user.login == 'maxi-tools-auth[bot]')
     uses: ./.github/workflows/lane-test.yml
     permissions:
       contents: read
