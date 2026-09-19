@@ -34,16 +34,31 @@ confidence. Every validation below therefore fails closed.
 
 import json
 import os
+import re
 import sys
 
 # A review in these states is not a review signal: PENDING has not been
 # submitted, and DISMISSED has been explicitly retracted.
 COUNTED_STATES = {'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'}
 
-# Head-branch prefix the config fan-out opens its pull requests on. It names
+# Head-branch prefix the maxi-config fan-out opens its pull requests on --
+# $sync_branch_prefix in maxi-config's scripts/sync-maxi-review.sh, which names
 # every branch it pushes 「maxi-config-sync/<manifest>」. Matched as a PREFIX and
 # not by equality on purpose: the manifest name is the second segment, so a
 # third manifest added later is covered without touching this file.
+#
+# RETIREMENT SCHEDULE (T4, maxi-config#735): this bypass is the only thing
+# stopping the fan-out from waiting forever for a reviewer that the roster
+# selector (T3, maxi-config#728, merged 2026-09-19) will deliberately skip.
+# It stays in place until T3 has been live on every repo for 14 days -- a
+# date set to 2026-10-03 -- so a PR whose head SHA lacks a `review-roster`
+# status still passes the gate on a fan-out branch. After 2026-10-03 the
+# selector is the single source of truth and this bypass can be removed
+# alongside the FANOUT_AUTHORS half of the security guard below. The fan-out
+# branch's `asked` list collapses to `[maxi-lint]` per the selector's
+# fast-path, and the rest of the reviewers are listed in `skipped` with
+# their canon reason -- the gate consumes that list directly once the
+# roster is required.
 FANOUT_BRANCH_PREFIX = 'maxi-config-sync/'
 
 # ...and the identity that opens them. The prefix alone is NOT sufficient: a
@@ -53,7 +68,7 @@ FANOUT_BRANCH_PREFIX = 'maxi-config-sync/'
 #
 # Spelled WITHOUT the 「[bot]」 suffix, which is not cosmetic. collect-pr-review-
 # state reads `author{login}` over GraphQL, and GraphQL returns a Bot actor's
-# bare slug -- verified against a live fan-out PR:
+# bare slug -- verified against a live fan-out PR (maxi-kvm#24):
 #     author: { login: 「maxi-tools-auth」, __typename: 「Bot」 }
 # The REST API spells the same actor 「maxi-tools-auth[bot]」, so both are
 # accepted: if the collection step is ever ported to REST the bypass keeps
@@ -72,13 +87,13 @@ FANOUT_AUTHORS = frozenset({'maxi-tools-auth', 'maxi-tools-auth[bot]'})
 # merely unmet on a Dependabot PR, it is unsatisfiable: no push can fix it,
 # because the next push is Dependabot's too.
 #
-# This is the same shape as the routers' `dependabot-fallback`, and for the
-# reason stated there: without it, a stricter gate turns 「dependency PRs merge
-# with no review signal」 into 「dependency PRs can never merge」.
+# This is the same shape as maxi-core ci.yml's `dependabot-fallback`, and for
+# the reason stated there: without it, a stricter gate turns 「dependency PRs
+# merge with no review signal」 into 「dependency PRs can never merge」.
 #
 # BOTH halves again, and the same GraphQL/REST split as FANOUT_AUTHORS -- the
 # collection step reads GraphQL, which gives a Bot actor's bare slug. Verified
-# on a live Dependabot PR:
+# on a live Dependabot PR (maxi-kvm#4):
 #     GraphQL author.login 「dependabot」   REST user.login 「dependabot[bot]」
 # Both accepted so a port of the collection step to REST cannot silently strand
 # every dependency PR; the bracketed form is unspoofable either way.
@@ -89,15 +104,16 @@ DEPENDABOT_AUTHORS = frozenset({'dependabot', 'dependabot[bot]'})
 # The escape hatch for "the review infrastructure is genuinely unavailable".
 #
 # It is honoured HERE, on condition 2, and deliberately nowhere else. Its
-# predecessor was honoured by the REVIEWER instead, through the review bot's
-# `bypass_label` default, and never by this gate. That inverted its own
-# purpose: the review bot is one of the non-author reviewers this condition
-# accepts, so the label removed a reviewer from the pool while leaving intact
-# the requirement that the pool be non-empty. A PR carrying it was strictly
-# LESS mergeable, in exactly the situation it was reached for.
+# predecessor -- `maxi-review-override` -- was honoured by the REVIEWER instead,
+# through maxi-reviewer's `bypass_label` default, and never by this gate. That
+# inverted its own purpose: `maxi-reviewer[bot]` is one of the non-author
+# reviewers this condition accepts, so the label removed a reviewer from the
+# pool while leaving intact the requirement that the pool be non-empty. A PR
+# carrying it was strictly LESS mergeable, in exactly the situation it was
+# reached for. Measured on maxi-config#536; see issue #555.
 #
-# So the capability moved to the half that is load-bearing. The review
-# workflow now passes `bypass_label: ""`, the reviewer never self-disables, and this label
+# So the capability moved to the half that is load-bearing. maxi-review.yml now
+# passes `bypass_label: ""`, the reviewer never self-disables, and this label
 # says what a human actually needs to say: "no reviewer can be summoned, stop
 # asking for one."
 #
@@ -123,9 +139,92 @@ REVIEW_INFRA_LABEL = 'review-infra-unavailable'
 #:
 #: Not applied to the draft, fan-out or Dependabot waivers. Those are structural
 #: facts about the PR that a reader can re-derive from the PR itself, and
-#: marking them would change the status description on every gate run in every
-#: consumer to fix a problem they do not have.
+#: marking them would change the status description on every gate run in ~31
+#: repos to fix a problem they do not have.
 WAIVED_PREFIX = 'WAIVED:'
+
+
+#: The roster the maxi-review selector publishes for every pull request, as a
+#: commit status with context `review-roster`. The selector is the
+#: generalisation of the fan-out bypass da0941c landed: instead of one
+#: head_ref/author pair hard-coded into this gate, the selector picks the
+#: reviewer set per PR and publishes the decision. The gate consumes the
+#: roster's `asked` set as its required non-author reviewers -- a roster that
+#: skips CodeRabbit on a trivial PR no longer leaves this gate waiting forever
+#: for a review that was never requested.
+#:
+#: Status description format (single line, from
+#: maxi-review/select-roster.py:summary):
+#:
+#:     band=<trivial|routine|complex> asked=[a,b,...] skipped=[c,d,...] profiles=<state>
+#:
+#: The gate only parses `asked=` and `skipped=`. `band=` and `profiles=` are
+#: for humans reading the PR face; an operator who needs to know WHY CodeRabbit
+#: was skipped follows the status's target_url into the run.
+ROSTER_CONTEXT = 'review-roster'
+
+#: Roster description regex. Tolerates whitespace between the four fields
+#: (band=, asked=, skipped=, profiles=) and an optional trailing newline the
+#: collector may append after the description -- the selector emits the four
+#: fields on one line with single spaces between them, but a hand-edited
+#: description with a final `\n` would otherwise fail to match. The selector
+#: never emits whitespace around `=`; matching `\s+` between the four fields
+#: is enough to survive a copy-paste through a markdown renderer, which is
+#: how a human-readable status gets re-pasted into the runner.
+#:
+#: Asked and skipped lists are bracket-delimited, comma-separated, may be
+#: empty, and the names are GitHub reviewer slugs (login or login[bot], both
+#: accepted as the GraphQL/REST split elsewhere in this file handles). The
+#: selector only ever emits bare slugs -- it reads GitHub logins, never the
+#: bracketed REST spelling -- so a `login[bot]` arriving in `asked` is the
+#: gate's bracketed-form allowance matching the GraphQL bare-slug spelling.
+ROSTER_DESCRIPTION_RE = re.compile(
+    r'^band=[a-z]+\s+'
+    r'asked=\[([^\]]*)\]\s+'
+    r'skipped=\[([^\]]*)\]\s+'
+    r'profiles=\S+'
+    r'\s*$'
+)
+
+
+def parse_roster(description):
+    """Parse a `review-roster` status description into (asked, skipped) lists.
+
+    Returns None when the description cannot be trusted to be a roster --
+    a None roster tells the gate to behave exactly as it did before T3,
+    failing closed to the old "any non-author review" rule.
+
+    Raises Malformed when the description LOOKS like a roster (the prefix
+    matches) but the body is unparseable. That is the dangerous shape: a
+    selector that is publishing the wrong thing in the right slot, which an
+    `ignored` rule would silently turn into a green gate.
+
+    The selector emits one reviewer per slot on main today. A future change
+    that adds whitespace between reviewers (`[a, b]` vs `[a,b]`) would still
+    parse -- the regex does not anchor on internal whitespace.
+    """
+    if not isinstance(description, str) or not description.strip():
+        return None
+    match = ROSTER_DESCRIPTION_RE.match(description.strip())
+    if not match:
+        # Decide between "this is not a roster description" and "this is a
+        # corrupted roster description". The selector never publishes anything
+        # that does not start with `band=`, so a description that doesn't is
+        # either an older status, an unrelated context, or human editing --
+        # all "not a roster". A description that DOES start with `band=` and
+        # then fails to match is a corruption and must fail closed.
+        if description.lstrip().startswith('band='):
+            raise Malformed(
+                'review-roster description is not in the expected shape: '
+                + repr(description)
+            )
+        return None
+
+    def _split(raw):
+        return [name for name in raw.split(',') if name]
+
+    return {'asked': _split(match.group(1)),
+            'skipped': _split(match.group(2))}
 
 
 class Malformed(Exception):
@@ -187,6 +286,33 @@ def evaluate(doc, only=ONLY_ALL):
     _require(isinstance(reviews, list), 'payload field "reviews" is not a list')
     _require(isinstance(threads, list), 'payload field "threads" is not a list')
 
+    # Roster is OPTIONAL. Absent field, None, or a non-object all mean "no
+    # roster was published for this head SHA" -- the gate falls back to the
+    # pre-roster rule and says `roster=absent` in its output. A present roster
+    # whose description cannot be parsed fails the whole evaluation closed
+    # (see parse_roster); the field's job here is to widen the verdict to
+    # one the gate cannot reach from the reviews alone.
+    raw_roster = doc.get('roster')
+    if raw_roster is None:
+        roster = None
+    else:
+        _require(isinstance(raw_roster, dict),
+                 'payload field "roster" is not an object')
+        _require('asked' in raw_roster and isinstance(raw_roster['asked'], list)
+                 and all(isinstance(n, str) for n in raw_roster['asked']),
+                 'payload field "roster.asked" is not a list of strings')
+        _require('skipped' in raw_roster and isinstance(raw_roster['skipped'], list)
+                 and all(isinstance(n, str) for n in raw_roster['skipped']),
+                 'payload field "roster.skipped" is not a list of strings')
+        # A roster that names no one as `asked` cannot impose a narrower rule
+        # than the old "any non-author review" rule -- an empty `asked` is
+        # indistinguishable from "the selector wanted no reviews at all", and
+        # treating it as a stricter rule would mean a missing review fails the
+        # gate even though the selector did not ask for one. Fall back to the
+        # pre-roster rule in this single case, and surface the empty list so a
+        # reader sees it.
+        roster = raw_roster
+
     lines = []
 
     if doc.get('isDraft') is True:
@@ -194,7 +320,7 @@ def evaluate(doc, only=ONLY_ALL):
 
     # The fan-out's own payload was reviewed in maxi-config, on the PR that
     # changed it. What lands here is a byte-for-byte copy of that payload in
-    # each consumer repository, opened by an app identity that never authors anything
+    # each of ~31 repos, opened by an app identity that never authors anything
     # else -- so the reviewers those PRs used to summon were re-reviewing one
     # already-reviewed diff thirty-one times. Suppressing them (CodeRabbit's
     # ignore_usernames/ignore_title_keywords, and maxi-review's own head_ref
@@ -211,7 +337,7 @@ def evaluate(doc, only=ONLY_ALL):
     # PRs the fan-out opens; it does not say who opened them, and a head ref is
     # attacker-chosen. Prefix alone would have turned this bypass into a way for
     # anyone able to push a branch -- in a repo whose gate exists precisely to
-    # stop unreviewed merges -- to name themselves past it.
+    # stop unreviewed merges -- to name themselves past it. (maxi-reviewer, #468.)
     head_ref = doc.get('headRefName')
     if (isinstance(head_ref, str)
             and head_ref.startswith(FANOUT_BRANCH_PREFIX)
@@ -275,6 +401,34 @@ def evaluate(doc, only=ONLY_ALL):
         if who not in reviewers:
             reviewers.append(who)
 
+    # Roster narrows condition 2 to the selectors asked set, when one is
+    # present AND non-empty. An absent roster or an empty asked list both fall
+    # back to the pre-roster rule: any non-author review suffices. A `skipped`
+    # reviewer that happens to run (e.g. a dashboard-only bot whose lane is
+    # not gated by the roster) STILL appears in `reviewers` -- the listing is
+    # who actually reviewed, not the gate's required set -- but it does NOT
+    # end up in `covered`, because the asked set is what the gate waits for.
+    # That is the difference between "this bot was deliberately skipped" and
+    # "this bot silently failed": the roster says the first, the absence of
+    # a status says the second, and the gate honours whichever signal it sees.
+    # `active_roster` is the roster dict that applies, or None. Computed
+    # once and read by every branch below, so a typo in one branch does
+    # not silently desync from the others.
+    if roster is not None and roster.get('asked'):
+        active_roster = roster
+        # Match the bracket-tolerant GraphQL/REST split the FANOUT_AUTHORS
+        # block above already handles: a roster entry is a bare slug, and
+        # REST-port code may spell the same actor with `[bot]`. The
+        # intersection accepts both, just like the existing author checks.
+        asked_logins = {name.removesuffix('[bot]')
+                        for name in active_roster['asked']}
+        covered = [name for name in reviewers
+                   if name.removesuffix('[bot]') in asked_logins]
+    else:
+        active_roster = None
+        asked_logins = None
+        covered = list(reviewers)
+
     ok = True
 
     if only in (ONLY_ALL, ONLY_THREADS) and unresolved:
@@ -295,7 +449,7 @@ def evaluate(doc, only=ONLY_ALL):
         lines.append('ok: no unresolved review threads (' + str(len(threads)) + ' total)')
 
     if (only in (ONLY_ALL, ONLY_REVIEWER)
-            and not reviewers and not dependabot and not infra_waiver):
+            and not covered and not dependabot and not infra_waiver):
         ok = False
         self_reviews = sum(
             1 for rv in reviews
@@ -303,30 +457,67 @@ def evaluate(doc, only=ONLY_ALL):
             and isinstance(rv.get('state'), str)
             and rv['state'].upper() in COUNTED_STATES
         )
-        lines.append('FAIL: no review from anyone other than the author (' + author + ').')
-        if self_reviews:
-            lines.append('  ' + str(self_reviews) + ' review(s) found, but all are by the author.')
-            lines.append('  Self-review is not review. Every agent lane in this org')
-            lines.append('  authenticates as the same account, so this is the common case.')
+        if asked_logins is not None:
+            # Roster present and non-empty: the FAIL has to name the asked
+            # set so an operator knows which reviewer to summon. The gate is
+            # here because nobody on the asked list has reviewed -- a
+            # `skipped` reviewer that ran anyway would NOT be in `covered`
+            # (covered is reviewers ∩ asked), but its presence in
+            # `reviewers` did not satisfy the required set. Surface that
+            # distinction so a triage reader does not chase a reviewer the
+            # roster said to skip.
+            lines.append('FAIL: roster asked for ' +
+                         ', '.join(sorted(active_roster['asked'])) +
+                         ' but none of them has reviewed.')
+            lines.append('  No human approval is wanted; a COMMENTED review from any')
+            lines.append('  reviewer on the asked list satisfies this. Pushing a')
+            lines.append('  commit is usually enough to summon them.')
         else:
-            lines.append('  No reviews at all. This does NOT need a human approval:')
-            lines.append('  a COMMENTED review from any review bot satisfies it. Pushing')
-            lines.append('  a commit is usually enough to summon them.')
-    elif only in (ONLY_ALL, ONLY_REVIEWER) and not reviewers and dependabot:
+            lines.append('FAIL: no review from anyone other than the author (' + author + ').')
+            if self_reviews:
+                lines.append('  ' + str(self_reviews) + ' review(s) found, but all are by the author.')
+                lines.append('  Self-review is not review. Every agent lane in this org')
+                lines.append('  authenticates as the same account, so this is the common case.')
+            else:
+                lines.append('  No reviews at all. This does NOT need a human approval:')
+                lines.append('  a COMMENTED review from any review bot satisfies it. Pushing')
+                lines.append('  a commit is usually enough to summon them.')
+    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered and dependabot:
         # Dependabot is checked before the label so a Dependabot PR that also
         # carries the label is still reported by its structural reason, which
         # is the true one and needs no human to have asserted anything.
         lines.append('ok: dependabot pull request - the review lanes cannot run '
                      'without Dependabot secrets, so no reviewer can be summoned')
-    elif only in (ONLY_ALL, ONLY_REVIEWER) and not reviewers:
+    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered:
         # Reached only under the infrastructure waiver -- the branches above own
         # every other reviewer-less case.
         lines.append(WAIVED_PREFIX + ' ' + REVIEW_INFRA_LABEL
                      + ' - no non-author review; merging on the assertion that '
                        'no reviewer could be summoned')
     elif only in (ONLY_ALL, ONLY_REVIEWER):
-        lines.append('ok: reviewed by ' + str(len(reviewers)) + ' non-author reviewer(s): '
-                     + ', '.join(sorted(reviewers)))
+        # The roster-aware line names only the asked reviewers that DID
+        # review, not the full `reviewers` set -- `skipped` reviewers are
+        # deliberately not in the asked list, and reporting them here would
+        # confuse a reader who reads "X reviewed" without the roster context
+        # and assumes X was required. The roster context goes on the line
+        # below.
+        listed = sorted(covered) if asked_logins is not None else sorted(reviewers)
+        lines.append('ok: reviewed by ' + str(len(listed)) + ' non-author reviewer(s): '
+                     + ', '.join(listed))
+        if asked_logins is not None:
+            # Surface the roster shape on every passing line: a reader of the
+            # log who can see CodeRabbit skipped it knows the gate was not
+            # waiting for CodeRabbit. Naming `skipped=` here would also be
+            # correct but adds noise on PRs where `skipped=[]`; keep the
+            # one-line summary tight and put `profiles=` in the workflow's
+            # own step summary instead. `asked=` already shows up via the
+            # FAIL branch above; the PASS branch repeats the size so a
+            # reader scanning the log sees how many reviewers the roster
+            # asked for.
+            lines.append('  roster=present asked=' + str(len(active_roster['asked']))
+                         + ' skipped=' + str(len(active_roster['skipped'])))
+        else:
+            lines.append('  roster=absent - behaving as before the roster selector shipped')
 
     return ok, lines
 
