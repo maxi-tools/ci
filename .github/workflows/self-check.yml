@@ -1,0 +1,60 @@
+# This repository had no CI of its own.
+#
+# Every other file here is a `workflow_call` reusable, so none of them runs on
+# a pull request. A change landed with three review-bot checks -- CodeRabbit,
+# cubic, qlty -- and nothing that read the YAML. Meanwhile ~48 repositories
+# execute these files at a pinned sha.
+#
+# It showed. PR #10 shipped the fan-out guard comparing `user.login` against
+# a bot name, in a file whose own `plan` job pins its owner by NUMERIC ID and
+# says why three lines further up. Nothing here objected. It was caught by
+# Codacy, days later, on maxi-config's mirror of the same file -- by accident
+# of the mirror existing, not by any gate in this repository.
+#
+# HOSTED, not self-hosted, and deliberately. This repository is PUBLIC, which
+# is the entire reason it exists (GitHub will not resolve a `uses:` from a
+# public repository into a private one). Fork pull requests are therefore
+# expected here, and fork code must never reach the org's self-hosted fleet.
+# actionlint takes seconds, so the hosted cost is small and the isolation is
+# worth more than the minutes.
+name: Self-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only. This lane only reads YAML; a token that can write is a token a
+# fork pull request could aim at something.
+permissions:
+  contents: read
+
+concurrency:
+  group: self-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Nothing here pushes, so the runner should not carry the credential
+          # into .git/config.
+          persist-credentials: false
+
+      - name: actionlint
+        # Reads every workflow, checks expression syntax, and shellchecks the
+        # `run:` blocks. A malformed `if:` in a reusable is not a local bug --
+        # it is ~48 repositories failing at once.
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          files: ".github/workflows/*.yml"
+          fail-on-error: true
+
+      - name: Check `uses:` references
+        # Two properties actionlint does not cover: that a relative call
+        # resolves inside this repository, and that every external action is
+        # sha-pinned. Both fail somewhere other than here.
+        run: python3 .github/scripts/check_workflow_refs.py
