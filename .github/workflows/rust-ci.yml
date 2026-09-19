@@ -167,9 +167,18 @@ jobs:
   # ACCEPTED and never started, not one that was never assigned.
   #
   # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
-  # AND the distributor identity. A head ref is chosen by whoever pushes the
-  # branch, so a prefix-only test would let anyone skip CI by naming a
-  # branch. The review lanes have applied this rule for months
+  # AND the distributor identity, matched by NUMERIC ID. That file is
+  # explicit -- "Stable GitHub database ID is canonical ... A login can be
+  # changed; this cannot" -- and the `plan` job above already pins its owner
+  # the same way. The first cut of this guard compared `user.login`, which
+  # would have handed the skip to whoever next claimed the name
+  # `maxi-tools-auth`. `github.event_name` is now tested explicitly rather
+  # than leaning on a null `pull_request` object coercing to false on push
+  # and workflow_dispatch.
+  #
+  # A head ref is chosen by whoever pushes the branch, so a prefix-only test
+  # would let anyone skip CI by naming a branch. The review lanes have
+  # applied this rule for months
   # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
   # and nothing recorded that as deliberate -- because it was not.
   #
@@ -178,8 +187,9 @@ jobs:
   check:
     needs: plan
     if: >
-      !(startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
-        github.event.pull_request.user.login == 'maxi-tools-auth[bot]')
+      !(github.event_name == 'pull_request' &&
+        startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
+        github.event.pull_request.user.id == 264883562)
     uses: ./.github/workflows/lane-check.yml
     permissions:
       contents: read
@@ -204,9 +214,18 @@ jobs:
   # ACCEPTED and never started, not one that was never assigned.
   #
   # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
-  # AND the distributor identity. A head ref is chosen by whoever pushes the
-  # branch, so a prefix-only test would let anyone skip CI by naming a
-  # branch. The review lanes have applied this rule for months
+  # AND the distributor identity, matched by NUMERIC ID. That file is
+  # explicit -- "Stable GitHub database ID is canonical ... A login can be
+  # changed; this cannot" -- and the `plan` job above already pins its owner
+  # the same way. The first cut of this guard compared `user.login`, which
+  # would have handed the skip to whoever next claimed the name
+  # `maxi-tools-auth`. `github.event_name` is now tested explicitly rather
+  # than leaning on a null `pull_request` object coercing to false on push
+  # and workflow_dispatch.
+  #
+  # A head ref is chosen by whoever pushes the branch, so a prefix-only test
+  # would let anyone skip CI by naming a branch. The review lanes have
+  # applied this rule for months
   # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
   # and nothing recorded that as deliberate -- because it was not.
   #
@@ -215,8 +234,9 @@ jobs:
   test:
     needs: plan
     if: >
-      !(startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
-        github.event.pull_request.user.login == 'maxi-tools-auth[bot]')
+      !(github.event_name == 'pull_request' &&
+        startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
+        github.event.pull_request.user.id == 264883562)
     uses: ./.github/workflows/lane-test.yml
     permissions:
       contents: read
