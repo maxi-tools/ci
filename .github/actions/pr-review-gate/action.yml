@@ -28,9 +28,9 @@ runs:
     # Inputs go through `env:`, never into the script text. `${{ }}` is
     # substituted BEFORE bash parses the line, so quoting the expansion does
     # not contain a hostile value -- it is already part of the program by then.
-    # As env vars they are data to bash, whatever they contain (CWE-94). An
-    # unknown --only value still fails closed in the script rather than
-    # widening or narrowing what is judged.
+    # As env vars they are data to bash, whatever they contain. (coderabbit,
+    # CWE-94, #379.) An unknown --only value still fails closed in the script
+    # rather than widening or narrowing what is judged.
     - id: judge
       shell: bash
       env:
