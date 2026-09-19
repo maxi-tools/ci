@@ -154,8 +154,80 @@ jobs:
             echo "posted $context=pending for $HEAD_SHA"
           done
 
-  gate:
+  # Dedupe bot review threads that hit the same lines in the same round.
+  # When two or more review bots flag the same code, every thread still
+  # has to be replied to and resolved before the gate below goes green.
+  # This job posts the duplicate-of reply and resolves the LATER
+  # thread, so the count the gate sees reflects the underlying findings
+  # rather than the multi-bot coverage of each one.
+  #
+  # Runs BEFORE the gate job so its count step sees the post-dedupe
+  # state. The dedupe does its own GraphQL reads, so it does not share
+  # state with the gate; the only ordering is "dedupe finished before
+  # the count is taken".
+  #
+  # `continue-on-error` on the run step: this job may only ever make the
+  # gate LOOSER, never stricter. A failure here must not turn a green
+  # gate red -- the gate's verdict is the thing that matters; this step
+  # is a cleanup that helps the gate pass on a PR it would otherwise
+  # block. The job itself succeeds on `continue-on-error`, so the gate's
+  # `needs: dedupe` is satisfied and the gate still runs.
+  #
+  # SKIPPED on fork PRs (`head.repo.full_name == github.repository`).
+  # The dedupe needs `pull-requests: write` to post the reply and
+  # resolve the thread, which a fork PR's read-only `GITHUB_TOKEN`
+  # cannot carry. Running on a fork would either silently no-op (the
+  # mutations fail closed, the dedupe run is suppressed by
+  # `continue-on-error`, the gate still runs) or fail outright -- both
+  # worse than skipping. Fork contributors get the same green-or-red the
+  # gate always was; same-repo PRs (where multi-bot coverage is densest
+  # and the dedupe matters most) get the full treatment. (maxi-review
+  # uses the same `if:` shape to gate App-token work; see its own
+  # App-token step.)
+  dedupe:
+    name: 'per-run: dedupe bot review threads'
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
     needs: invalidate
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      # WRITE: the dedupe posts replies (addPullRequestReviewThreadReply)
+      # and resolves threads (resolveReviewThread). The gate job stays on
+      # `read` -- see the job-level rationale above.
+      pull-requests: write
+    steps:
+      # The script lives in maxi-tools/maxi-config, not in the consumer
+      # repo. Same sparse-checkout shape as maxi-review.yml uses to fetch
+      # the same helper: only the maxi-review/ directory, nothing else,
+      # which keeps the wire cost small on every gate run in every
+      # fanned-out consumer.
+      - name: Fetch maxi-review helper for dedupe
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: maxi-tools/maxi-config
+          path: .maxi-config
+          sparse-checkout: maxi-review
+          persist-credentials: false
+          token: ${{ github.token }}
+
+      - name: Run dedupe
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          .maxi-config/maxi-review/dedupe-review-threads.py \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --repo "${GITHUB_REPOSITORY##*/}" \
+            --pr "$PR_NUMBER" \
+            --apply 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    needs: [invalidate, dedupe]
     # The check name IS the spec.
     #
     # "review gate" told a reader nothing, so both humans and review bots read
