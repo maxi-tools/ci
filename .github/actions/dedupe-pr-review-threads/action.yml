@@ -1,0 +1,61 @@
+name: Dedupe bot PR review threads
+description: >-
+  Collapse bot review threads that hit the same (path, line window) into one
+  keeper thread per cluster, by posting a duplicate-of reply and resolving the
+  later thread. So the review gate's unresolved-thread count reflects the
+  underlying findings rather than the multi-bot coverage of each one.
+
+  Carried into maxi-tools/ci so a consumer repo's GITHUB_TOKEN can run it
+  without reading another repo. The previous shape -- `actions/checkout` of
+  maxi-tools/maxi-config from inside a reusable workflow's `dedupe` job --
+  404'd in every consumer, because a reusable workflow cannot elevate the
+  caller-repository's token past its own scope. The composite action that the
+  reusable workflow already calls (collect-pr-review-state, pr-review-gate)
+  ships its helper in the same repo, which is what this action does too.
+
+  Source of truth for the script: this directory. maxi-tools/maxi-config still
+  carries a copy at maxi-review/dedupe-review-threads.py because maxi-config's
+  own .github/workflows/maxi-review.yml runs in a context where the GITHUB_TOKEN
+  IS scoped to maxi-config and can therefore read its own copy; removing it
+  would break that workflow.
+
+inputs:
+  github-token:
+    description: "Token for the GraphQL reads and the mutations. Needs scope: pull-requests write."
+    required: true
+  owner:
+    description: "Repository owner login."
+    required: true
+  repo:
+    description: "Repository name."
+    required: true
+  pr:
+    description: "Pull request number."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # No checkout. A composite action referenced by full owner/repo path lands
+    # on the runner with its own files at ${{ github.action_path }}, which is
+    # exactly where the script lives in this directory -- no extra step needed.
+    # The script is copied byte-for-byte from
+    # maxi-tools/maxi-config@main:maxi-review/dedupe-review-threads.py so a
+    # re-run that finds a thread we previously resolved on a maxi-config run
+    # still recognises its sentinel (`<!-- maxi-config:dedupe -->`). Changing
+    # the sentinel would invalidate every thread we have already marked, which
+    # is a strictly larger behavioural change than the cross-repo checkout
+    # this action replaces.
+    - name: Run dedupe
+      id: dedupe
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr }}
+      run: |
+        set -euo pipefail
+        python3 "${{ github.action_path }}/dedupe_review_threads.py" \
+          --owner "${{ inputs.owner }}" \
+          --repo "${{ inputs.repo }}" \
+          --pr "${{ inputs.pr }}" \
+          --apply 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
