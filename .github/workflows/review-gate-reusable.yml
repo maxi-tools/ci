@@ -206,7 +206,28 @@ jobs:
       # the same helper: only the maxi-review/ directory, nothing else,
       # which keeps the wire cost small on every gate run in every
       # fanned-out consumer.
+      # `continue-on-error`, and the run step below is conditioned on this
+      # step's outcome rather than on the assumption that it succeeded.
+      #
+      # A CONSUMER'S `GITHUB_TOKEN` CANNOT READ THE HELPER'S REPO. It is
+      # scoped to the repository the workflow runs in, so this checkout
+      # answers 404 -- `Not Found` -- in every fanned-out consumer, and
+      # succeeds only in the repo that owns the helper. Measured 2026-09-19 on
+      # maxi-core#4348: the checkout errored, the run step then died with
+      # `No such file or directory` and exit 127, and because only the RUN
+      # step carried `continue-on-error` the JOB failed. `gate: needs: [...,
+      # dedupe]` then skipped the gate outright -- so the fix for that
+      # morning's org-wide startup failure would have shipped a gate that
+      # publishes no verdict at all, in 42 repos.
+      #
+      # The job header above already asserts that the job itself succeeds on
+      # continue-on-error, so the gate's `needs: dedupe` is satisfied and the
+      # gate still runs. That was true of the run step and never of this one.
+      # Now it is true of both -- and the `if:` on the gate job below makes it
+      # true even when neither holds.
       - name: Fetch maxi-review helper for dedupe
+        id: helper
+        continue-on-error: true
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: maxi-tools/maxi-config
@@ -216,7 +237,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Run dedupe
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.helper.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -229,8 +250,40 @@ jobs:
             --pr "$PR_NUMBER" \
             --apply 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Named, because the two causes want different fixes. A 404 is "this
+      # consumer's token cannot read the helper's repo", which is the steady
+      # state until the helper lives somewhere a consumer token can reach --
+      # the composite actions this file already calls are exactly that shape.
+      # Anything else is worth opening the step log for.
+      - name: Say why the dedupe did not run
+        if: ${{ !cancelled() && steps.helper.outcome != 'success' }}
+        shell: bash
+        env:
+          HELPER_OUTCOME: ${{ steps.helper.outcome }}
+        run: |
+          set -euo pipefail
+          echo "::warning::the maxi-review helper could not be fetched (${HELPER_OUTCOME}); skipping the dedupe. The gate still runs -- this job only ever makes it looser, never stricter."
+
   gate:
     needs: [invalidate, dedupe]
+    # RUNS EVEN IF `dedupe` DID NOT.
+    #
+    # A `needs:` dependency that is skipped or failed skips the dependent job
+    # unless it opts out, and `dedupe` is skipped by its own `if:` on every
+    # FORK pull request. So since that job landed the gate has not run on a
+    # fork at all -- the exact opposite of the "fork contributors get the same
+    # green-or-red the gate always was" the dedupe's own header claims. The
+    # two `continue-on-error`s above cover the failure path; only this covers
+    # the skip, and a lost runner or a timeout defeats both of them.
+    #
+    # It also runs when `invalidate` failed, in the same direction and for the
+    # same reason: `invalidate` only writes `pending`, and a gate that reaches
+    # a real verdict is strictly better than one that skips because the
+    # placeholder could not be written.
+    #
+    # This job's verdict is the only thing in this file that decides anything.
+    # Nothing upstream of it may be able to take it off the board.
+    if: ${{ !cancelled() }}
     # The check name IS the spec.
     #
     # "review gate" told a reader nothing, so both humans and review bots read
