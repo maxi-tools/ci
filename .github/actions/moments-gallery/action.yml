@@ -1,0 +1,110 @@
+name: Moments gallery
+description: >-
+  Turn a moments manifest + a directory of PNG frames into a self-contained
+  static HTML gallery (one file, no build step, relative image paths) that a
+  person can open from a downloaded artifact or browse on GitHub Pages.
+
+  Designed for e2e lanes that already capture per-moment state: voicemaci's
+  `hud-e2e` (SVG draw-list snapshots rasterised to PNG) and `hud-desktop-e2e`
+  (real-window PNGs with overlay state beside each) are the first two
+  callers, but the schema and the renderer are agnostic to the producer.
+
+  Inputs are kept few on purpose: the manifest carries everything the
+  gallery needs to render, `root` is the directory the manifest paths are
+  resolved against, `name` is the lane label written into the HTML header
+  and used as the artifact name, and `summary_thumbnails` is the number of
+  inline base64 thumbnails written to the job summary (GitHub renders
+  <img> in summaries; images cannot be linked from an artifact, so the
+  first few are embedded). Pages deploys are deliberately NOT inside this
+  action -- the caller composes a separate `actions/deploy-pages` step
+  with `data/index.html` as the entry, the same way `pr-review-gate`'s
+  callers compose `actions/checkout` themselves. That keeps Pages policy
+  in the caller and this action usable without `pages: write`.
+
+  Why a composite action rather than a reusable workflow: the renderer is
+  one script with no secrets and no cross-lane policy. A reusable workflow
+  would force callers to hand it permissions they do not need and would
+  not let them drop the action into the same job as the producer that
+  already has the frames on disk. The action runs in the caller's
+  checkout so it sees the producer's output directory without a handoff.
+
+  Reuse: this action replaces the per-repo gallery HTML written by
+  `maxi-e2e/scripts/gallery_generator.py`, the `ReviewGallery` template
+  inside `maxi-e2e-gallery`, the per-page HTML that `tools/glass-gallery`
+  emits, and the bespoke page layout `maxi-ui`'s
+  `tools/waterui_gallery_snapshot.sh` produces for the WaterUI gallery's
+  artifacts. The WaterUI gallery's manifest schema
+  (`maxi-ui.waterui-gallery.v1`) is intentionally NOT extended by this
+  schema -- that schema is a renderer-test contract (capture receipts,
+  expected sections) and the moments schema is a test-result-timeline
+  contract (scenarios, claims, frames as a filmstrip), so a single
+  versioning lineage would carry the cost without buying the reader
+  anything. Both schemas share the same versioned-naming convention
+  `maxi-tools.<thing>.vN`. See `docs/moments-gallery.md` for the schema
+  definition, an example, and the upgrade path for each existing gallery.
+
+  Inputs that carry arbitrary values (paths, names, JSON) are passed via
+  `env:` so that bash sees them as data rather than as program text
+  expanded before the script is parsed (CWE-94). A hostile manifest
+  cannot inject shell.
+
+runs:
+  using: composite
+  steps:
+    - name: Render the moments gallery
+      id: render
+      shell: bash
+      env:
+        GALLERY_MANIFEST: ${{ inputs.manifest }}
+        GALLERY_ROOT: ${{ inputs.root }}
+        GALLERY_NAME: ${{ inputs.name }}
+        GALLERY_SUMMARY_THUMBNAILS: ${{ inputs.summary_thumbnails }}
+        GALLERY_SCRIPT: ${{ github.action_path }}/moments_gallery.py
+      run: python3 "$GALLERY_SCRIPT"
+    - name: Upload gallery artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.name }}-${{ github.run_id }}
+        path: ${{ steps.render.outputs.out_dir }}
+        if-no-files-found: warn
+        retention-days: 14
+
+inputs:
+  manifest:
+    description: >-
+      Path (relative to `root`) of the moments manifest. The schema is
+      `maxi-tools.moments-gallery.v1`; see the action's `docs/` for the
+      full definition and an example. The manifest's `scenarios[].moments[]`
+      image paths are resolved relative to `root`, and the rendered HTML's
+      image references are resolved relative to the gallery output.
+    required: true
+  root:
+    description: >-
+      Directory the manifest is read from and the moment PNG paths are
+      resolved against. The gallery output is written under
+      `<root>/<name>-gallery/` and the artifact upload references that
+      directory.
+    required: true
+  name:
+    description: >-
+      Gallery name. Used as the lane label in the HTML header, as the
+      artifact name suffix, and (when the caller adds a Pages step) as
+      the Pages sub-path under `<repo>/gallery/<name>/`.
+    required: true
+  summary_thumbnails:
+    description: >-
+      How many inline base64 thumbnails to embed in the job summary (one
+      per scenario, up to this count). GitHub renders `<img>` in job
+      summaries but cannot resolve image URLs that point into an artifact,
+      so a handful are embedded directly. 0 disables the section.
+    required: false
+    default: '3'
+
+outputs:
+  out_dir:
+    description: Absolute path of the rendered gallery directory.
+    value: ${{ steps.render.outputs.out_dir }}
+  html_path:
+    description: Absolute path of the rendered `index.html`.
+    value: ${{ steps.render.outputs.html_path }}

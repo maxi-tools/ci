@@ -39,6 +39,7 @@ credentials.
   fetch-policy/                pulls policy files over the Contents API
   collect-pr-review-state/     two paginated GraphQL reads
   pr-review-gate/              the verdict logic and its truth table
+  moments-gallery/             static HTML gallery from a moments manifest
 ```
 
 Everything these workflows *decide with* stays in the private `maxi-config`
