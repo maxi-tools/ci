@@ -122,19 +122,42 @@ jobs:
           # exist. Accept a comma-separated string (the real shape) and,
           # defensively, a JSON list should the input ever become one.
           # An unset input serialises as "null".
-          if [ -n "$EXTRA_REPOS_JSON" ] && [ "$EXTRA_REPOS_JSON" != "null" ]; then
-            while IFS= read -r r; do
-              [ -n "$r" ] && args+=(--consumer-repo "$r")
-            done < <(printf '%s' "$EXTRA_REPOS_JSON" | python3 -c '
-          import json, sys
+          # Decoded into a variable FIRST: a failure inside `< <(...)` is
+          # invisible to `set -e`, and an empty consumer list means the
+          # whole inventory -- so a typo in the dispatch box would have
+          # fanned out to ~48 repositories. `$(...)` under set -e aborts.
+          # "null" is the push/schedule case (no inputs at all); '""' is a
+          # dispatch with the box left blank. Both mean the whole inventory.
+          if [ -n "$EXTRA_REPOS_JSON" ] && [ "$EXTRA_REPOS_JSON" != "null" ] && [ "$EXTRA_REPOS_JSON" != '""' ]; then
+            names="$(printf '%s' "$EXTRA_REPOS_JSON" | python3 -c '
+          import json, re, sys
           v = json.load(sys.stdin)
+          # A string that is itself JSON-list text (someone typed
+          # ["a/b","c/d"] into the box) is opened before splitting.
+          if isinstance(v, str) and v.lstrip().startswith("["):
+              v = json.loads(v)
           items = v if isinstance(v, list) else [v]
-          for item in items:
-              for name in str(item).split(","):
-                  name = name.strip()
-                  if name:
-                      print(name)
-          ')
+          names = [n.strip() for item in items for n in str(item).split(",")]
+          names = [n for n in names if n]
+          # Every name must be owner/repo. This is the check that would
+          # have refused "m", "a", "x", "i" ... on 35504357184.
+          bad = [n for n in names if not re.fullmatch(r"[\w.-]+/[\w.-]+", n)]
+          if bad:
+              sys.exit(f"consumer_repo: not owner/repo: {bad}")
+          for n in names:
+              print(n)
+          ')"
+            n_consumers=0
+            while IFS= read -r r; do
+              if [ -n "$r" ]; then
+                args+=(--consumer-repo "$r")
+                n_consumers=$((n_consumers + 1))
+              fi
+            done <<< "$names"
+            if [ "$n_consumers" -eq 0 ]; then
+              echo "::error::consumer_repo was given but decoded to nothing; refusing to fall back to the whole inventory"
+              exit 1
+            fi
           fi
           # --json selects the report format: one JSON row per consumer,
           # AFTER execution, each with an `outcome`. Until ci#29 the
@@ -173,7 +196,7 @@ jobs:
           for r in rows:
               if r['outcome'] == 'opened':
                   print(f"opened {r['consumer']}: {r['pr_url']}")
-          explicit = sys.argv[2] not in ('', 'null', '[]')
+          explicit = sys.argv[2] not in ('', 'null', '[]', '""')
           if not rows and not explicit:
               print('::error::zero consumers examined on an inventory run; this is not an all-clear')
               sys.exit(1)
