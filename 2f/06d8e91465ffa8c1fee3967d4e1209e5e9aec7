@@ -1,0 +1,14 @@
+.github/workflows/fanout-ci-pin.yml
+  h_cebe5b6d461c32 125-133,135-138,140-160,199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2f06d8e91465ffa8c1fee3967d4e1209e5e9aec7",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
