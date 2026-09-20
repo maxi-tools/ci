@@ -169,24 +169,41 @@ jobs:
   # state with the gate; the only ordering is "dedupe finished before
   # the count is taken".
   #
-  # `continue-on-error` on the run step: this job may only ever make the
-  # gate LOOSER, never stricter. A failure here must not turn a green
-  # gate red -- the gate's verdict is the thing that matters; this step
-  # is a cleanup that helps the gate pass on a PR it would otherwise
-  # block. The job itself succeeds on `continue-on-error`, so the gate's
-  # `needs: dedupe` is satisfied and the gate still runs.
+  # NO `continue-on-error` ON THE RUN STEP -- AND NO LONGER CLAIMS TO BE
+  # LOOSEN-ONLY.
   #
-  # SKIPPED on fork PRs (`head.repo.full_name == github.repository`).
-  # The dedupe needs `pull-requests: write` to post the reply and
-  # resolve the thread, which a fork PR's read-only `GITHUB_TOKEN`
-  # cannot carry. Running on a fork would either silently no-op (the
-  # mutations fail closed, the dedupe run is suppressed by
-  # `continue-on-error`, the gate still runs) or fail outright -- both
-  # worse than skipping. Fork contributors get the same green-or-red the
-  # gate always was; same-repo PRs (where multi-bot coverage is densest
-  # and the dedupe matters most) get the full treatment. (maxi-review
-  # uses the same `if:` shape to gate App-token work; see its own
-  # App-token step.)
+  # This job historically carried `continue-on-error: true` on its run
+  # step on the grounds that it could only make the gate LOOSER. The
+  # premise was false. A flaky GraphQL call, a missing `python3` on the
+  # runner, a script crash with an uncaught exception -- any of those
+  # failed the step under `set -e`, the `continue-on-error` swallowed
+  # it, and the step showed as a green tick with nothing in the summary
+  # to read. The gate's `needs: dedupe` was satisfied (the job
+  # "succeeded"), the gate ran, and the verdict was published against a
+  # dedupe that did no work. That is the silent-no-op defect the
+  # composite action was rewritten to make impossible: its shell now
+  # writes one of three explicit lines to the summary
+  # (`deduped N threads` / `nothing to dedupe` / `dedupe unavailable:
+  # <reason>`) and exits non-zero on the failure path.
+  #
+  # The contract the new shape enforces: this step's GREEN tick carries
+  # a line, and the only way to get a green tick without a line is to
+  # reach into the composite and undo it. Removing `continue-on-error`
+  # on this calling step is what closes the gap -- a non-zero exit from
+  # the composite now fails THIS step, which fails the JOB, which
+  # causes `gate` (with `needs: [invalidate, dedupe]`) to skip. The
+  # gate skipping on a dedupe failure is strictly safer than the gate
+  # running with a dedupe that published no verdict: a `pending` on
+  # `review-gate/threads` blocks a merge, an empty dedupe with a green
+  # tick does not.
+  #
+  # FORK PRs are still skipped on this job via the `if:` below -- the
+  # dedupe needs `pull-requests: write`, a fork PR's read-only
+  # `GITHUB_TOKEN` cannot carry it, and running on a fork would either
+  # silently no-op or fail outright, both worse than skipping. The gate's
+  # `needs: dedupe` is satisfied on a skipped dedupe, so fork PRs get the
+  # same green-or-red the gate always was. (maxi-review uses the same
+  # `if:` shape to gate App-token work; see its own App-token step.)
   dedupe:
     name: 'per-run: dedupe bot review threads'
     runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
@@ -217,19 +234,15 @@ jobs:
       # have shipped a gate that publishes no verdict at all, in 42
       # repos.
       #
-      # `continue-on-error` stays: this job may only ever make the gate
-      # LOOSER, never stricter, and the same fail-open discipline the
-      # prior shape had applies to this step's failure mode (a flaky
-      # GraphQL call, a transient bot-loop cap hit) as much as it did to
-      # the prior shape's 404. The job header above asserts the job
-      # succeeds on continue-on-error, which is what makes the gate's
-      # `needs: dedupe` satisfied and the gate still run -- a separate
-      # `if: !cancelled()` on the gate job below is what covers the case
-      # where THIS step is skipped outright (its own `if:` on fork PRs).
+      # NO `continue-on-error` on this step: the step's contract is that
+      # a green tick carries an explicit summary line, and that
+      # `dedupe unavailable: <reason>` is the only honest sentence the
+      # failure path can write. A non-zero exit from the composite makes
+      # THIS step red, which is the whole point -- see the job header
+      # above for the consequences for the gate.
       - name: Dedupe bot review threads
         id: dedupe
         if: ${{ !cancelled() }}
-        continue-on-error: true
         uses: maxi-tools/ci/.github/actions/dedupe-pr-review-threads@main
         with:
           github-token: ${{ github.token }}
@@ -246,13 +259,25 @@ jobs:
     # FORK pull request. So since that job landed the gate has not run on a
     # fork at all -- the exact opposite of the "fork contributors get the same
     # green-or-red the gate always was" the dedupe's own header claims. The
-    # two `continue-on-error`s above cover the failure path; only this covers
-    # the skip, and a lost runner or a timeout defeats both of them.
+    # `continue-on-error` above on `invalidate` covers the failure path on
+    # that side; only this `if:` covers the skip, and a lost runner or a
+    # timeout defeats both of them.
     #
-    # It also runs when `invalidate` failed, in the same direction and for the
-    # same reason: `invalidate` only writes `pending`, and a gate that reaches
-    # a real verdict is strictly better than one that skips because the
-    # placeholder could not be written.
+    # It also runs when `invalidate` failed, in the same direction and for
+    # the same reason: `invalidate` only writes `pending`, and a gate that
+    # reaches a real verdict is strictly better than one that skips because
+    # the placeholder could not be written.
+    #
+    # A `dedupe` FAILURE, on the other hand, skips this job. That is the
+    # correct direction: since the dedupe composite was rewritten to fail
+    # the step on mechanism unavailability (no more `continue-on-error`),
+    # a failed dedupe means `dedupe unavailable: <reason>` was written to
+    # the dedupe job's step summary and the gate cannot claim to have
+    # inspected a post-dedupe state. Skipping the gate keeps
+    # `review-gate/threads` `pending`, which blocks a merge; running it
+    # on a dedupe that did not run would publish a verdict without the
+    # evidence the dedupe normally contributes, which is a strictly worse
+    # outcome.
     #
     # This job's verdict is the only thing in this file that decides anything.
     # Nothing upstream of it may be able to take it off the board.

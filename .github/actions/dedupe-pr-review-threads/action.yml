@@ -46,6 +46,34 @@ runs:
     # the sentinel would invalidate every thread we have already marked, which
     # is a strictly larger behavioural change than the cross-repo checkout
     # this action replaces.
+    #
+    # WRITES ONE OF THREE EXPLICIT OUTCOME LINES TO THE STEP SUMMARY, IN
+    # EVERY EXIT PATH:
+    #
+    #   `deduped N threads`             -- ran to completion and posted N
+    #                                      duplicate-of replies + resolves.
+    #   `nothing to dedupe`             -- ran to completion; no duplicates.
+    #   `dedupe unavailable: <reason>`  -- the mechanism did not run.
+    #
+    # A green tick on this step now means one of those three lines was
+    # written, not merely "no error surfaced". The contract on which that
+    # sentence rests -- that this step cannot go green without a meaningful
+    # line in the summary -- is held by the absence of `continue-on-error`
+    # on the calling reusable-workflow step. That change lives in
+    # .github/workflows/review-gate-reusable.yml alongside this one; the
+    # `continue-on-error` is removed there, in the same PR, so this step's
+    # non-zero exit on unavailability makes the JOB red and the gate's
+    # `needs:` dependency skips the gate job -- the worst case is the gate
+    # does not publish a verdict (i.e. `pending` stands), which is the
+    # correct direction: a green tick on an empty dedupe was the bug.
+    #
+    # The previous shape teed python's combined stdout/stderr through
+    # `set -euo pipefail`. A non-zero exit from python aborted the step
+    # before any human-readable line reached the summary and the only
+    # artefact was the script's own `::error::` annotation -- which is not
+    # a sentence a reader can act on. Removing `set -e` from the run step
+    # is what lets the failure path write its own summary line and then
+    # propagate python's exit code up to the calling step.
     - name: Run dedupe
       id: dedupe
       shell: bash
@@ -53,9 +81,59 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ inputs.pr }}
       run: |
-        set -euo pipefail
+        # NO `set -e`: we want python's exit code captured, not propagated
+        # through `set -e` before the failure-path summary line is written.
+        # `-u` and `-o pipefail` stay: unbound variables are still bugs,
+        # and any pipeline's exit code still has to come from its leftmost
+        # failing command.
+        set -uo pipefail
+        out="$(mktemp)"
+        trap 'rm -f "$out"' EXIT
         python3 "${{ github.action_path }}/dedupe_review_threads.py" \
           --owner "${{ inputs.owner }}" \
           --repo "${{ inputs.repo }}" \
           --pr "${{ inputs.pr }}" \
-          --apply 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          --apply >"$out" 2>&1
+        rc=$?
+        # Cat the captured output into the summary first, so the script's
+        # own JSON report and `::error::` annotations are visible there
+        # even on the failure path. The summary line below is added on top.
+        cat "$out" >>"$GITHUB_STEP_SUMMARY"
+        if [ "$rc" -ne 0 ]; then
+          # The script's own `::error::` annotations are already in $out;
+          # we add a single human-readable line naming the failure mode.
+          # The calling step goes red because we exit with python's code
+          # and the wrapper step has no `continue-on-error` -- which is the
+          # whole point: a green tick on a step that crashed is the bug
+          # this change exists to close.
+          #
+          # `<reason>` is the LAST non-empty line of the script output,
+          # trimmed. Falls back to a generic phrasing when the script left
+          # no explanation (an uncaught exception whose traceback tail
+          # still appears in the summary, because python prints the
+          # traceback to stderr on an uncaught exception and we captured
+          # both streams into $out).
+          reason="$(tail -n 20 "$out" | awk 'NF{f=$0} END{print f}')"
+          if [ -z "$reason" ]; then
+            reason="the dedupe script exited with code $rc and produced no explanation"
+          fi
+          printf 'dedupe unavailable: %s\n' "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+        fi
+        # Parse the JSON report the script prints on its only success path.
+        # `deduped` is the count of duplicates we POSTED the reply and
+        # RESOLVE mutation against on THIS run. The script's report field
+        # is `resolved`; `kept` and `already_processed` are not
+        # resolutions we performed (one is a keeper, the other is a
+        # previous-run sentinel we recognised). Reporting a combined count
+        # would overstate the work this run did.
+        #
+        # The parse lives in a sibling python file so the run step's
+        # shell stays readable (a multi-line python -c inside a YAML
+        # literal block confuses the YAML scanner on `for ... in ...`).
+        deduped="$(python3 "${{ github.action_path }}/parse_summary.py" <"$out")"
+        if [ "${deduped:-0}" -eq 0 ]; then
+          printf 'nothing to dedupe\n' | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+          printf 'deduped %s threads\n' "$deduped" | tee -a "$GITHUB_STEP_SUMMARY"
+        fi
