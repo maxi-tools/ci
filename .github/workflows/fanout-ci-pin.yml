@@ -1,0 +1,131 @@
+name: Fan-out ci pin
+
+# Triggered by every push to main AND weekly on Monday. The push hook is
+# the canonical "a fix landed" signal; the weekly cron is the
+# backstop for cases where a consumer closed the fan-out PR without
+# merging and is still behind.
+
+# A PR on main that affects only `docs/`, `*.md`, `README*` does NOT
+# need a fan-out: it changes no workflow bytes. The push paths below
+# scope the run to workflow files and to the fan-out script itself.
+
+# Fan-out PRs are the inert-detector: every consumer a fix has not
+# reached has an open PR on it, named `ci: advance pin to <sha>...`.
+# See docs/contracts/first-party-pin-scheme.md for the rule and the
+# failure mode this contract addresses.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/scripts/fanout_ci_pin.py'
+      - 'docs/contracts/first-party-pin-scheme.md'
+  schedule:
+    # Mondays 09:00 UTC, an hour before distribute-pr-green.yml so a
+    # fan-out burst is not parallel with another fleet write.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      tip:
+        description: 'Override the tip sha (default: current main HEAD)'
+        required: false
+      dry_run:
+        description: 'Print the plan without opening PRs'
+        type: boolean
+        default: false
+      consumer_repo:
+        description: 'Limit the fan-out to a single owner/repo (repeatable)'
+        required: false
+
+concurrency:
+  group: fanout-ci-pin
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fanout:
+    # workflow_dispatch is a trigger, not a trust statement:
+    # `gh workflow run --ref` accepts any branch, so anyone with write
+    # access could have this fleet job execute their branch's script
+    # beside an org token. The gate below matches the
+    # distribute-*.yml pattern in maxi-config.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      (github.event.sender.id == 874012 && github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve tip sha
+        id: tip
+        # Push hook: the tip is the new HEAD. Schedule/dispatch: the
+        # caller may override; otherwise read main.
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.tip }}" ]; then
+            echo "sha=${{ inputs.tip }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate fleet write token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          permission-contents: write
+          permission-pull-requests: write
+          # No workflows:write. The fan-out touches .github/workflows/
+          # contents, but the Contents API treats that path like any
+          # other file; workflows:write is a separate, broader
+          # permission.
+
+      - name: Run fan-out
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TIP_SHA: ${{ steps.tip.outputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          # EXTRA_REPOS lets dispatch limit the fan-out to a single
+          # consumer for testing. Each value is owner/repo.
+          EXTRA_REPOS_JSON: ${{ toJSON(inputs.consumer_repo) }}
+        run: |
+          set -euo pipefail
+          args=(--tip "$TIP_SHA")
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          # Decode the optional --consumer-repo array. Inputs of type
+          # array arrive as a JSON list; an empty list serialises as
+          # the string "null" and the shell receives a single empty
+          # arg, which we drop.
+          if [ -n "$EXTRA_REPOS_JSON" ] && [ "$EXTRA_REPOS_JSON" != "null" ]; then
+            for r in $(echo "$EXTRA_REPOS_JSON" | python3 -c 'import json,sys; [print(repo) for repo in json.load(sys.stdin) if repo]'); do
+              args+=(--consumer-repo "$r")
+            done
+          fi
+          # --json keeps the job summary structured for the next step.
+          args+=(--json)
+          python3 .github/scripts/fanout_ci_pin.py "${args[@]}" \
+            | tee "$GITHUB_STEP_SUMMARY"
+
+      - name: Post-summary check
+        if: ${{ !inputs.dry_run }}
+        # Empty run (zero consumers behind the tip) is a pass, not a
+        # failure; an error in the script itself fails the step
+        # immediately under `set -e` above. This step exists so the
+        # job summary is the last line of the run log.
+        run: |
+          set -euo pipefail
+          echo 'fan-out completed; see step summary for the per-consumer plan'

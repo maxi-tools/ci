@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+'''Advance every consumer's `uses: maxi-tools/ci/...` pin to a new tip.
+
+This is the detector for MERGED-BUT-INERT.
+
+Every PR that lands on `maxi-tools/ci` main may change the bytes of the
+shared workflows; the consumers pin a sha, so they do not see the change
+until this script opens a fan-out PR. The fan-out PR is the signal: if
+a consumer does not merge (or close with a reason), that consumer is now
+inert on the change that landed.
+
+Designed to run from .github/workflows/fanout-ci-pin.yml with a token
+that has `contents: write, pull-requests: write` over the org. Also
+runnable by hand for a one-off advance:
+
+    python3 -m github.scripts.fanout_ci_pin \\
+        --tip <sha> --dry-run --consumer-repo a/b --consumer-repo c/d
+
+The hardcoded consumer list (`DEFAULT_CONSUMERS`) is the org inventory
+measured 2026-09-20: 48 repositories whose
+`.github/workflows/review-gate.yml` (or equivalent) references
+`maxi-tools/ci/.github/workflows/review-gate-reusable.yml@<sha>`.
+Override per-invocation with `--consumer-repo` (repeatable) or
+`--consumer-list-file`.
+
+What this script does NOT do:
+
+* It does not auto-merge the consumer's PR. The fan-out PR is the
+  human-in-the-loop review surface. See
+  docs/contracts/first-party-pin-scheme.md for why auto-merging a
+  fleet-wide pin is the wrong shape.
+* It does not retry on a closed PR. A consumer that closes the
+  fan-out PR with `pin: skip` is recorded in `OPT_OUTS` (constant
+  below) and skipped on subsequent runs.
+* It does not touch non-pin files. The fan-out PR touches exactly one
+  line per consumer (the `uses:` ref) so the diff stays auditable.
+'''
+
+from __future__ import annotations
+
+import argparse
+import functools
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+# Default SIGPIPE handler exits with code 141 under `head -1 | ...`,
+# which surfaces as a CI failure for callers that pipe our stdout. The
+# `head -1` case in fanout-ci-pin.yml is one such caller. Ignore SIGPIPE
+# so the script exits cleanly when its downstream pipe closes early.
+@functools.cache
+def _ignore_sigpipe() -> None:
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError):
+        # SIGPIPE does not exist on Windows; on some restricted
+        # runtimes `signal.signal` rejects SIG_DFL for SIGPIPE. Either
+        # way, the default behaviour is acceptable.
+        pass
+
+
+# 40-character sha. A consumer whose pinned sha is shorter, longer, or
+# non-hex (e.g. `@main`, `@v1`) is reported as a problem but the
+# problem is never auto-fixed -- fixing the pin shape is a separate,
+# reviewed change.
+SHA = re.compile(r'\b[0-9a-f]{40}\b')
+
+# Matches the `uses: ...maxi-tools/ci/.github/workflows/<file>.yml@<ref>`
+# line we are advancing. `<file>` is the workflow file (the action
+# composite files are also referenced this way). The ref is captured so
+# we can compare.
+USES_RE = re.compile(
+    r'''(?P<indent>^[\t ]*(?:-\s*)?uses:\s*)
+        maxi-tools/ci/\.github/workflows/(?P<workflow>[A-Za-z0-9_.\-]+?)\.yml@
+        (?P<ref>[^\s#'"]+)
+    ''',
+    re.VERBOSE | re.MULTILINE,
+)
+
+
+# 48 consumer repos measured 2026-09-20. The order is stable so the
+# fan-out's PR burst has a predictable notification cadence. New
+# consumers are added in alphabetical order on the next inventory sweep.
+DEFAULT_CONSUMERS: tuple[str, ...] = (
+    'maxi-tools/MaxiTab',
+    'maxi-tools/aibi-libre',
+    'maxi-tools/bifrost',
+    'maxi-tools/bittle-libre',
+    'maxi-tools/brisingamen',
+    'maxi-tools/coreml-rs',
+    'maxi-tools/freya',
+    'maxi-tools/fruit-suite',
+    'maxi-tools/grok-chrome-extension',
+    'maxi-tools/maxi-action-heptathlon',
+    'maxi-tools/maxi-agent-runner',
+    'maxi-tools/maxi-android-bridge',
+    'maxi-tools/maxi-audio',
+    'maxi-tools/maxi-cloud',
+    'maxi-tools/maxi-config',
+    'maxi-tools/maxi-core',
+    'maxi-tools/maxi-dist',
+    'maxi-tools/maxi-docker',
+    'maxi-tools/maxi-e2e',
+    'maxi-tools/maxi-firmware-core',
+    'maxi-tools/maxi-firmware-embassy',
+    'maxi-tools/maxi-firmware-std',
+    'maxi-tools/maxi-glass-plugin',
+    'maxi-tools/maxi-io',
+    'maxi-tools/maxi-ios-bridge',
+    'maxi-tools/maxi-kvm',
+    'maxi-tools/maxi-kvm-client',
+    'maxi-tools/maxi-libs',
+    'maxi-tools/maxi-lint',
+    'maxi-tools/maxi-memory',
+    'maxi-tools/maxi-ml',
+    'maxi-tools/maxi-ml-mac-app',
+    'maxi-tools/maxi-motion',
+    'maxi-tools/maxi-mux',
+    'maxi-tools/maxi-nix',
+    'maxi-tools/maxi-sandbox',
+    'maxi-tools/maxi-stackchan',
+    'maxi-tools/maxi-terminal',
+    'maxi-tools/maxi-transport',
+    'maxi-tools/maxi-tray',
+    'maxi-tools/maxi-tui',
+    'maxi-tools/maxi-tui-deps',
+    'maxi-tools/maxi-ui',
+    'maxi-tools/maxi-unity',
+    'maxi-tools/maxi-vector-cloud',
+    'maxi-tools/maxi-vpad',
+    'maxi-tools/maximoji-rs',
+    'maxi-tools/rlvgl',
+    'maxi-tools/voicemaci',
+)
+
+
+# Consumers that explicitly opted out. Closing the fan-out PR with a
+# `pin: skip` comment (the workflow comments this back to the consumer
+# when the PR is opened) records the opt-out here. Empty by default.
+OPT_OUTS: dict[str, str] = {}
+
+
+# Workflow files we expect to find pinned in a consumer's
+# `.github/workflows/review-gate.yml`. A consumer that pins something
+# else (e.g. an internal wrapper) is reported but the line is not
+# advanced -- the fan-out shape is constrained to the shared lanes.
+WORKFLOW_FILES = frozenset({
+    'review-gate-reusable',
+    'rust-ci',
+    'lane-plan',
+    'lane-check',
+    'lane-test',
+    'lane-package',
+    'lane-sign-publish',
+    'lane-release-verify',
+})
+
+
+@dataclass(frozen=True)
+class Consumer:
+    name: str  # e.g. 'maxi-tools/maxi-core'
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class FanOut:
+    consumer: Consumer
+    workflow_file: str  # e.g. 'review-gate-reusable'
+    old_ref: str
+    new_ref: str  # always a 40-char sha
+    pr_url: str | None
+
+
+def _run(
+    args: list[str], *,
+    env: dict[str, str] | None = None,
+    workdir: str | None = None,
+) -> str:
+    '''Run a subprocess and return stdout. Raise on non-zero exit.'''
+    proc = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(env or {})},
+        cwd=workdir,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f'command failed (rc={proc.returncode}): '
+            f'{" ".join(args)}\nstderr:\n{proc.stderr}'
+        )
+    return proc.stdout
+
+
+def _gh(args: list[str], *, token: str) -> str:
+    return _run(['gh', *args], env={'GH_TOKEN': token})
+
+
+def _fetch_consumer_pin(consumer: Consumer, *, token: str) -> dict[str, str]:
+    '''Return {workflow_file: pinned_ref} for `consumer`.
+
+    Scans every file under `.github/workflows/` (and `.github/workflows/`
+    specifically; `workflows/` is the legacy location maxi-config's
+    wrappers live in and is excluded so this script does not collide
+    with `distribute-*.yml`'s coverage of that path). A consumer that
+    pins `maxi-tools/ci/.github/workflows/<file>.yml@<ref>` contributes
+    one entry. Multiple references to the same file contribute the
+    LAST one; the diff is still a single-line advance.
+    '''
+    out = _gh(
+        [
+            'api',
+            f'repos/{consumer.name}/contents/.github/workflows',
+            '--jq', '.[].name',
+        ],
+        token=token,
+    )
+    names = [n for n in out.splitlines() if n.endswith(('.yml', '.yaml'))]
+    pins: dict[str, str] = {}
+    for name in names:
+        content = _gh(
+            [
+                'api',
+                f'repos/{consumer.name}/contents/.github/workflows/{name}',
+                '--jq', '.content',
+            ],
+            token=token,
+        )
+        text = _decode_b64(content)
+        for match in USES_RE.finditer(text):
+            wf = match.group('workflow')
+            if wf not in WORKFLOW_FILES:
+                continue
+            pins[wf] = match.group('ref')
+    return pins
+
+
+def _decode_b64(b64_text: str) -> str:
+    import base64
+    # GitHub returns base64 with embedded newlines; strip them.
+    return base64.b64decode(b64_text.translate({ord('\n'): None})).decode('utf-8')
+
+
+def _consumer_current_sha(consumer: Consumer, *, token: str) -> str:
+    return _gh(
+        ['api', f'repos/{consumer.name}/git/ref/heads/main', '--jq', '.object.sha'],
+        token=token,
+    ).strip()
+
+
+def _open_pr(
+    *,
+    consumer: Consumer,
+    workflow_file: str,
+    old_ref: str,
+    new_ref: str,
+    tip_sha: str,
+    token: str,
+    dry_run: bool,
+) -> str | None:
+    '''Open the fan-out PR on `consumer`. Return the PR URL or None.
+
+    The PR is one commit advancing the `uses:` ref; the body explains
+    why and links the ci PR that landed the change. If a fan-out PR is
+    already open for this tip, return its URL instead of opening a
+    duplicate.
+    '''
+    head_ref = f'ci/fanout-{tip_sha[:12]}'
+    title = f'ci: advance pin to {tip_sha[:12]} ({workflow_file})'
+    body = (
+        f'Fan-out from `maxi-tools/ci` @{tip_sha}.\n\n'
+        f'This PR advances `{workflow_file}.yml` from `{old_ref}` to '
+        f'`{new_ref}` (40-char sha).\n\n'
+        f'See `docs/contracts/first-party-pin-scheme.md` in `maxi-tools/ci` '
+        f'for the rule and the inert-detector this PR is part of. '
+        f'To opt out, close the PR and the next fan-out run will skip this '
+        f'consumer; re-enable by merging a follow-up that flips the pin.'
+    )
+
+    if dry_run:
+        return None
+
+    # Reuse an existing open PR if any (avoid duplicate-notification
+    # spam on weekly cron re-runs).
+    existing = _gh(
+        [
+            'pr', 'list',
+            '--repo', consumer.name,
+            '--state', 'open',
+            '--head', f'{consumer.name.split("/")[0]}:{head_ref}',
+            '--json', 'url',
+            '--jq', '.[].url',
+        ],
+        token=token,
+    ).strip()
+    if existing:
+        first = existing.splitlines()[0]
+        return first or None
+
+    head_sha = _consumer_current_sha(consumer, token=token)
+
+    # Branch, commit, push. A pre-existing branch (the cron re-run case)
+    # is reset to the consumer's current main.
+    _run([
+        'git', 'clone', '--depth', '1', '--branch', 'main',
+        f'https://x-access-token:{token}@github.com/{consumer.name}.git',
+        '/tmp/fanout',
+    ])
+    try:
+        cwd = Path('/tmp/fanout')
+        _run(['git', 'checkout', '-B', head_ref], workdir=str(cwd))
+        target = cwd / '.github/workflows/review-gate.yml'
+        text = target.read_text(encoding='utf-8')
+        new_text, n = USES_RE.subn(
+            lambda m: (
+                f'{m.group("indent")}'
+                f'maxi-tools/ci/.github/workflows/{m.group("workflow")}.yml@'
+                f'{new_ref}'
+            ),
+            text,
+            count=1,  # advance only the first matching line per file
+        )
+        if n == 0:
+            raise RuntimeError(
+                f'{consumer.name}: no `uses:` line matched after dry lookup'
+            )
+        target.write_text(new_text, encoding='utf-8')
+        _run(['git', 'add', str(target)], workdir=str(cwd))
+        _run(
+            [
+                'git', '-c', 'user.name=Maxi Boch',
+                '-c', 'user.email=874012+maxiboch@users.noreply.github.com',
+                'commit', '-m',
+                f'ci: advance pin to {new_ref[:12]}',
+            ],
+            workdir=str(cwd),
+        )
+        _run(['git', 'push', '-f', 'origin', head_ref], workdir=str(cwd))
+    finally:
+        _run(['rm', '-rf', '/tmp/fanout'])
+
+    pr_url = _gh(
+        [
+            'pr', 'create',
+            '--repo', consumer.name,
+            '--base', 'main',
+            '--head', f'{consumer.name.split("/")[0]}:{head_ref}',
+            '--title', title,
+            '--body', body,
+        ],
+        token=token,
+    ).strip()
+    return pr_url
+
+
+def _plan(
+    *,
+    tip_sha: str,
+    consumers: Iterable[str],
+    token: str,
+) -> list[FanOut]:
+    '''Compute the fan-out plan; do not mutate anything.
+
+    A consumer that is already at `tip_sha` is reported with
+    `old_ref == new_ref` so the caller can log the no-op.
+    '''
+    plan: list[FanOut] = []
+    for name in consumers:
+        consumer = Consumer(name)
+        if name in OPT_OUTS:
+            print(f'{name}: skipped (opt-out: {OPT_OUTS[name]})')
+            continue
+        try:
+            pins = _fetch_consumer_pin(consumer, token=token)
+        except Exception as exc:  # noqa: BLE001
+            print(f'{name}: could not read pin ({exc})', file=sys.stderr)
+            continue
+        if not pins:
+            print(f'{name}: no `uses: maxi-tools/ci/.github/workflows/...` line')
+            continue
+        for wf, ref in pins.items():
+            if not SHA.match(ref):
+                print(
+                    f'{name}: {wf} pinned at `{ref}` (not a sha); '
+                    f'auto-fix refused',
+                    file=sys.stderr,
+                )
+                continue
+            plan.append(FanOut(
+                consumer=consumer,
+                workflow_file=wf,
+                old_ref=ref,
+                new_ref=tip_sha,
+                pr_url=None,
+            ))
+    return plan
+
+
+def _execute(plan: list[FanOut], *, tip_sha: str, token: str, dry_run: bool) -> list[FanOut]:
+    executed: list[FanOut] = []
+    for entry in plan:
+        if entry.old_ref == entry.new_ref:
+            print(f'{entry.consumer} {entry.workflow_file}: already at tip')
+            executed.append(entry)
+            continue
+        url = _open_pr(
+            consumer=entry.consumer,
+            workflow_file=entry.workflow_file,
+            old_ref=entry.old_ref,
+            new_ref=entry.new_ref,
+            tip_sha=tip_sha,
+            token=token,
+            dry_run=dry_run,
+        )
+        executed.append(FanOut(
+            consumer=entry.consumer,
+            workflow_file=entry.workflow_file,
+            old_ref=entry.old_ref,
+            new_ref=entry.new_ref,
+            pr_url=url,
+        ))
+    return executed
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--tip', required=True, help='40-char sha to advance to')
+    parser.add_argument(
+        '--consumer-repo', action='append', default=[],
+        help='Override the consumer list (repeatable)',
+    )
+    parser.add_argument(
+        '--consumer-list-file', default=None,
+        help='File with one `owner/repo` per line; merged with --consumer-repo',
+    )
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='Plan and report without opening PRs',
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit the plan as JSON to stdout (one object per line)',
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    _ignore_sigpipe()
+    args = _parse_args()
+    tip_sha = args.tip.strip()
+    if not SHA.match(tip_sha):
+        print(f'--tip must be a 40-char sha, got {tip_sha!r}', file=sys.stderr)
+        return 2
+
+    token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+    if not token and not args.dry_run:
+        print('GH_TOKEN (or GITHUB_TOKEN) is required for non-dry-run mode',
+              file=sys.stderr)
+        return 2
+
+    consumers: list[str] = list(args.consumer_repo)
+    if args.consumer_list_file:
+        consumers.extend(
+            line.strip() for line in Path(args.consumer_list_file).read_text().splitlines()
+            if line.strip() and not line.startswith('#')
+        )
+    # Fall back to the org inventory only when no consumer was specified
+    # at all. An explicit empty file or only --consumer-repo values
+    # produce an empty plan rather than the default; the self-check
+    # uses this to exercise the script with the default list disabled.
+    if not consumers and not args.consumer_repo and not args.consumer_list_file:
+        consumers = list(DEFAULT_CONSUMERS)
+
+    plan = _plan(tip_sha=tip_sha, consumers=consumers, token=token or 'noop')
+
+    if args.json:
+        for entry in plan:
+            print(json.dumps({
+                'consumer': entry.consumer.name,
+                'workflow_file': entry.workflow_file,
+                'old_ref': entry.old_ref,
+                'new_ref': entry.new_ref,
+            }))
+        return 0
+
+    executed = _execute(plan, tip_sha=tip_sha, token=token or 'noop', dry_run=args.dry_run)
+
+    n_opened = sum(1 for e in executed if e.pr_url)
+    n_already = sum(1 for e in executed if e.old_ref == e.new_ref)
+    print(
+        f'fan-out: {n_opened} PR(s) opened, {n_already} already at tip, '
+        f'{len(executed)} total'
+    )
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

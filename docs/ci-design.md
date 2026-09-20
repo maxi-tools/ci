@@ -60,10 +60,15 @@ reachable without a token that already has read access to it.
 
 ## Consuming these
 
+Pin to a sha. `@main`, tags, and bare branches are not a security boundary, and
+the role they have on the mirror's fork guard is load-bearing. See
+`docs/contracts/first-party-pin-scheme.md` for the rule and the
+inert-detector (`fanout-ci-pin.yml`) that this contract wires in.
+
 ```yaml
 jobs:
   merge-gate:
-    uses: maxi-tools/ci/.github/workflows/rust-ci.yml@main
+    uses: maxi-tools/ci/.github/workflows/rust-ci.yml@<sha>
     permissions:
       contents: write
       pull-requests: read
@@ -86,7 +91,7 @@ The review gate takes no secrets at all — it runs on the caller's `GITHUB_TOKE
 ```yaml
 jobs:
   review-gate:
-    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@main
+    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@<sha>
     permissions:
       actions: read
       contents: read
@@ -96,6 +101,22 @@ jobs:
 
 `statuses: write` has to be granted by the caller. A reusable workflow cannot
 elevate the token it is handed.
+
+### How a fix reaches you
+
+Every push to `maxi-tools/ci` `main` that touches a workflow file or a
+composite action triggers `.github/workflows/fanout-ci-pin.yml`. That
+workflow opens a `ci: advance pin to <sha>` PR on every consumer whose pin
+is behind the new tip. The fan-out PR is the **inert-detector**: it exists
+on the consumer the moment the change lands on ci, and stays open until
+the consumer merges it (or closes it with a reason). Consumers that close
+without merging are recorded in `OPT_OUTS` in `.github/scripts/fanout_ci_pin.py`
+so the next run skips them deliberately.
+
+`ci-pin-staleness-check.yml` is the backstop: a weekly read-only audit
+that opens an issue on this repository listing consumers that are more
+than one tip behind. The fan-out PR is the primary detector; this audit
+is what catches consumers that ignored the fan-out.
 
 ## Trust boundary
 

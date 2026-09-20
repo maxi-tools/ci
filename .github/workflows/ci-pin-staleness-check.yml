@@ -1,0 +1,98 @@
+name: ci-pin staleness check
+
+# A scheduled read-only check that opens an issue on THIS repository
+# when a consumer's pinned `uses: maxi-tools/ci/...` sha is more than
+# ONE tip behind the current ci main.
+#
+# This is the BACKSTOP for the inert-detector: the primary detector is
+# the open fan-out PR on the consumer, posted by fanout-ci-pin.yml.
+# When a fleet token is unavailable or a consumer has been
+# intentionally excluded, this check keeps the gap visible.
+#
+# Read-only. Never opens a PR on a consumer. The fan-out workflow does
+# that; this one only files an internal issue.
+
+on:
+  schedule:
+    # Tuesdays 11:00 UTC, AFTER fanout-ci-pin.yml (Monday 09:00) so
+    # the fan-out's PR burst has landed before we audit it.
+    - cron: '0 11 * * 2'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-pin-staleness-check
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Same workflow_dispatch guard as fanout-ci-pin.yml.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      (github.event.sender.id == 874012 && github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Generate fleet read token
+        id: app-token
+        # contents: read is enough to read each consumer's
+        # review-gate.yml. The check never writes; this token is
+        # narrower than fanout-ci-pin.yml's.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          owner: maxi-tools
+          permission-contents: read
+
+      - name: Audit consumer pins
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Pass --json so the script emits one record per consumer
+          # and the next step (or operator) can grep without parsing
+          # free-form prose. --dry-run suppresses the network side
+          # effects of fanout_ci_pin.py that this workflow does not
+          # need.
+          python3 .github/scripts/fanout_ci_pin.py \
+            --tip "$(git rev-parse origin/main)" \
+            --dry-run --json \
+            | tee "$GITHUB_STEP_SUMMARY" \
+            | python3 .github/scripts/ci_pin_staleness_summarize.py
+
+      - name: File an issue if any consumer is more than one tip behind
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The summarize script writes a file under $GITHUB_STEP_SUMMARY
+          # listing every consumer that is more than one tip behind.
+          # If that file is empty, there is nothing to file; exit 0.
+          # Otherwise open a single issue naming the laggards with
+          # their pinned SHAs and the tip they should be at.
+          summary_file="$GITHUB_STEP_SUMMARY"
+          if ! grep -q '^LAGGARD' "$summary_file"; then
+            echo 'no consumer is more than one tip behind; nothing to file'
+            exit 0
+          fi
+          # Idempotent: a previous run already opened an open issue
+          # titled "ci-pin staleness: ..."; reuse it.
+          existing=$(gh issue list --repo maxi-tools/ci --state open \
+            --label ci-pin-drift --json number --jq '.[0].number' || true)
+          body=$(awk '/^LAGGARD/{flag=1; next} flag' "$summary_file")
+          title="ci-pin staleness: $(date -u +%Y-%m-%d)"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo maxi-tools/ci --body "$body" \
+              --add-label ci-pin-drift
+            echo "updated issue #$existing"
+          else
+            gh issue create --repo maxi-tools/ci --title "$title" \
+              --label ci-pin-drift --body "$body"
+          fi
