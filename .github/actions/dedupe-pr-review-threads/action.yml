@@ -52,10 +52,23 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ inputs.pr }}
+        # Inputs are passed through `env:` rather than interpolated into
+        # the `run:` block. Interpolating `${{ inputs.x }}` directly into
+        # shell runs every input through the runner's expression
+        # evaluator, then string-concatenates the result into the
+        # command line -- which is the codepath that turns a malformed
+        # input into a shell injection. `env:` is the documented escape:
+        # each value lands in the script's environment as a string and
+        # is read by argparse's `type=int` / `default=` machinery, which
+        # validates the type before the value touches any code. Codacy
+        # LOW on the original composite action; promoted to a written
+        # rule here so a future reshuffle cannot silently regress.
+        DEDUPE_OWNER: ${{ inputs.owner }}
+        DEDUPE_REPO: ${{ inputs.repo }}
       run: |
         set -euo pipefail
         python3 "${{ github.action_path }}/dedupe_review_threads.py" \
-          --owner "${{ inputs.owner }}" \
-          --repo "${{ inputs.repo }}" \
-          --pr "${{ inputs.pr }}" \
+          --owner "$DEDUPE_OWNER" \
+          --repo "$DEDUPE_REPO" \
+          --pr "$PR_NUMBER" \
           --apply 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
