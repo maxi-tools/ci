@@ -40,6 +40,15 @@ on:
         value: ${{ jobs.lane-plan.outputs.packaging_impact }}
       packaging_reason:
         value: ${{ jobs.lane-plan.outputs.packaging_reason }}
+      scope:
+        description: >
+          Validation scope for the lane chain. One of `merge-gate-only` (all
+          changed paths are documentation/metadata — safe to skip check/test)
+          or `full` (at least one changed path is non-doc — run everything).
+        value: ${{ jobs.lane-plan.outputs.scope }}
+      scope_reason:
+        description: Human-readable explanation of the scope decision.
+        value: ${{ jobs.lane-plan.outputs.scope_reason }}
 
     secrets:
       APP_ID:
@@ -79,6 +88,8 @@ jobs:
       provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}
       packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}
       packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}
+      scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope }}
+      scope_reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason }}
     permissions:
       contents: read
       pull-requests: read
@@ -252,6 +263,33 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Classify change scope
+        id: scope
+        shell: bash
+        env:
+          CHANGED_FILES: ${{ steps.files.outputs.changed_files }}
+        run: |
+          set -euo pipefail
+          docs_only=true
+          non_doc_first=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              ""|README.md|CHANGELOG.md|LICENSE*|.gitignore|docs/*|*.md) ;;
+              *)
+                docs_only=false
+                [ -z "$non_doc_first" ] && non_doc_first="$file"
+                ;;
+            esac
+          done <<< "$CHANGED_FILES"
+          if [ "$docs_only" = "true" ]; then
+            echo "scope=merge-gate-only" >> "$GITHUB_OUTPUT"
+            echo "scope_reason=all changed paths are documentation or metadata" >> "$GITHUB_OUTPUT"
+          else
+            echo "scope=full" >> "$GITHUB_OUTPUT"
+            echo "scope_reason=non-doc path: $non_doc_first" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Plan packaging impact
         if: ${{ github.actor != 'dependabot[bot]' }}
         id: packaging
@@ -293,6 +331,8 @@ jobs:
             echo 'provider=self-hosted'
             echo 'packaging_impact=false'
             echo 'packaging_reason=dependabot: routing and packaging policy are unreadable without an app token; planned on merge to main instead'
+            echo 'scope=full'
+            echo 'scope_reason=dependabot: changed files are unreadable without an app token; conservatively full'
           } >> "$GITHUB_OUTPUT"
 
       - name: Lane summary
@@ -303,4 +343,6 @@ jobs:
             echo "- Provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}"
             echo "- Packaging impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}"
             echo "- Packaging reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}"
+            echo "- Scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope }}"
+            echo "- Scope reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason }}"
           } >> "$GITHUB_STEP_SUMMARY"
