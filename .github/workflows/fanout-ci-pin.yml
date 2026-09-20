@@ -87,10 +87,16 @@ jobs:
           owner: maxi-tools
           permission-contents: write
           permission-pull-requests: write
-          # No workflows:write. The fan-out touches .github/workflows/
-          # contents, but the Contents API treats that path like any
-          # other file; workflows:write is a separate, broader
-          # permission.
+          # workflows:write is REQUIRED. The previous comment here said the
+          # Contents API treats .github/workflows/ like any other path and
+          # so this was not needed. It was never measured, because until
+          # ci#29 this workflow never pushed anything. The first real run
+          # (35498817540, 2026-09-20) measured it: all 49 consumers failed
+          # with "refusing to allow a GitHub App to create or update
+          # workflow `.github/workflows/review-gate.yml` without
+          # `workflows` permission". maxi-config's distribute-maxi-review.yml
+          # grants the same permission for the same file.
+          permission-workflows: write
 
       - name: Run fan-out
         env:
