@@ -97,7 +97,7 @@ copy.
 | `schema` | string | yes | Must be `"maxi-tools.moments-gallery.v1"`. The renderer refuses any other value. |
 | `title` | string | no | HTML `<title>` and the H1 at the top of the page. |
 | `run` | object | no | Free-form header data. The known fields are `repo`, `ref`, `box`, `date`, `lane`, `commit`. |
-| `scenarios[].id` | string | no | Scenario identifier. Optional; the renderer substitutes `scenario-<index>` when absent. Must match `[A-Za-z0-9._-]+` if present (the value is reused in the gallery output path). The renderer writes the resolved id to the section's `data-scenario` attribute. |
+| `scenarios[].id` | string | no | Scenario identifier. Optional; the renderer substitutes `scenario-<index>` when absent. Must match `[A-Za-z0-9._-]+` if present (the value is reused in the gallery output path). The renderer writes the resolved id to the section's `data-scenario` attribute. Resolved ids must be unique across scenarios; the renderer raises `GalleryError` on a duplicate. |
 | `scenarios[].label` | string | no | Display name; defaults to `id`. |
 | `scenarios[].description` | string | no | One-line description shown under the label. |
 | `scenarios[].audio` | string | no | Path (relative to root) to the scenario's audio file. Copied into the output and renamed `<id>.<ext>`. |

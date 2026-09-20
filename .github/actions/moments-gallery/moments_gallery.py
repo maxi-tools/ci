@@ -148,6 +148,7 @@ def _normalise_scenarios(
     if not isinstance(scenarios, list) or not scenarios:
         raise GalleryError("manifest has no scenarios[]")
     normalised: list[dict[str, Any]] = []
+    seen_ids: dict[str, int] = {}
     for index, raw in enumerate(scenarios):
         if not isinstance(raw, dict):
             raise GalleryError(f"scenarios[{index}] is not an object")
@@ -165,6 +166,18 @@ def _normalise_scenarios(
             )
         else:
             scenario_id = raw_id
+        # Reject duplicate scenario ids: the rendered gallery uses the
+        # id as the section's data-scenario attribute and the
+        # client-side JS keys interactions off `querySelector`, so a
+        # duplicate would leave the second scenario's controls broken
+        # silently. Detect here and fail the manifest load loudly.
+        prior = seen_ids.get(scenario_id)
+        if prior is not None:
+            raise GalleryError(
+                f"scenarios[{index}].id {scenario_id!r} is a duplicate of "
+                f"scenarios[{prior}].id; scenario ids must be unique"
+            )
+        seen_ids[scenario_id] = index
         moments_raw = raw.get("moments")
         if not isinstance(moments_raw, list) or not moments_raw:
             raise GalleryError(
