@@ -58,3 +58,40 @@ jobs:
         # resolves inside this repository, and that every external action is
         # sha-pinned. Both fail somewhere other than here.
         run: python3 .github/scripts/check_workflow_refs.py
+
+      - name: Smoke-test fanout_ci_pin.py
+        # The fan-out is a real script, not just a doc, and is invoked from
+        # fanout-ci-pin.yml with the org token. A script that crashes on a
+        # bad tip is invisible until a real fan-out runs (which may take a
+        # week), so this step proves the script accepts a valid sha,
+        # rejects an invalid one, and exits cleanly with an empty consumer
+        # list. The plan step is exercised by fanout-ci-pin.yml's weekly
+        # cron, where the org token is present.
+        run: |
+          set -euo pipefail
+          sha=0000000000000000000000000000000000000000
+          if python3 .github/scripts/fanout_ci_pin.py --tip "$sha" --help >/dev/null; then
+            :
+          else
+            echo "ERROR: fanout_ci_pin.py --help exited non-zero" >&2
+            exit 1
+          fi
+          # Bad tip: script must exit non-zero.
+          if python3 .github/scripts/fanout_ci_pin.py --tip "not-a-sha"; then
+            echo "ERROR: fanout_ci_pin.py accepted a non-sha tip" >&2
+            exit 1
+          fi
+          # Good tip --dry-run --json must exit zero and emit JSON.
+          # GITHUB_SHA is the merge commit on a PR merge, and the
+          # pushed commit on a direct push; the fan-out's `--tip` is
+          # always one of those. The checkout may be shallow, so we
+          # cannot assume `git rev-parse` of an arbitrary sha resolves;
+          # the script only validates the SHA FORMAT (40-char hex),
+          # which the env var satisfies.
+          sha="${GITHUB_SHA:?GITHUB_SHA is required}"
+          empty_list="$(mktemp)"
+          trap 'rm -f "$empty_list"' EXIT
+          : > "$empty_list"
+          python3 .github/scripts/fanout_ci_pin.py \
+            --tip "$sha" --consumer-list-file "$empty_list" --dry-run --json
+          echo 'fanout_ci_pin.py accepts, rejects, and exits cleanly on an empty list'
