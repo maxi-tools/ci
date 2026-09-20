@@ -108,12 +108,72 @@ SENTINEL = "<!-- maxi-config:dedupe -->"
 MAX_RESOLVE_PER_RUN = 100
 
 
+def _gh_graphql_field_args(key: str, value: Any) -> list[str]:
+    """Serialize one (key, value) GraphQL variable as `gh api graphql` flags.
+
+    Three forms of `gh api graphql` are in play here, picked by the value's
+    Python type so the server sees the type the variable declares:
+
+    * `str`              -> `-f key=value`            (shipped as String)
+    * `bool` / `int`     -> `-F key=value`            (shipped as JSON-typed)
+    * `list`             -> `-F key[]=item` per item  (shipped as a JSON array)
+    * anything else      -> rejected -- the script's own GraphQL variables
+                            are exactly these four types, and a wider
+                            contract here would mean a wider blast radius
+                            in `_gh_graphql`.
+
+    The old shape used `-f` for every scalar, which made every variable a
+    String on the wire. `--pr` is parsed as `type=int` and the query
+    declares `$pr:Int!`, so `-f pr=761` rejected the whole document with
+    `Variable $pr of type Int! was provided invalid value` and the script
+    crashed on every run before doing any work. `gh api graphql -F`
+    converts numbers, booleans and lists to their JSON-typed equivalents
+    on the wire (verified against the live API on 2026-09-19), which is
+    what `Int!` and `[ID!]!` actually want.
+
+    Note: `-F key=value` for a list value ALSO accepts JSON (`-F ids='["a","b"]'`)
+    and parses it as a JSON array, but we use the `key[]=v` repeat form
+    because it composes cleanly with the existing single-value path --
+    no JSON-escaping decisions to make per call site.
+    """
+    if isinstance(value, bool):
+        # `bool` is a subclass of `int`; check it first so `True`/`False`
+        # don't fall through to the int branch.
+        return ["-F", f"{key}={'true' if value else 'false'}"]
+    if isinstance(value, str):
+        return ["-f", f"{key}={value}"]
+    if isinstance(value, int):
+        return ["-F", f"{key}={value}"]
+    if isinstance(value, list):
+        if not value:
+            # `gh api graphql -F key[]` (no value) is the documented way to
+            # ship an empty list -- the script never passes one today,
+            # but the path is one extra branch and keeps the helper
+            # honest about what `list[str]` means.
+            return ["-F", f"{key}[]"]
+        out: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError(
+                    f"_gh_graphql list variable {key!r} must contain "
+                    f"strings; got {type(item).__name__}"
+                )
+            out.extend(["-F", f"{key}[]={item}"])
+        return out
+    raise TypeError(
+        f"_gh_graphql does not know how to ship a {type(value).__name__} "
+        f"variable for key {key!r}; add a branch for it before passing "
+        f"one in."
+    )
+
+
 def _gh_graphql(query: str, **fields: Any) -> dict[str, Any]:
     """Run one GraphQL query via `gh api graphql`.
 
-    Field values are coerced: dicts and lists go through `--input` so the
-    value is parsed as JSON, scalars through `-f`. Pagination is the
-    caller's responsibility; this helper runs one page.
+    Field values are coerced through `_gh_graphql_field_args`, which
+    selects `-f` (String), `-F` (Int / Bool / list) or `--input` (JSON
+    body) per the value's Python type. Pagination is the caller's
+    responsibility; this helper runs one page.
 
     Raises RuntimeError on a non-200 response or on a response carrying a
     non-empty `.errors` list. The gate's collect step fails closed on the
@@ -122,8 +182,7 @@ def _gh_graphql(query: str, **fields: Any) -> dict[str, Any]:
     """
     args: list[str] = ["gh", "api", "graphql"]
     for key, value in fields.items():
-        flag = "--input" if isinstance(value, (dict, list)) else "-f"
-        args.extend([flag, f"{key}={value}"])
+        args.extend(_gh_graphql_field_args(key, value))
     args.extend(["-f", f"query={query}"])
     proc = subprocess.run(
         args,
@@ -247,42 +306,57 @@ def fetch_thread_bodies(
     Returns {thread_id: concatenated_bodies}. The bodies are joined with
     newlines so the sentinel grep is unambiguous.
 
-    ONE GraphQL round-trip for the whole list, using `nodes(ids:)` over
-    the PR's review-thread set. The single-page max of 100 thread IDs
-    covers the cluster candidates even on a noisy PR, and the test
-    harness exercises it with `>1` IDs to keep the batching real.
+    ONE GraphQL round-trip for the whole list, via the top-level
+    `nodes(ids: [ID!]!)` field -- `PullRequest.reviewThreads(ids:)` is
+    NOT a real argument (verified against the live schema on 2026-09-19:
+    `__type(name:"PullRequest").fields` lists only `after, before, first,
+    last` for `reviewThreads`), but `Query.nodes(ids:)` is, and filtering
+    through `... on PullRequestReviewThread` is how the docstring's
+    original "single round-trip for N threads" intent lands. Smaller
+    than an N-query loop, and the cost is one round-trip per run rather
+    than N -- the old shape paid one round-trip per duplicate, which was
+    the bottleneck Codacy flagged on PR #723.
+
+    `owner` / `repo` / `pr` are kept on the signature for caller
+    uniformity with `fetch_threads` even though `Query.nodes` doesn't
+    need them; the GraphQL variables declared in the document track the
+    old shape so the byte-identity copy in maxi-config stays a
+    one-character substitution. Pinned by
+    `test_fetch_thread_bodies_signature_includes_pr_coords` so a future
+    refactor that drops them only lands if it also updates the docstring
+    contract above.
     """
     if not thread_ids:
         return {}
     bodies: dict[str, str] = {}
-    # The PR's reviewThreads set has an `ids:` filter, so a single
-    # query returns every requested thread's comment list. Smaller than
-    # an N-query loop, and the cost is one round-trip per run rather
-    # than N -- the old shape paid one round-trip per duplicate, which
-    # was the bottleneck Codacy flagged on PR #723.
+    # `Query.nodes(ids: [ID!]!)` is a real top-level field (verified
+    # against the live schema on 2026-09-19 -- `PullRequest.reviewThreads`
+    # only takes `after, before, first, last`, never `ids:`). The body of
+    # this query does not need PR coordinates, so the document does not
+    # declare them. `fetch_thread_bodies`'s signature still carries
+    # `(owner, repo, pr)` for caller uniformity with `fetch_threads`; the
+    # docstring contract above spells out why we keep them.
     query = """
-    query($owner:String!,$repo:String!,$pr:Int!,$ids:[ID!]!){
-      repository(owner:$owner,name:$repo){
-        pullRequest(number:$pr){
-          reviewThreads(first:100,ids:$ids){
-            nodes{
-              id
-              comments(first:50){
-                nodes{ body }
-              }
-            }
+    query($ids:[ID!]!){
+      nodes(ids:$ids){
+        ... on PullRequestReviewThread{
+          id
+          comments(first:50){
+            nodes{ body }
           }
         }
       }
     }
     """
-    payload = _gh_graphql(
-        query, owner=owner, repo=repo, pr=pr, ids=thread_ids
-    )
-    threads = (
-        payload["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-    )
-    for thread in threads:
+    payload = _gh_graphql(query, ids=thread_ids)
+    thread_nodes = (payload.get("data") or {}).get("nodes") or []
+    for thread in thread_nodes:
+        if not thread:
+            # `nodes(ids:)` echoes a `null` slot for every ID that does
+            # not resolve to the requested type or is unknown; the inner
+            # block is skipped rather than crashed on so a stale ID
+            # doesn't kill the whole run.
+            continue
         thread_id = thread.get("id")
         if not thread_id:
             continue
