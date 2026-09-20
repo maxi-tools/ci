@@ -109,7 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
-          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py; do
+          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_lane_decisions.py; do
             echo "== $t"
             if ! python3 "$t"; then
               echo "::error file=$t::$t failed"
@@ -118,7 +118,7 @@ jobs:
           done
           # Non-vacuity: every tests/test_*.py must be in the list above.
           for f in tests/test_*.py; do
-            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py " in
+            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_lane_decisions.py " in
               *" $f "*) ;;
               *) echo "::error file=$f::$f exists but is not run by this lane; add it to the list"; failed=1 ;;
             esac

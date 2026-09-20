@@ -152,16 +152,33 @@ jobs:
         run: |
           set -euo pipefail
           echo "Lane needs: $MERGE_GATE_NEEDS"
-          python3 - "$MERGE_GATE_NEEDS" <<'PY'
-          import json, sys
-          needs = json.loads(sys.argv[1])
-          failing = [(name, info["result"]) for name, info in needs.items()
-                     if info.get("result") in ("failure", "cancelled")]
-          if failing:
-              for name, result in failing:
-                  print(f"::error::Required lane {name!r} reported {result!r}; merge-gate fails.")
+          # The needs context is read from the ENVIRONMENT, not argv: it is
+          # unbounded (one entry per lane, each with outputs) and argv is
+          # bounded by ARG_MAX. (codacy, maxi-config#790.)
+          python3 <<'PY'
+          import json, os, sys
+
+          # ALLOWLIST, not a denylist. The previous shape failed on
+          # `failure` and `cancelled` only, so any other value -- a result
+          # GitHub adds later, or an entry whose `result` key is missing
+          # because a lane never reported -- passed the gate silently.
+          # This job is the SOLE required context under the new ruleset, so
+          # "a value I do not recognise" must mean stop, not proceed.
+          # `skipped` is the one non-success that is genuinely fine: the
+          # fan-out and docs-only paths skip lanes deliberately, and the
+          # lane-side guards keep the check runs present as `skipped`.
+          PASSING = ("success", "skipped")
+
+          needs = json.loads(os.environ["MERGE_GATE_NEEDS"])
+          bad = [(name, info.get("result")) for name, info in needs.items()
+                 if info.get("result") not in PASSING]
+          if bad:
+              for name, result in bad:
+                  print(f"::error::Required lane {name!r} reported {result!r}; "
+                        "merge-gate fails.")
               sys.exit(1)
-          skipped = [name for name, info in needs.items() if info.get("result") == "skipped"]
+          skipped = [name for name, info in needs.items()
+                     if info.get("result") == "skipped"]
           print(f"All required lanes passed (or were skipped). skipped={skipped}")
           PY
 
