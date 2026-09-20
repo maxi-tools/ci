@@ -21,6 +21,15 @@ on:
         required: false
         type: boolean
         default: false
+      repo_policy:
+        # Forwarded for parity with lane-check.yml: the test lane has no
+        # house-style-only step to skip, but consumers still set
+        # `repo_policy: fork-upstream` on the wrapper and the value travels
+        # here unchanged so the contract test can verify the threading.
+        # See docs/contracts/fork-lane-policy.md.
+        required: false
+        type: string
+        default: standard-rust
 
     secrets:
       APP_ID:
@@ -33,16 +42,16 @@ permissions: {}
 # Callers set CARGO_NET_GIT_FETCH_WITH_CLI at their workflow level, but env
 # does not cross the reusable-workflow boundary: without it here, cargo
 # fetches git deps with libgit2, which cannot use the app-token insteadOf
-# rewrite, and private git dependencies fail to authenticate.
+# rewrite, and private git deps (e.g. maxi-libs) fail to authenticate.
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
   CARGO_TERM_COLOR: always
   # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
   # (e.g. a shared farm cache in the runner service .env) can never redirect
   # build output or make concurrent jobs serialize on one build-dir flock,
-  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Fleet
-  # policy: cross-run reuse belongs in sccache; Cargo target dirs stay
-  # workspace-local and disposable.
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Policy
+  # (hooks/cargo-cache-policy.sh in maxi-core): cross-run reuse belongs in
+  # sccache; Cargo target dirs stay workspace-local and disposable.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   MAXI_TRAY_SKIP_SWIFT_BUILD: ${{ inputs.skip_swift_build && '1' || '' }}
 
@@ -50,8 +59,8 @@ jobs:
   lane-test:
     # Same as lane-check.yml, including WHY the guard lives on this job rather
     # than on the caller: a skipped caller job never creates the nested check
-    # run, and `merge-gate / test / lane-test` is a REQUIRED context in many
-    # consumer repositories. Skipped is accepted there; absent can never merge.
+    # run, and `merge-gate / test / lane-test` is a REQUIRED context in ~20
+    # repos. Skipped is accepted there; absent can never merge.
     if: ${{ github.actor != 'dependabot[bot]' }}
     runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
     continue-on-error: ${{ inputs.advisory }}
@@ -83,11 +92,11 @@ jobs:
           [ -n "$packages" ] || exit 0
 
           # Not every self-hosted Linux runner is Debian-family with a sudoer
-          # build user. Some run a declaratively-configured distribution with
-          # neither apt-get nor sudo, taking system libraries from the machine's
-          # own configuration instead — so hard-coding `sudo apt-get` failed
-          # every lane at provisioning with `sudo: command not found`, seconds
-          # in, before compiling anything.
+          # build user. The NixOS ml-node boxes that now serve `linux-x64` have
+          # neither apt-get nor sudo — they get system libraries from the
+          # machine's Nix configuration — so hard-coding `sudo apt-get` failed
+          # every lane at provisioning with `sudo: command not found`, three
+          # seconds in, before compiling anything.
           if ! command -v apt-get >/dev/null 2>&1; then
             echo "::notice::No apt-get on this runner; expecting its image to provide: $packages"
             exit 0
@@ -113,29 +122,43 @@ jobs:
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
-          # Deliberately still `app-id` rather than `client-id`.
+          # Deliberately still app-id. Not an oversight -- see maxi-config#527.
           #
-          # This is a `workflow_call` workflow: it sees only the secrets its
-          # CALLER passes, and the wrapper that consumers vendor forwards
-          # `APP_ID` by name. Flipping to `client-id` takes effect in every
-          # consumer the moment this file lands on main, while their wrappers
-          # still forward only `APP_ID` -- an empty client-id and a failing
-          # token step fleet-wide. The org secret existing does not help; a
-          # called workflow cannot read a secret nobody handed it.
+          # This is a `workflow_call` workflow: it only sees secrets its CALLER
+          # passes, and `.github/workflows/rust-ci.yml` declares `APP_ID` explicitly
+          # rather than using `secrets: inherit`. Its own caller is the vendored
+          # `ci.yml` wrapper in ~38 consumer repos, pinned at
+          # `maxi-tools/maxi-config/.github/workflows/rust-ci.yml@main`. Flipping
+          # this to `client-id: ${{ secrets.APP_CLIENT_ID }}` takes effect on
+          # every one of those repos the moment this file lands on main, while
+          # their wrappers still forward only `APP_ID` -- an empty client-id and
+          # a failing token step fleet-wide. The org secret existing does not
+          # help; a called workflow cannot read a secret nobody handed it.
           #
           # Order of operations: thread `APP_CLIENT_ID` through the wrapper
-          # template first, let the fan-out deliver it, then flip the call
-          # sites.
+          # template first, let maxi-config-sync deliver it (maxi-core#3881),
+          # then flip these five call sites.
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: maxi-tools
-          # Scoped deliberately. Without a `permission-*` input this mint
-          # inherits the whole App installation rather than the read this lane
-          # needs, which is a large over-grant handed to a job that only reads
-          # files. Always state the permissions.
+          # Scoped to what this token is actually USED for, which is two reads:
+          # the maxi-config policy fetch below (fetch-policy issues
+          # GET /repos/maxi-tools/maxi-config/contents/...) and the private-
+          # dependency `insteadOf` rewrite that lets cargo clone maxi-tools
+          # crates. Neither writes anything.
           #
-          # The reasoning, the incident and the scope tables are recorded
-          # privately in maxi-config.
+          # Without a permission-* input the mint inherits the WHOLE
+          # installation, and this installation is repository_selection=all over
+          # the org: contents/workflows/actions write on every repo plus
+          # organization_self_hosted_runners write. That is org-wide write --
+          # including the power to rewrite workflows and deregister the runners
+          # themselves -- handed to a lane that only reads files, in ~38
+          # consumer repos on every push. See maxi-config#581.
+          #
+          # `repositories:` is deliberately NOT added: this file fans out by
+          # reference to consumer repos with different private-dependency sets,
+          # and a list derived from one of them leaves the rest fetching
+          # uncredentialed (maxi-config#557).
           permission-contents: read
 
       - name: Install Rust toolchain
@@ -150,7 +173,7 @@ jobs:
         # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
         # the success condition -- moved into the action unchanged, along with
         # why that action is referenced by its full owner/repo path.
-        uses: maxi-tools/ci/.github/actions/fetch-policy@main
+        uses: maxi-tools/maxi-config/.github/actions/fetch-policy@main
         with:
           policy-files: |
             scripts/select-rust-toolchain.sh
@@ -232,12 +255,13 @@ jobs:
       # already warm from the step above, and its exit status is the lane's.
       #
       # This exists because `cargo test` passing is not always evidence that a
-      # crate works. One crate in this fleet exports a UniFFI surface that is
-      # validated at BINDGEN time, not at compile time: an exported
+      # crate works. maxi-transport exports a UniFFI surface that is validated
+      # at BINDGEN time, not at compile time: an exported
       # `-> Result<T, String>` compiles clean, tests clean, and then aborts
-      # uniffi-bindgen with "unknown throw type: Some(String)". It shipped a
-      # Swift-facing API from which no Swift could be produced, green in CI the
-      # entire time, because nothing ever ran the generator.
+      # uniffi-bindgen with "unknown throw type: Some(String)". That crate
+      # shipped a Swift-facing API from which no Swift could be produced, green
+      # in CI the entire time, because nothing ever ran the generator
+      # (maxi-transport#280).
       #
       # It hangs off lane-test rather than lane-check deliberately. `cargo test
       # --workspace --all-targets` has already codegen'd every crate type, so a

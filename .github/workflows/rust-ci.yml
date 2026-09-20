@@ -33,21 +33,11 @@ on:
       APP_PRIVATE_KEY:
         description: GitHub App private key paired with APP_ID.
         required: true
+  push:
+    branches: [main, release/**]
+  pull_request:
+  workflow_dispatch:
 
-# workflow_call ONLY, unlike the copy this was moved from.
-#
-# In maxi-config this file also carried `push`, `pull_request` and
-# `workflow_dispatch`, because maxi-config is itself a Rust workspace and those
-# triggers ran its own CI -- redundantly, since maxi-config also vendors the
-# wrapper. Two things are true here and neither was true there: this repository
-# contains no Cargo workspace, so a self-triggered lane would `cargo fmt` a tree
-# with no Cargo.toml and be permanently red; and a repository that exists to be
-# CALLED should not also be a caller, or its own runs become indistinguishable
-# from its consumers' on the Actions tab.
-#
-# Consumers are unaffected -- they reach this file through `uses:`, which is the
-# `workflow_call` trigger, and every `github.event_name` test below reads the
-# CALLER's event, not this file's triggers.
 permissions: {}
 
 env:
@@ -57,9 +47,9 @@ env:
   # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
   # (e.g. a shared farm cache in the runner service .env) can never redirect
   # build output or make concurrent jobs serialize on one build-dir flock,
-  # where the cpu-liveness guard kills the lock-waiter at 0% CPU.
-  # Fleet policy: cross-run reuse belongs in sccache; Cargo target dirs stay
-  # workspace-local and disposable.
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Policy
+  # (hooks/cargo-cache-policy.sh in maxi-core): cross-run reuse belongs in
+  # sccache; Cargo target dirs stay workspace-local and disposable.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
@@ -71,27 +61,22 @@ jobs:
     # the workflow file from the PR's merge commit, so a fork PR supplies this
     # `run:` block along with everything else in the file. "Inspect what the
     # shell body currently does" is a review of the base branch, not a boundary
-    # around what will execute on `[self-hosted, Linux]`.
+    # around what will execute on `[self-hosted, Linux, X64]`.
     #
     # Stated plainly because the guard is easy to over-read: this closes the
     # DECLARED lanes. A fork PR can also add a job that was never here, and no
     # `if:` in this file constrains that -- the boundary for that is the org's
     # "self-hosted runners for fork pull requests" setting plus required
-    # approval for outside contributors, both of which are set at org level.
+    # approval for outside contributors. See maxi-tools/maxi-config#345.
     if: >
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
-    # Deliberately self-hosted rather than a hosted runner: when hosted
-    # capacity is unavailable a job is rejected before a runner is assigned --
-    # zero steps, no log, seconds to "failure" -- so this sentinel reported the
-    # PR broken without ever evaluating the enforcement mode it exists to
-    # report. It is pure bash (echo and date), so any POSIX lane runs it --
-    # which is why the architecture is not pinned. `X64` here bought nothing
-    # and cost capacity: this job needs a shell and a clock, and excluding
-    # arm64 kept it queueing behind a saturated x64 pool for no reason. The
-    # canonical copy in maxi-config has been `[self-hosted, Linux]` for a
-    # while; this brings the two back into agreement.
-    runs-on: [self-hosted, Linux]
+    # Was ubuntu-latest. With the org's Actions allowance exhausted, hosted
+    # jobs are rejected before a runner is assigned -- zero steps, no log, ~3s
+    # to "failure" -- so this sentinel reported the PR broken without ever
+    # evaluating the enforcement mode it exists to report. It is pure bash
+    # (echo and date), so the self-hosted Linux fleet runs it unchanged.
+    runs-on: [self-hosted, Linux]  # ARM64 welcome: this job's deps are verified present on the DGX boxes.
     permissions:
       contents: read
     steps:
@@ -138,9 +123,9 @@ jobs:
     # it unconditionally -- and `gh workflow run --ref` accepts ANY branch, so
     # anyone with write access to a consumer repository could dispatch its CI
     # at a branch of their own and have the fleet build that branch. Pinned to
-    # the owner by numeric id, which the trusted-actor policy also pins; logins
-    # can be reassigned, ids cannot. The ref is deliberately NOT pinned:
-    # dispatching CI at a work-in-progress branch is the normal use.
+    # the owner by numeric id (ci/review-trusted-actors.toml pins 874012;
+    # logins can be reassigned, ids cannot). The ref is deliberately NOT
+    # pinned: dispatching CI at a work-in-progress branch is the normal use.
     #
     # `push` keeps its unconditional clearance -- this workflow's push trigger
     # is `branches: [main, release/**]`, i.e. post-merge code.
@@ -156,34 +141,6 @@ jobs:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
-  # NOT ON THE FAN-OUT. A `maxi-config-sync/*` PR carries a byte-for-byte copy
-  # of a payload already tested on the canon, so building and testing the
-  # workspace in every consumer re-derives one answer ~38 times.
-  #
-  # Measured 2026-09-19: one distribute run touched 48 consumer PRs. With all
-  # 35 runners busy the resulting queue stalled unrelated work for 15+
-  # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
-  # not queue time, and rerun_stalled_jobs.py only catches a job a runner
-  # ACCEPTED and never started, not one that was never assigned.
-  #
-  # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
-  # AND the distributor identity, matched by NUMERIC ID. That file is
-  # explicit -- "Stable GitHub database ID is canonical ... A login can be
-  # changed; this cannot" -- and the `plan` job above already pins its owner
-  # the same way. The first cut of this guard compared `user.login`, which
-  # would have handed the skip to whoever next claimed the name
-  # `maxi-tools-auth`. `github.event_name` is now tested explicitly rather
-  # than leaning on a null `pull_request` object coercing to false on push
-  # and workflow_dispatch.
-  #
-  # A head ref is chosen by whoever pushes the branch, so a prefix-only test
-  # would let anyone skip CI by naming a branch. The review lanes have
-  # applied this rule for months
-  # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
-  # and nothing recorded that as deliberate -- because it was not.
-  #
-  # `merge-gate` and `plan` still run, so the PR reports and can merge;
-  # `package` already tolerates check/test being skipped.
   check:
     needs: plan
     if: >-
@@ -200,38 +157,17 @@ jobs:
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
       allow_unwrap_used: ${{ inputs.allow_unwrap_used == true }}
+      # Forwarded unchanged to lane-check. The lane reads
+      # `inputs.repo_policy` to gate the house-style-only steps. Forwarding
+      # `inputs.repo_policy` (not a literal) means a consumer that sets
+      # `repo_policy: fork-upstream` on the wrapper's `merge-gate` job gets
+      # the exemption without further changes. Default `standard-rust` keeps
+      # every existing repo's behaviour identical.
+      repo_policy: ${{ inputs.repo_policy }}
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
-  # NOT ON THE FAN-OUT. A `maxi-config-sync/*` PR carries a byte-for-byte copy
-  # of a payload already tested on the canon, so building and testing the
-  # workspace in every consumer re-derives one answer ~38 times.
-  #
-  # Measured 2026-09-19: one distribute run touched 48 consumer PRs. With all
-  # 35 runners busy the resulting queue stalled unrelated work for 15+
-  # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
-  # not queue time, and rerun_stalled_jobs.py only catches a job a runner
-  # ACCEPTED and never started, not one that was never assigned.
-  #
-  # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
-  # AND the distributor identity, matched by NUMERIC ID. That file is
-  # explicit -- "Stable GitHub database ID is canonical ... A login can be
-  # changed; this cannot" -- and the `plan` job above already pins its owner
-  # the same way. The first cut of this guard compared `user.login`, which
-  # would have handed the skip to whoever next claimed the name
-  # `maxi-tools-auth`. `github.event_name` is now tested explicitly rather
-  # than leaning on a null `pull_request` object coercing to false on push
-  # and workflow_dispatch.
-  #
-  # A head ref is chosen by whoever pushes the branch, so a prefix-only test
-  # would let anyone skip CI by naming a branch. The review lanes have
-  # applied this rule for months
-  # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
-  # and nothing recorded that as deliberate -- because it was not.
-  #
-  # `merge-gate` and `plan` still run, so the PR reports and can merge;
-  # `package` already tolerates check/test being skipped.
   test:
     needs: plan
     if: >-
@@ -247,6 +183,10 @@ jobs:
       advisory: ${{ github.event_name == 'pull_request' && vars.CI_ENFORCEMENT_MODE != 'strict' }}
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
+      # Same as `check`: forwarded for parity even though lane-test does not
+      # gate on it today. The contract test verifies the value reaches both
+      # lanes.
+      repo_policy: ${{ inputs.repo_policy }}
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
