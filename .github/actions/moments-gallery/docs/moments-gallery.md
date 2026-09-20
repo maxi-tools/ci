@@ -40,9 +40,9 @@ copy.
   "schema": "maxi-tools.moments-gallery.v1",
   "title": "HUD desktop e2e — 2026-09-18", // optional; defaults to "moments gallery"
 
-  // Run header. Every field is optional, but `repo`, `ref`, `box` and
-  // `date` are the four the HTML renders by default. Anything else is
-  // rendered as an extra row in the same header.
+  // Run header. Every field is optional. The HTML renders the
+  // well-known keys (`repo`, `ref`, `box`, `date`, `lane`, `commit`)
+  // in a fixed order and ignores anything else.
   "run": {
     "repo": "maxi-tools/voicemaci",
     "ref": "wt/moments-gallery-survey",
@@ -56,7 +56,7 @@ copy.
   // renders them in.
   "scenarios": [
     {
-      "id": "warmup",                       // required, unique, slug-shaped
+      "id": "warmup",                       // optional; falls back to scenario-<index>. Must be a slug of [A-Za-z0-9._-] when set, so the value is safe to embed in a path.
       "label": "warmup",                     // optional; defaults to id
       "description": "cold start; timing not asserted",
 
@@ -97,7 +97,7 @@ copy.
 | `schema` | string | yes | Must be `"maxi-tools.moments-gallery.v1"`. The renderer refuses any other value. |
 | `title` | string | no | HTML `<title>` and the H1 at the top of the page. |
 | `run` | object | no | Free-form header data. The known fields are `repo`, `ref`, `box`, `date`, `lane`, `commit`. |
-| `scenarios[].id` | string | yes | Unique scenario identifier. Becomes the section's DOM id and the audio file's basename. |
+| `scenarios[].id` | string | no | Scenario identifier. Optional; the renderer substitutes `scenario-<index>` when absent. Must match `[A-Za-z0-9._-]+` if present (the value is reused in the gallery output path). The renderer writes the resolved id to the section's `data-scenario` attribute. |
 | `scenarios[].label` | string | no | Display name; defaults to `id`. |
 | `scenarios[].description` | string | no | One-line description shown under the label. |
 | `scenarios[].audio` | string | no | Path (relative to root) to the scenario's audio file. Copied into the output and renamed `<id>.<ext>`. |
@@ -240,7 +240,7 @@ moved across.
 python3 .github/actions/moments-gallery/moments_gallery.py --self-test
 ```
 
-Builds a synthetic root with two scenarios, three PNGs each, a JSON
-facts file, an audio file, and a manifest that mixes held and failed
-claims; runs the renderer; and asserts on the HTML and the file
-layout. Uses stdlib only.
+Builds a synthetic root with two scenarios (warmup: two PNGs;
+samantha-normal: three PNGs), a JSON facts file, an audio file,
+and a manifest that mixes held and failed claims; runs the renderer;
+and asserts on the HTML and the file layout. Uses stdlib only.

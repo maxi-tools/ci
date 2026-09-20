@@ -44,11 +44,16 @@ import base64
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 from typing import Any
 
 SCHEMA = "maxi-tools.moments-gallery.v1"
+
+# Slug used for scenario ids; conservative so a hand-edited
+# manifest cannot escape the gallery root via `moments/<id>/`.
+_SCENARIO_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 HTML_FILENAME = "index.html"
 MOMENTS_SUBDIR = "moments"
 
@@ -146,7 +151,20 @@ def _normalise_scenarios(
     for index, raw in enumerate(scenarios):
         if not isinstance(raw, dict):
             raise GalleryError(f"scenarios[{index}] is not an object")
-        scenario_id = raw.get("id") or f"scenario-{index}"
+        raw_id = raw.get("id")
+        if raw_id is None or raw_id == "":
+            scenario_id = f"scenario-{index}"
+        elif (
+            not isinstance(raw_id, str)
+            or _SCENARIO_ID_RE.fullmatch(raw_id) is None
+            or raw_id in (".", "..")
+        ):
+            raise GalleryError(
+                f"scenarios[{index}].id must be a slug of "
+                f"[A-Za-z0-9._-]; got {raw_id!r}"
+            )
+        else:
+            scenario_id = raw_id
         moments_raw = raw.get("moments")
         if not isinstance(moments_raw, list) or not moments_raw:
             raise GalleryError(
@@ -401,7 +419,17 @@ def _render_html(manifest: dict[str, Any], scenarios: list[dict[str, Any]]) -> s
     title = _html_escape(manifest.get("title") or "moments gallery")
     run_header = _render_run_header(manifest.get("run") or {})
     body = "\n".join(_render_scenario(s) for s in scenarios)
-    json_blob = json.dumps({"scenarios": scenarios})
+    # Defense in depth: the blob is embedded inside a <script
+    # type="application/json"> block. Manifest and facts values may
+    # contain `<script>` or markup; Unicode-escape the three HTML
+    # context-sensitive characters so the renderer cannot be tricked
+    # by a hostile summary string into terminating the element.
+    json_blob = (
+        json.dumps({"scenarios": scenarios})
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
     # The embedded JSON keeps the file self-contained so the gallery works
     # when opened straight from a downloaded artifact (no fetch, no XHR).
     return f"""<!doctype html>
