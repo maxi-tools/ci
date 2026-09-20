@@ -36,7 +36,7 @@ on:
         type: boolean
         default: false
       consumer_repo:
-        description: 'Limit the fan-out to a single owner/repo (repeatable)'
+        description: 'Limit the fan-out to these owner/repo names, comma-separated'
         required: false
 
 concurrency:
@@ -112,14 +112,29 @@ jobs:
           if [ "$DRY_RUN" = "true" ]; then
             args+=(--dry-run)
           fi
-          # Decode the optional --consumer-repo array. Inputs of type
-          # array arrive as a JSON list; an empty list serialises as
-          # the string "null" and the shell receives a single empty
-          # arg, which we drop.
+          # Decode the optional consumer list. A workflow_dispatch input
+          # is a STRING -- there is no array input type -- so toJSON()
+          # yields a JSON string, and the first cut of this loop iterated
+          # it character by character: dispatch 35504357184 with
+          # consumer_repo=maxi-tools/maxi-kvm ran against 19 "consumers"
+          # named m, a, x, i, -, ... and reported 19 unreadable. The
+          # comment above it described an array type that does not
+          # exist. Accept a comma-separated string (the real shape) and,
+          # defensively, a JSON list should the input ever become one.
+          # An unset input serialises as "null".
           if [ -n "$EXTRA_REPOS_JSON" ] && [ "$EXTRA_REPOS_JSON" != "null" ]; then
-            for r in $(echo "$EXTRA_REPOS_JSON" | python3 -c 'import json,sys; [print(repo) for repo in json.load(sys.stdin) if repo]'); do
-              args+=(--consumer-repo "$r")
-            done
+            while IFS= read -r r; do
+              [ -n "$r" ] && args+=(--consumer-repo "$r")
+            done < <(printf '%s' "$EXTRA_REPOS_JSON" | python3 -c '
+          import json, sys
+          v = json.load(sys.stdin)
+          items = v if isinstance(v, list) else [v]
+          for item in items:
+              for name in str(item).split(","):
+                  name = name.strip()
+                  if name:
+                      print(name)
+          ')
           fi
           # --json selects the report format: one JSON row per consumer,
           # AFTER execution, each with an `outcome`. Until ci#29 the
