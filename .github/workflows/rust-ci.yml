@@ -78,9 +78,26 @@ jobs:
     # `if:` in this file constrains that -- the boundary for that is the org's
     # "self-hosted runners for fork pull requests" setting plus required
     # approval for outside contributors, both of which are set at org level.
-    if: >
+    #
+    # AGGREGATE, not just a sentinel. This job is the SOLE required context
+    # under the post-merge-gate ruleset (maxi-tools/ci#<this PR> +
+    # maxi-tools/maxi-config#<mirrored PR>); if a required lane reports
+    # FAILURE while this concludes SUCCESS, the ruleset is structurally
+    # weaker than the lanes it is supposed to replace. So `merge-gate` waits
+    # on every declared lane job (`needs:` below) and re-evaluates their
+    # results in a step that always runs -- skipped lanes (fan-out case) are
+    # fine, but failure or cancellation MUST surface as a FAILURE conclusion
+    # here, not as a green check that hides a red lane.
+    #
+    # `if:` adds `always()` to the fork tripwire so this gate's check run is
+    # present whether its needs succeeded OR failed -- without it, a failing
+    # `check`/`test` skips this job and the required context vanishes. That
+    # is precisely the failure mode this slice exists to fix.
+    if: >-
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      always()
+    needs: [plan, check, test, package, sign-publish, release-verify]
     # Deliberately self-hosted rather than a hosted runner: when hosted
     # capacity is unavailable a job is rejected before a runner is assigned --
     # zero steps, no log, seconds to "failure" -- so this sentinel reported the
@@ -119,9 +136,34 @@ jobs:
           fi
           {
             echo "## merge-gate summary"
-            echo "- check and test lanes provide PR confidence"
+            echo "- this job is the aggregate of every declared lane and is the sole required context under the new ruleset"
+            echo "- a lane reporting failure or cancellation surfaces here as a FAILURE conclusion, not as a green check"
             echo "- package/sign/release lanes are deferred unless packaging impact or trusted release refs require them"
           } >> "$GITHUB_STEP_SUMMARY"
+      # Always runs so a failed upstream lane is reported by THIS job, not by
+      # the lane itself (which the ruleset no longer requires). Skipped is
+      # fine (fan-out: e.g. merge-gate-only scope, no push to release refs);
+      # failure or cancellation is the failure mode this step exists for.
+      - name: Aggregate lane results
+        if: always()
+        shell: bash
+        env:
+          MERGE_GATE_NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "Lane needs: $MERGE_GATE_NEEDS"
+          python3 - "$MERGE_GATE_NEEDS" <<'PY'
+          import json, sys
+          needs = json.loads(sys.argv[1])
+          failing = [(name, info["result"]) for name, info in needs.items()
+                     if info.get("result") in ("failure", "cancelled")]
+          if failing:
+              for name, result in failing:
+                  print(f"::error::Required lane {name!r} reported {result!r}; merge-gate fails.")
+              sys.exit(1)
+          skipped = [name for name, info in needs.items() if info.get("result") == "skipped"]
+          print(f"All required lanes passed (or were skipped). skipped={skipped}")
+          PY
 
   plan:
     # The gate for the WHOLE lane chain. `check`, `test`, `package`,
