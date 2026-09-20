@@ -271,73 +271,51 @@ def _decode_b64(b64_text: str) -> str:
     return base64.b64decode(b64_text.translate({ord('\n'): None})).decode('utf-8')
 
 
-def _consumer_current_sha(consumer: Consumer, *, token: str) -> str:
-    return _gh(
-        ['api', f'repos/{consumer.name}/git/ref/heads/main', '--jq', '.object.sha'],
-        token=token,
-    ).strip()
+# ONE branch per consumer, moved forward on every tip. The first cut
+# keyed the branch on the tip sha (`ci/fanout-<sha12>`), so every push to
+# ci main that touched a workflow opened a SECOND PR per consumer beside
+# the previous one and closed nothing: after ci#31 merged, 49 open
+# `ci/fanout-660e29c4` PRs were about to be joined by 49 at a856e0d4
+# (run 35504925677, cancelled by hand). The stable name makes a tip
+# advance a force-push the existing PR follows, and the legacy per-sha
+# PRs are closed as superseded when they are met.
+HEAD_REF = 'ci/fanout-pin'
+LEGACY_HEAD_RE = re.compile(r'^ci/fanout-[0-9a-f]{12}$')
 
 
-def _open_pr(
-    *,
-    consumer: Consumer,
-    workflow_file: str,
-    old_ref: str,
-    new_ref: str,
-    tip_sha: str,
-    token: str,
-    dry_run: bool,
-) -> tuple[str, str | None]:
-    '''Open the fan-out PR on `consumer`. Return (outcome, PR URL).
-
-    The PR is one commit advancing the `uses:` ref; the body explains
-    why and links the ci PR that landed the change. If a fan-out PR is
-    already open for this tip, return its URL instead of opening a
-    duplicate.
-    '''
-    head_ref = f'ci/fanout-{tip_sha[:12]}'
-    title = f'ci: advance pin to {tip_sha[:12]} ({workflow_file})'
-    body = (
-        f'Fan-out from `maxi-tools/ci` @{tip_sha}.\n\n'
-        f'This PR advances `{workflow_file}.yml` from `{old_ref}` to '
-        f'`{new_ref}` (40-char sha).\n\n'
-        f'See `docs/contracts/first-party-pin-scheme.md` in `maxi-tools/ci` '
-        f'for the rule and the inert-detector this PR is part of. '
-        f'To opt out, close the PR and the next fan-out run will skip this '
-        f'consumer; re-enable by merging a follow-up that flips the pin.'
-    )
-
-    if dry_run:
-        return ('dry-run', None)
-
-    # Reuse an existing open PR if any (avoid duplicate-notification
-    # spam on weekly cron re-runs).
-    existing = _gh(
+def _open_fanout_prs(consumer: Consumer, *, token: str) -> list[dict]:
+    '''Every open PR on `consumer` whose head is a fan-out branch of ours.'''
+    out = _gh(
         [
             'pr', 'list',
             '--repo', consumer.name,
             '--state', 'open',
-            '--head', f'{consumer.name.split("/")[0]}:{head_ref}',
-            '--json', 'url',
-            '--jq', '.[].url',
+            '--limit', '100',
+            '--json', 'number,url,headRefName',
         ],
         token=token,
     ).strip()
-    if existing:
-        first = existing.splitlines()[0]
-        return ('reused', first) if first else ('opened', None)
+    prs = json.loads(out) if out else []
+    return [p for p in prs
+            if p['headRefName'] == HEAD_REF or LEGACY_HEAD_RE.match(p['headRefName'])]
 
-    head_sha = _consumer_current_sha(consumer, token=token)
 
-    # Branch, commit, push. A pre-existing branch (the cron re-run case)
-    # is reset to the consumer's current main.
-    _run([
-        'git', 'clone', '--depth', '1', '--branch', 'main',
-        f'https://x-access-token:{token}@github.com/{consumer.name}.git',
-        '/tmp/fanout',
-    ])
+def _push_pin_branch(
+    consumer: Consumer, *, head_ref: str, new_ref: str, token: str,
+) -> None:
+    '''Clone main, rewrite the pinned ref, commit, force-push `head_ref`.
+
+    A pre-existing branch is reset to the consumer's current main, so the
+    PR that follows it always carries exactly one commit over main.
+    '''
+    import tempfile
+    cwd = Path(tempfile.mkdtemp(prefix='fanout-'))
     try:
-        cwd = Path('/tmp/fanout')
+        _run([
+            'git', 'clone', '--depth', '1', '--branch', 'main',
+            f'https://x-access-token:{token}@github.com/{consumer.name}.git',
+            str(cwd),
+        ])
         _run(['git', 'checkout', '-B', head_ref], workdir=str(cwd))
         target = cwd / '.github/workflows/review-gate.yml'
         text = target.read_text(encoding='utf-8')
@@ -367,20 +345,86 @@ def _open_pr(
         )
         _run(['git', 'push', '-f', 'origin', head_ref], workdir=str(cwd))
     finally:
-        _run(['rm', '-rf', '/tmp/fanout'])
+        _run(['rm', '-rf', str(cwd)])
 
-    pr_url = _gh(
-        [
-            'pr', 'create',
-            '--repo', consumer.name,
-            '--base', 'main',
-            '--head', f'{consumer.name.split("/")[0]}:{head_ref}',
-            '--title', title,
-            '--body', body,
-        ],
-        token=token,
-    ).strip()
-    return ('opened', pr_url)
+
+def _open_pr(
+    *,
+    consumer: Consumer,
+    workflow_file: str,
+    old_ref: str,
+    new_ref: str,
+    tip_sha: str,
+    token: str,
+    dry_run: bool,
+) -> tuple[str, str | None]:
+    '''Open or move forward the fan-out PR on `consumer`. Return (outcome, URL).
+
+    `opened`: no fan-out PR was open, one was created on HEAD_REF.
+    `reused`: a PR on HEAD_REF was open; its branch was force-pushed to
+    the new tip and its title/body updated. Either way, any legacy
+    per-sha fan-out PR still open is closed as superseded.
+    '''
+    title = f'ci: advance pin to {tip_sha[:12]} ({workflow_file})'
+    body = (
+        f'Fan-out from `maxi-tools/ci` @{tip_sha}.\n\n'
+        f'This PR advances `{workflow_file}.yml` from `{old_ref}` to '
+        f'`{new_ref}` (40-char sha).\n\n'
+        f'One branch per consumer: this PR is moved forward on every tip '
+        f'rather than replaced. '
+        f'See `docs/contracts/first-party-pin-scheme.md` in `maxi-tools/ci` '
+        f'for the rule and the inert-detector this PR is part of. '
+        f'To opt out, close the PR and the next fan-out run will skip this '
+        f'consumer; re-enable by merging a follow-up that flips the pin.'
+    )
+
+    if dry_run:
+        return ('dry-run', None)
+
+    prs = _open_fanout_prs(consumer, token=token)
+    ours = next((p for p in prs if p['headRefName'] == HEAD_REF), None)
+    legacy = [p for p in prs if p['headRefName'] != HEAD_REF]
+
+    _push_pin_branch(consumer, head_ref=HEAD_REF, new_ref=new_ref, token=token)
+
+    if ours:
+        _gh(
+            [
+                'pr', 'edit', str(ours['number']),
+                '--repo', consumer.name,
+                '--title', title,
+                '--body', body,
+            ],
+            token=token,
+        )
+        outcome, url = 'reused', ours['url']
+    else:
+        url = _gh(
+            [
+                'pr', 'create',
+                '--repo', consumer.name,
+                '--base', 'main',
+                '--head', f'{consumer.name.split("/")[0]}:{HEAD_REF}',
+                '--title', title,
+                '--body', body,
+            ],
+            token=token,
+        ).strip()
+        outcome = 'opened'
+
+    for p in legacy:
+        _gh(
+            [
+                'pr', 'close', str(p['number']),
+                '--repo', consumer.name,
+                '--delete-branch',
+                '--comment',
+                f'Superseded by {url}: the fan-out now keeps one branch per '
+                f'consumer (`{HEAD_REF}`) and moves it forward on each tip.',
+            ],
+            token=token,
+        )
+    return (outcome, url)
 
 
 def _plan(

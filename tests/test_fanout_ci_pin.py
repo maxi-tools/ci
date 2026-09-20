@@ -171,5 +171,76 @@ class EveryConsumerIsAccountedFor(unittest.TestCase):
             self.assertIn(repr(name), src, f"{name!r} is declared but never emitted")
 
 
+class OneBranchPerConsumer(unittest.TestCase):
+    """_open_pr keeps ONE PR per consumer and moves it forward.
+
+    The first cut keyed the branch on the tip sha, so each tip opened a
+    second PR beside the last and closed nothing (49 + 49 after ci#31,
+    run 35504925677 cancelled by hand). `_gh` and `_push_pin_branch` are
+    recorded, not run.
+    """
+
+    def _drive(self, open_prs):
+        calls = []
+
+        def gh(args, *, token):
+            calls.append(args)
+            if args[:2] == ["pr", "list"]:
+                return json.dumps(open_prs)
+            if args[:2] == ["pr", "create"]:
+                return "https://github.com/maxi-tools/x/pull/9\n"
+            return ""
+
+        pushes = []
+        with mock.patch.object(fp, "_gh", gh), \
+             mock.patch.object(fp, "_push_pin_branch",
+                               lambda c, **kw: pushes.append(kw["head_ref"])):
+            outcome, url = fp._open_pr(
+                consumer=fp.Consumer("maxi-tools/x"), workflow_file="review-gate-reusable",
+                old_ref=OLD, new_ref=TIP, tip_sha=TIP, token="t", dry_run=False)
+        return outcome, url, calls, pushes
+
+    def test_no_open_pr_creates_one_on_the_stable_branch(self):
+        outcome, url, calls, pushes = self._drive([])
+        self.assertEqual((outcome, url), ("opened", "https://github.com/maxi-tools/x/pull/9"))
+        self.assertEqual(pushes, [fp.HEAD_REF])
+        create = next(c for c in calls if c[:2] == ["pr", "create"])
+        self.assertIn(f"maxi-tools:{fp.HEAD_REF}", create)
+        self.assertFalse(any(c[:2] == ["pr", "close"] for c in calls))
+
+    def test_an_open_pr_on_the_stable_branch_is_moved_not_duplicated(self):
+        ours = {"number": 4, "url": "https://github.com/maxi-tools/x/pull/4",
+                "headRefName": fp.HEAD_REF}
+        outcome, url, calls, pushes = self._drive([ours])
+        self.assertEqual((outcome, url), ("reused", ours["url"]))
+        self.assertEqual(pushes, [fp.HEAD_REF], "the branch is force-pushed to the new tip")
+        self.assertFalse(any(c[:2] == ["pr", "create"] for c in calls), "no second PR")
+        edit = next(c for c in calls if c[:2] == ["pr", "edit"])
+        self.assertEqual(edit[2], "4")
+        self.assertIn(f"ci: advance pin to {TIP[:12]} (review-gate-reusable)", edit)
+
+    def test_legacy_per_sha_prs_are_closed_as_superseded(self):
+        legacy = {"number": 2, "url": "https://github.com/maxi-tools/x/pull/2",
+                  "headRefName": "ci/fanout-660e29c41e4d"}
+        unrelated = {"number": 3, "url": "u3", "headRefName": "feat/thing"}
+        outcome, url, calls, _ = self._drive([legacy, unrelated])
+        self.assertEqual(outcome, "opened")
+        closes = [c for c in calls if c[:2] == ["pr", "close"]]
+        self.assertEqual([c[2] for c in closes], ["2"], "only the legacy fan-out PR")
+        self.assertIn(url, closes[0][closes[0].index("--comment") + 1])
+        order = [c[1] for c in calls if c[0] == "pr"]
+        self.assertLess(order.index("create"), order.index("close"),
+                        "the replacement exists before the old one is closed")
+
+    def test_dry_run_calls_nothing(self):
+        with mock.patch.object(fp, "_gh", no_network), \
+             mock.patch.object(fp, "_push_pin_branch", no_network):
+            self.assertEqual(
+                fp._open_pr(consumer=fp.Consumer("maxi-tools/x"),
+                            workflow_file="review-gate-reusable", old_ref=OLD,
+                            new_ref=TIP, tip_sha=TIP, token="t", dry_run=True),
+                ("dry-run", None))
+
+
 if __name__ == "__main__":
     unittest.main()
