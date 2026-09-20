@@ -95,3 +95,32 @@ jobs:
           python3 .github/scripts/fanout_ci_pin.py \
             --tip "$sha" --consumer-list-file "$empty_list" --dry-run --json
           echo 'fanout_ci_pin.py accepts, rejects, and exits cleanly on an empty list'
+
+      - name: Run the test suites
+        # Each file directly, by name, with a failure flag -- the same
+        # shape as maxi-config's script-tests lane, for the same reason:
+        # `unittest discover` needs an importable start directory, and a
+        # suite nobody lists here is run by nothing. tests/
+        # test_dedupe_review_threads.py (52 tests) sat unrun from ci#9 to
+        # ci#29 -- the smoke test above was this repository's only
+        # Python check, and it proves the fan-out script parses, not
+        # that it fans out. test_fanout_ci_pin.py is the one that
+        # would have caught --json returning before execution.
+        run: |
+          set -euo pipefail
+          failed=0
+          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py; do
+            echo "== $t"
+            if ! python3 "$t"; then
+              echo "::error file=$t::$t failed"
+              failed=1
+            fi
+          done
+          # Non-vacuity: every tests/test_*.py must be in the list above.
+          for f in tests/test_*.py; do
+            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py " in
+              *" $f "*) ;;
+              *) echo "::error file=$f::$f exists but is not run by this lane; add it to the list"; failed=1 ;;
+            esac
+          done
+          exit "$failed"
