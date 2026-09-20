@@ -115,17 +115,46 @@ jobs:
               args+=(--consumer-repo "$r")
             done
           fi
-          # --json keeps the job summary structured for the next step.
+          # --json selects the report format: one JSON row per consumer,
+          # AFTER execution, each with an `outcome`. Until ci#29 the
+          # script returned on --json before opening anything, so every
+          # run of this workflow since ci#24 planned ~48 consumers,
+          # opened no PR, and ended "fan-out completed". The rows are
+          # written to a file, not only to the summary, so the next
+          # step judges the same bytes the summary shows.
           args+=(--json)
           python3 .github/scripts/fanout_ci_pin.py "${args[@]}" \
-            | tee "$GITHUB_STEP_SUMMARY"
+            | tee "$RUNNER_TEMP/fanout-rows.jsonl" "$GITHUB_STEP_SUMMARY"
 
       - name: Post-summary check
         if: ${{ !inputs.dry_run }}
-        # Empty run (zero consumers behind the tip) is a pass, not a
-        # failure; an error in the script itself fails the step
-        # immediately under `set -e` above. This step exists so the
-        # job summary is the last line of the run log.
+        # Judges the rows the fan-out wrote. Every consumer must end in
+        # one accounted-for outcome; `failed` and `unreadable` fail this
+        # run (the script already exits 1 on them, `pipefail` carries
+        # that through `tee`, and this step names them); and a run that
+        # examined ZERO consumers is not an all-clear -- the default
+        # inventory is ~48 repositories, so an empty row set means the
+        # inventory was not read, not that nothing was behind.
+        env:
+          EXTRA_REPOS_JSON: ${{ toJSON(inputs.consumer_repo) }}
         run: |
           set -euo pipefail
-          echo 'fan-out completed; see step summary for the per-consumer plan'
+          python3 - "$RUNNER_TEMP/fanout-rows.jsonl" "$EXTRA_REPOS_JSON" <<'PY'
+          import collections, json, sys
+          rows = [json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')]
+          counts = collections.Counter(r['outcome'] for r in rows)
+          print(f"fan-out: {len(rows)} consumer row(s): "
+                + (', '.join(f'{n} {o}' for o, n in sorted(counts.items())) or 'none'))
+          ok = {'opened', 'reused', 'already', 'opt-out', 'no-pin', 'not-a-sha'}
+          bad = [r for r in rows if r['outcome'] not in ok]
+          for r in bad:
+              print(f"::error::{r['consumer']}: {r['outcome']} -- {r['detail']}")
+          for r in rows:
+              if r['outcome'] == 'opened':
+                  print(f"opened {r['consumer']}: {r['pr_url']}")
+          explicit = sys.argv[2] not in ('', 'null', '[]')
+          if not rows and not explicit:
+              print('::error::zero consumers examined on an inventory run; this is not an all-clear')
+              sys.exit(1)
+          sys.exit(1 if bad else 0)
+          PY

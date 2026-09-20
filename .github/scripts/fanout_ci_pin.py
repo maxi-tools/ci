@@ -46,7 +46,7 @@ import re
 import signal
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -171,13 +171,33 @@ class Consumer:
         return self.name
 
 
+# Every consumer the run looked at ends in exactly ONE of these. The
+# summary is a partition, not a count of the happy path: a consumer
+# whose pin could not be read is `unreadable`, not silently absent.
+OUTCOMES = ('opened', 'reused', 'already', 'dry-run', 'failed', 'unreadable',
+            'opt-out', 'no-pin', 'not-a-sha')
+
+
 @dataclass(frozen=True)
 class FanOut:
     consumer: Consumer
-    workflow_file: str  # e.g. 'review-gate-reusable'
+    workflow_file: str  # e.g. 'review-gate-reusable'; '' when nothing was read
     old_ref: str
     new_ref: str  # always a 40-char sha
     pr_url: str | None
+    outcome: str = 'planned'
+    detail: str = ''
+
+    def as_json(self) -> str:
+        return json.dumps({
+            'consumer': self.consumer.name,
+            'workflow_file': self.workflow_file,
+            'old_ref': self.old_ref,
+            'new_ref': self.new_ref,
+            'pr_url': self.pr_url,
+            'outcome': self.outcome,
+            'detail': self.detail,
+        })
 
 
 def _run(
@@ -267,8 +287,8 @@ def _open_pr(
     tip_sha: str,
     token: str,
     dry_run: bool,
-) -> str | None:
-    '''Open the fan-out PR on `consumer`. Return the PR URL or None.
+) -> tuple[str, str | None]:
+    '''Open the fan-out PR on `consumer`. Return (outcome, PR URL).
 
     The PR is one commit advancing the `uses:` ref; the body explains
     why and links the ci PR that landed the change. If a fan-out PR is
@@ -288,7 +308,7 @@ def _open_pr(
     )
 
     if dry_run:
-        return None
+        return ('dry-run', None)
 
     # Reuse an existing open PR if any (avoid duplicate-notification
     # spam on weekly cron re-runs).
@@ -305,7 +325,7 @@ def _open_pr(
     ).strip()
     if existing:
         first = existing.splitlines()[0]
-        return first or None
+        return ('reused', first) if first else ('opened', None)
 
     head_sha = _consumer_current_sha(consumer, token=token)
 
@@ -360,7 +380,7 @@ def _open_pr(
         ],
         token=token,
     ).strip()
-    return pr_url
+    return ('opened', pr_url)
 
 
 def _plan(
@@ -375,26 +395,31 @@ def _plan(
     `old_ref == new_ref` so the caller can log the no-op.
     '''
     plan: list[FanOut] = []
+
+    def dropped(consumer, outcome, detail, wf='', ref=''):
+        print(f'{consumer}: {outcome} ({detail})', file=sys.stderr)
+        plan.append(FanOut(consumer=consumer, workflow_file=wf, old_ref=ref,
+                           new_ref=tip_sha, pr_url=None, outcome=outcome,
+                           detail=detail))
+
     for name in consumers:
         consumer = Consumer(name)
         if name in OPT_OUTS:
-            print(f'{name}: skipped (opt-out: {OPT_OUTS[name]})')
+            dropped(consumer, 'opt-out', OPT_OUTS[name])
             continue
         try:
             pins = _fetch_consumer_pin(consumer, token=token)
         except Exception as exc:  # noqa: BLE001
-            print(f'{name}: could not read pin ({exc})', file=sys.stderr)
+            dropped(consumer, 'unreadable', f'could not read pin: {exc}')
             continue
         if not pins:
-            print(f'{name}: no `uses: maxi-tools/ci/.github/workflows/...` line')
+            dropped(consumer, 'no-pin',
+                    'no `uses: maxi-tools/ci/.github/workflows/...` line')
             continue
         for wf, ref in pins.items():
             if not SHA.match(ref):
-                print(
-                    f'{name}: {wf} pinned at `{ref}` (not a sha); '
-                    f'auto-fix refused',
-                    file=sys.stderr,
-                )
+                dropped(consumer, 'not-a-sha',
+                        f'pinned at `{ref}`; auto-fix refused', wf=wf, ref=ref)
                 continue
             plan.append(FanOut(
                 consumer=consumer,
@@ -409,26 +434,34 @@ def _plan(
 def _execute(plan: list[FanOut], *, tip_sha: str, token: str, dry_run: bool) -> list[FanOut]:
     executed: list[FanOut] = []
     for entry in plan:
+        if entry.outcome != 'planned':
+            executed.append(entry)  # dropped in _plan, reason already set
+            continue
         if entry.old_ref == entry.new_ref:
             print(f'{entry.consumer} {entry.workflow_file}: already at tip')
-            executed.append(entry)
+            executed.append(replace(entry, outcome='already'))
             continue
-        url = _open_pr(
-            consumer=entry.consumer,
-            workflow_file=entry.workflow_file,
-            old_ref=entry.old_ref,
-            new_ref=entry.new_ref,
-            tip_sha=tip_sha,
-            token=token,
-            dry_run=dry_run,
-        )
-        executed.append(FanOut(
-            consumer=entry.consumer,
-            workflow_file=entry.workflow_file,
-            old_ref=entry.old_ref,
-            new_ref=entry.new_ref,
-            pr_url=url,
-        ))
+        try:
+            outcome, url = _open_pr(
+                consumer=entry.consumer,
+                workflow_file=entry.workflow_file,
+                old_ref=entry.old_ref,
+                new_ref=entry.new_ref,
+                tip_sha=tip_sha,
+                token=token,
+                dry_run=dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The clone/commit/push/pr-create chain for THIS consumer
+            # failed. Record it and go on: the other consumers are
+            # independent, and a run that stops at the first one leaves
+            # every later consumer silently un-fanned.
+            print(f'{entry.consumer}: failed ({exc})', file=sys.stderr)
+            executed.append(replace(entry, outcome='failed', detail=str(exc)))
+            continue
+        executed.append(replace(entry, pr_url=url, outcome=outcome))
+    assert all(e.outcome in OUTCOMES for e in executed), \
+        [e for e in executed if e.outcome not in OUTCOMES]
     return executed
 
 
@@ -483,25 +516,23 @@ def main() -> int:
 
     plan = _plan(tip_sha=tip_sha, consumers=consumers, token=token or 'noop')
 
-    if args.json:
-        for entry in plan:
-            print(json.dumps({
-                'consumer': entry.consumer.name,
-                'workflow_file': entry.workflow_file,
-                'old_ref': entry.old_ref,
-                'new_ref': entry.new_ref,
-            }))
-        return 0
-
+    # `--json` used to print the plan and RETURN HERE, before _execute.
+    # fanout-ci-pin.yml passes --json unconditionally ("keeps the job
+    # summary structured"), so from ci#24 until this fix every run planned
+    # ~48 consumers, opened nothing, and printed "fan-out completed". The
+    # inert-detector was inert. --json now selects the report format only.
     executed = _execute(plan, tip_sha=tip_sha, token=token or 'noop', dry_run=args.dry_run)
 
-    n_opened = sum(1 for e in executed if e.pr_url)
-    n_already = sum(1 for e in executed if e.old_ref == e.new_ref)
-    print(
-        f'fan-out: {n_opened} PR(s) opened, {n_already} already at tip, '
-        f'{len(executed)} total'
-    )
-    return 0
+    counts = {o: sum(1 for e in executed if e.outcome == o) for o in OUTCOMES}
+    assert sum(counts.values()) == len(executed), (counts, len(executed))
+    if args.json:
+        for entry in executed:
+            print(entry.as_json())
+    summary = ', '.join(f'{n} {o}' for o, n in counts.items() if n)
+    print(f'fan-out: {len(executed)} consumer row(s): {summary or "none"}',
+          file=sys.stderr if args.json else sys.stdout)
+    bad = counts['failed'] + counts['unreadable']
+    return 1 if bad else 0
 
 
 if __name__ == '__main__':
