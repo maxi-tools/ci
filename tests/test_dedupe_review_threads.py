@@ -61,9 +61,10 @@ import io
 import json
 import os
 import pathlib
+import re
+import subprocess
 import sys
 import tempfile
-import re
 import unittest
 
 
@@ -961,6 +962,183 @@ class ThreadQueryMatchesTheSchema(unittest.TestCase):
             DEDUPE_PATH.read_text(encoding="utf-8"), self._COMMENT_NODES
         )
         self.assertIn("createdAt", comment_block)
+
+
+class ActionSummaryLines(unittest.TestCase):
+    """End-to-end test of the action.yml run step's three outcome lines.
+
+    Why this exists. The issue's acceptance criterion is that a 404 on
+    the checkout (or any unavailability) FAILS the step, and that the
+    step writes one of three explicit outcome lines to the summary in
+    every case. The 47 unit tests above pin the SCRIPT -- its GraphQL
+    flag dispatch, the top-level nodes(ids:) query, the cluster/plan
+    shape. None of them pin the SHELL that wraps the script: a future
+    edit to action.yml that drops the failure-path summary line or
+    re-adds `continue-on-error` would pass every test above while
+    silently re-introducing the silent-no-op defect this whole change
+    exists to close.
+
+    What the shell actually does is small enough to run as a subprocess
+    against a controlled script: capture the script's combined
+    stdout/stderr into `$out`, branch on its exit code, write one of
+    three lines to `$GITHUB_STEP_SUMMARY`. The test below extracts that
+    shell into a tiny shim, runs it against three controlled script
+    outputs, and asserts:
+
+      * `deduped N threads` is written on a successful run with N>0.
+      * `nothing to dedupe` is written on a successful run with N==0.
+      * `dedupe unavailable: <reason>` is written on a non-zero exit.
+      * The wrapper exits non-zero on the failure path so the calling
+        step -- which has no `continue-on-error` -- goes red.
+
+    The shim is a stripped copy of the actual run step; the assertion
+    is on the SHAPE of its behaviour, not on action.yml's text. The
+    two are kept in sync by `test_the_action_yml_run_step_matches_the_shim`
+    below, which fails if action.yml's run step drifts from the shim's
+    structure -- so a future change to the wrapper either lands through
+    this test class (with an updated assertion) or fails closed.
+    """
+
+    SHIM = ROOT / "tests" / "fixtures" / "sim_dedupe_run_step.sh"
+
+    def _run_shim(
+        self,
+        *,
+        script_output: str,
+        script_exit: int,
+    ) -> tuple[str, int]:
+        """Drive the shim with a controlled script output. Returns
+        (GITHUB_STEP_SUMMARY contents, shim exit code)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script = pathlib.Path(tmp) / "fake_script.py"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stderr.write(" + repr(script_output) + ")\n"
+                "sys.exit(" + str(script_exit) + ")\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+            summary = pathlib.Path(tmp) / "summary"
+            summary.write_text("", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", str(self.SHIM), str(script), str(summary)],
+                capture_output=True,
+                text=True,
+            )
+            return summary.read_text(encoding="utf-8"), proc.returncode
+
+    def test_deduped_n_threads_is_written_on_success(self):
+        summary, rc = self._run_shim(
+            script_output='{"resolved": ["t1","t2"], "kept": ["k1"], "already_processed": []}\n',
+            script_exit=0,
+        )
+        self.assertEqual(rc, 0)
+        # The summary line MUST be the literal "deduped 2 threads" -- the
+        # text the gate job and the PR-page review bot both grep for.
+        self.assertIn("deduped 2 threads\n", summary)
+        # The success line is the LAST line, by construction: the shim
+        # tees the script output into the summary first, then writes
+        # the outcome line on top. A future change that puts the line
+        # before the script output would put a reader looking for the
+        # count in the middle of a JSON blob.
+        self.assertTrue(
+            summary.endswith("deduped 2 threads\n"),
+            "summary ends with: " + repr(summary[-200:]),
+        )
+
+    def test_nothing_to_dedupe_is_written_on_zero_count(self):
+        summary, rc = self._run_shim(
+            script_output='no duplicates here\n',
+            script_exit=0,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing to dedupe\n", summary)
+        self.assertNotIn("deduped ", summary)
+
+    def test_dedupe_unavailable_is_written_on_non_zero_exit(self):
+        # The traceback tail is what a reader actually sees on the
+        # failure path. The shim's reason extraction pulls the LAST
+        # non-empty line out of the captured output -- a different
+        # default would change the message a reader sees on every
+        # crash, and a test that pins the shape is the cheapest place
+        # to catch it.
+        summary, rc = self._run_shim(
+            script_output=(
+                "Traceback (most recent call last):\n"
+                '  File "dedupe_review_threads.py", line 200, in main\n'
+                "    resp = _gh_graphql(query, ids=[])\n"
+                "RuntimeError: api returned 502\n"
+            ),
+            script_exit=1,
+        )
+        self.assertEqual(rc, 1, "shim must exit non-zero on script failure")
+        # The summary line MUST name the failure mode in human prose.
+        # "dedupe unavailable" alone (without the reason) would tell a
+        # reader the gate is wedged but not WHY -- exactly the silent
+        # defect this change exists to close.
+        self.assertIn("dedupe unavailable: RuntimeError: api returned 502\n", summary)
+        # The script's traceback is preserved in the summary above the
+        # outcome line, so a reader with the link can read the full
+        # traceback rather than only its tail.
+        self.assertIn("RuntimeError: api returned 502", summary)
+        self.assertIn("Traceback (most recent call last):", summary)
+
+    def test_dedupe_unavailable_without_traceback_still_names_an_outcome(self):
+        # An empty captured output with a non-zero exit -- the script
+        # exited but printed nothing. The shim's fallback reason is the
+        # only thing a reader would see, and "exited with code N and
+        # produced no explanation" is the honest phrasing.
+        summary, rc = self._run_shim(script_output="", script_exit=2)
+        self.assertEqual(rc, 2)
+        self.assertIn(
+            "dedupe unavailable: the dedupe script exited with code 2 and produced no explanation\n",
+            summary,
+        )
+
+    def test_the_action_yml_run_step_matches_the_shim(self):
+        # The shim is a stripped copy of the run step in action.yml.
+        # If they diverge, this test fails: a future edit to the wrapper
+        # either updates the shim (and the assertions above) or lands
+        # through this test class.
+        action_text = (ROOT / ".github" / "actions" / "dedupe-pr-review-threads" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        shim_text = self.SHIM.read_text(encoding="utf-8")
+        # The structural shape: three branches on `rc` against zero, each
+        # branch writing one of the three literal outcome lines. The
+        # exact strings are duplicated between the wrapper and the shim
+        # by design -- the shim is the test fixture, and changing one
+        # without the other is the silent drift this test catches.
+        for literal in (
+            "dedupe unavailable: %s\\n",
+            "nothing to dedupe\\n",
+            "deduped %s threads\\n",
+        ):
+            self.assertIn(literal, action_text, "action.yml missing: " + repr(literal))
+            self.assertIn(literal, shim_text, "shim missing: " + repr(literal))
+        # The wrapper MUST exit with the script's code on the failure
+        # path. `exit $rc` propagates it; `exit 1` would mask a SIGTERM
+        # exit 143 as a generic crash.
+        self.assertRegex(action_text, r"exit \"\$rc\"")
+        self.assertRegex(shim_text, r"exit \"\$rc\"")
+        # `set -e` MUST be off -- a non-zero exit from python is the
+        # signal that picks which summary line gets written, and a
+        # `set -e` in front of python would abort before the failure
+        # path can write `dedupe unavailable`. Check the actual
+        # `set -` directive on its own line (re.MULTILINE), not the
+        # comment that mentions the OLD shape for context.
+        # `unittest.TestCase.assertRegex` does not accept a flags
+        # argument, so the MULTILINE flag is applied via re.search().
+        self.assertIsNotNone(
+            re.search(r"^        set -uo pipefail$", action_text, re.MULTILINE),
+            "action.yml run step is missing `set -uo pipefail` on its own line",
+        )
+        self.assertIsNone(
+            re.search(r"^        set -euo pipefail$", action_text, re.MULTILINE),
+            "action.yml run step has `set -e` re-enabled; the failure path "
+            "needs python's exit code to fall through to the summary writer",
+        )
 
 
 if __name__ == "__main__":
