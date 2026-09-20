@@ -61,6 +61,18 @@ COUNTED_STATES = {'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'}
 # roster is required.
 FANOUT_BRANCH_PREFIX = 'maxi-config-sync/'
 
+# The SECOND producer writing to the same consumers: maxi-tools/ci's
+# fanout-ci-pin.yml, which advances each consumer's pinned `uses:` sha on
+# `ci/fanout-pin`. Same App, different prefix, and it was not enrolled --
+# so on 2026-09-20 its 49 open PRs were structurally unmergeable: every
+# review lane suppresses this author, and this bypass demanded a prefix
+# those branches do not carry. (maxi-config#784.)
+#
+# Mirrors ci/fanout-identity.toml's `bypass_branch_prefixes`. A tuple, not
+# a second scalar, because the next producer must extend a list rather
+# than add a third `startswith` nobody can find.
+FANOUT_BRANCH_PREFIXES = ('maxi-config-sync/', 'ci/fanout-pin')
+
 # ...and the identity that opens them. The prefix alone is NOT sufficient: a
 # branch name is attacker-chosen, so 「starts with maxi-config-sync/」 would let
 # anyone who can push a branch here name their way out of the review gate. Both
@@ -340,9 +352,9 @@ def evaluate(doc, only=ONLY_ALL):
     # stop unreviewed merges -- to name themselves past it. (maxi-reviewer, #468.)
     head_ref = doc.get('headRefName')
     if (isinstance(head_ref, str)
-            and head_ref.startswith(FANOUT_BRANCH_PREFIX)
+            and head_ref.startswith(FANOUT_BRANCH_PREFIXES)
             and author in FANOUT_AUTHORS):
-        return True, ['maxi-config fan-out branch - reviewed at source in maxi-config']
+        return True, ['fan-out branch - reviewed at source (maxi-config or ci)']
 
     # Dependabot: condition 2 ONLY, and deliberately not the whole gate.
     #
