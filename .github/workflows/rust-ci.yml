@@ -198,46 +198,26 @@ jobs:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
-  # NOT ON THE FAN-OUT. A `maxi-config-sync/*` PR carries a byte-for-byte copy
-  # of a payload already tested on the canon, so building and testing the
-  # workspace in every consumer re-derives one answer ~38 times.
-  #
-  # Measured 2026-09-19: one distribute run touched 48 consumer PRs. With all
-  # 35 runners busy the resulting queue stalled unrelated work for 15+
-  # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
-  # not queue time, and rerun_stalled_jobs.py only catches a job a runner
-  # ACCEPTED and never started, not one that was never assigned.
-  #
-  # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
-  # AND the distributor identity, matched by NUMERIC ID. That file is
-  # explicit -- "Stable GitHub database ID is canonical ... A login can be
-  # changed; this cannot" -- and the `plan` job above already pins its owner
-  # the same way. The first cut of this guard compared `user.login`, which
-  # would have handed the skip to whoever next claimed the name
-  # `maxi-tools-auth`. `github.event_name` is now tested explicitly rather
-  # than leaning on a null `pull_request` object coercing to false on push
-  # and workflow_dispatch.
-  #
-  # A head ref is chosen by whoever pushes the branch, so a prefix-only test
-  # would let anyone skip CI by naming a branch. The review lanes have
-  # applied this rule for months
-  # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
-  # and nothing recorded that as deliberate -- because it was not.
-  #
-  # `merge-gate` and `plan` still run, so the PR reports and can merge;
-  # `package` already tolerates check/test being skipped.
+  # NOT ON THE FAN-OUT and NOT ON DOCS-ONLY CHANGES -- decided inside the
+  # lane, not here. The measurements behind both skips (48 consumer PRs
+  # per distribute run against 35 runners; ~160s of Rust lane time per
+  # docs-only PR) and the both-halves identity rule are recorded on the
+  # lane job's `if:`.
   check:
     needs: plan
-    if: >-
-      needs.plan.outputs.scope != 'merge-gate-only' &&
-      !(github.event_name == 'pull_request' &&
-        startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
-        github.event.pull_request.user.id == 264883562)
+    # No `if:` here on purpose. The docs-only and fan-out skips live INSIDE
+    # lane-check.yml (with the Dependabot one), because skipping THIS job
+    # skips the reusable workflow and the nested check run
+    # `merge-gate / check / lane-check` is then never created -- absent, not
+    # skipped -- and the fleet's rulesets require it by that name. See the
+    # `if:` on the lane job for the full account. `scope` is passed down so
+    # the lane can make the decision this job used to make.
     uses: ./.github/workflows/lane-check.yml
     permissions:
       contents: read
     with:
       runs_on: ${{ needs.plan.outputs.runs_on }}
+      scope: ${{ needs.plan.outputs.scope }}
       advisory: ${{ github.event_name == 'pull_request' && vars.CI_ENFORCEMENT_MODE != 'strict' }}
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
@@ -246,46 +226,26 @@ jobs:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
-  # NOT ON THE FAN-OUT. A `maxi-config-sync/*` PR carries a byte-for-byte copy
-  # of a payload already tested on the canon, so building and testing the
-  # workspace in every consumer re-derives one answer ~38 times.
-  #
-  # Measured 2026-09-19: one distribute run touched 48 consumer PRs. With all
-  # 35 runners busy the resulting queue stalled unrelated work for 15+
-  # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
-  # not queue time, and rerun_stalled_jobs.py only catches a job a runner
-  # ACCEPTED and never started, not one that was never assigned.
-  #
-  # BOTH HALVES, per maxi-config ci/fanout-identity.toml: the branch prefix
-  # AND the distributor identity, matched by NUMERIC ID. That file is
-  # explicit -- "Stable GitHub database ID is canonical ... A login can be
-  # changed; this cannot" -- and the `plan` job above already pins its owner
-  # the same way. The first cut of this guard compared `user.login`, which
-  # would have handed the skip to whoever next claimed the name
-  # `maxi-tools-auth`. `github.event_name` is now tested explicitly rather
-  # than leaning on a null `pull_request` object coercing to false on push
-  # and workflow_dispatch.
-  #
-  # A head ref is chosen by whoever pushes the branch, so a prefix-only test
-  # would let anyone skip CI by naming a branch. The review lanes have
-  # applied this rule for months
-  # (maxi-review.yml, pr_review_gate.py); the TEST lanes were never enrolled,
-  # and nothing recorded that as deliberate -- because it was not.
-  #
-  # `merge-gate` and `plan` still run, so the PR reports and can merge;
-  # `package` already tolerates check/test being skipped.
+  # NOT ON THE FAN-OUT and NOT ON DOCS-ONLY CHANGES -- decided inside the
+  # lane, not here. The measurements behind both skips (48 consumer PRs
+  # per distribute run against 35 runners; ~160s of Rust lane time per
+  # docs-only PR) and the both-halves identity rule are recorded on the
+  # lane job's `if:`.
   test:
     needs: plan
-    if: >-
-      needs.plan.outputs.scope != 'merge-gate-only' &&
-      !(github.event_name == 'pull_request' &&
-        startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
-        github.event.pull_request.user.id == 264883562)
+    # No `if:` here on purpose. The docs-only and fan-out skips live INSIDE
+    # lane-test.yml (with the Dependabot one), because skipping THIS job
+    # skips the reusable workflow and the nested check run
+    # `merge-gate / test / lane-test` is then never created -- absent, not
+    # skipped -- and the fleet's rulesets require it by that name. See the
+    # `if:` on the lane job for the full account. `scope` is passed down so
+    # the lane can make the decision this job used to make.
     uses: ./.github/workflows/lane-test.yml
     permissions:
       contents: read
     with:
       runs_on: ${{ needs.plan.outputs.runs_on }}
+      scope: ${{ needs.plan.outputs.scope }}
       advisory: ${{ github.event_name == 'pull_request' && vars.CI_ENFORCEMENT_MODE != 'strict' }}
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
