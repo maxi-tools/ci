@@ -186,7 +186,8 @@ jobs:
   # `package` already tolerates check/test being skipped.
   check:
     needs: plan
-    if: >
+    if: >-
+      needs.plan.outputs.scope != 'merge-gate-only' &&
       !(github.event_name == 'pull_request' &&
         startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
         github.event.pull_request.user.id == 264883562)
@@ -233,7 +234,8 @@ jobs:
   # `package` already tolerates check/test being skipped.
   test:
     needs: plan
-    if: >
+    if: >-
+      needs.plan.outputs.scope != 'merge-gate-only' &&
       !(github.event_name == 'pull_request' &&
         startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
         github.event.pull_request.user.id == 264883562)
