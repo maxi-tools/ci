@@ -134,3 +134,39 @@ queue and approves it. The fan-out IS the human-in-the-loop detector.
    honours that opt-out for that consumer. The opt-out is recorded in
    `.github/scripts/fanout_ci_pin.py:opt_outs` so a re-introduction is
    a deliberate change, not an accident.
+
+## Operational state measured 2026-09-20 (post-merge)
+
+`fanout-ci-pin.yml` ran cleanly for the first time at 11:06Z on the
+2026-09-20 push (run 35506929343). It opened **48 fan-out PRs** at
+head `ci/fanout-pin` against the 49 repos in `DEFAULT_CONSUMERS`, each
+advancing `review-gate-reusable.yml` from `2eb4d94f` or `a1287f8b` to
+`0d09e02af3cd` (40-char sha). Of those 48 PRs:
+
+- **0 merged** as of 2026-09-20 ~22:50Z.
+- **48 open**, no `pin-intra-org` label applied by the engine.
+- Branch tip on every consumer diverged from `main`; structural
+  mergeability varies (CONFLICTING on `maxi-tools/maxi-tui` PR #98
+  after a subsequent main push; MERGEABLE on most others).
+- `lint-gate` is the dominant failure on the open PRs; the second
+  sweep at 22:46Z (run 35541790216, on PR #36 merge) **failed with
+  `error connecting to api.github.com` from `gh pr list` calls** and
+  did not dispatch. The next push to ci main will re-fire.
+
+The fan-out PR is the inert-detector, and it is firing: 48 PRs are
+visible, dated 2026-09-20, recording exactly the gap this contract
+was written to expose. The consumer-side merge is the missing step.
+
+**The fan-out PR was designed not to auto-merge** (see "Why not a
+bot that auto-merges fan-out PRs" above). Landing them is a
+per-consumer maintainer (or `CODEOWNERS`) decision. The intent is that
+each consumer's owner sees the diff in their own PR queue, and the
+fleet-wide advance happens at human speed on a human's clock.
+
+**Known merge-blocker on the open PRs:** `lint-gate` rejects
+intra-org pin updates without the `pin-intra-org` label (per
+`maxi-config` ruleset policy). The fan-out engine opens the PR but
+does not label it. Either the engine must apply the label, or the
+consumer's reviewer must. Both paths are deliberate; this contract
+does not pick one. Tracked as `pin-intra-org` / "advance the pins" in
+the next board iteration.
