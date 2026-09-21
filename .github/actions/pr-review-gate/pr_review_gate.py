@@ -61,6 +61,32 @@ COUNTED_STATES = {'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'}
 # roster is required.
 FANOUT_BRANCH_PREFIX = 'maxi-config-sync/'
 
+# The SECOND producer writing to the same consumers: maxi-tools/ci's
+# fanout-ci-pin.yml, which advances each consumer's pinned `uses:` sha on
+# `ci/fanout-pin`. Same App, different branch, and it was not enrolled --
+# so on 2026-09-20 its 49 open PRs were structurally unmergeable: every
+# review lane suppresses this author, and this bypass demanded a prefix
+# those branches do not carry. (maxi-config#784.)
+#
+# Mirrors ci/fanout-identity.toml, INCLUDING its two shapes: a namespace
+# ending in `/` is a prefix, a whole branch name is matched by equality.
+# `ci/fanout-pin` is one branch per consumer (ci#32), so prefix-matching
+# it would also accept `ci/fanout-pinned`. Lists rather than scalars
+# because the next producer must extend one, not add a third test
+# nobody can find. (codacy, #789.)
+FANOUT_BRANCH_PREFIXES = (FANOUT_BRANCH_PREFIX,)
+FANOUT_BRANCH_NAMES = ('ci/fanout-pin',)
+
+
+def is_fanout_branch(head_ref):
+    '''Does this head ref belong to a declared fan-out producer?
+
+    The AUTHOR half is checked separately and is mandatory; see below.
+    '''
+    return (isinstance(head_ref, str)
+            and (head_ref.startswith(FANOUT_BRANCH_PREFIXES)
+                 or head_ref in FANOUT_BRANCH_NAMES))
+
 # ...and the identity that opens them. The prefix alone is NOT sufficient: a
 # branch name is attacker-chosen, so 「starts with maxi-config-sync/」 would let
 # anyone who can push a branch here name their way out of the review gate. Both
@@ -339,10 +365,8 @@ def evaluate(doc, only=ONLY_ALL):
     # anyone able to push a branch -- in a repo whose gate exists precisely to
     # stop unreviewed merges -- to name themselves past it. (maxi-reviewer, #468.)
     head_ref = doc.get('headRefName')
-    if (isinstance(head_ref, str)
-            and head_ref.startswith(FANOUT_BRANCH_PREFIX)
-            and author in FANOUT_AUTHORS):
-        return True, ['maxi-config fan-out branch - reviewed at source in maxi-config']
+    if is_fanout_branch(head_ref) and author in FANOUT_AUTHORS:
+        return True, ['fan-out branch - reviewed at source (maxi-config or ci)']
 
     # Dependabot: condition 2 ONLY, and deliberately not the whole gate.
     #

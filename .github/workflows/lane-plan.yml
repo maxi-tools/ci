@@ -123,7 +123,7 @@ jobs:
           fi
 
       - name: Checkout caller repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         timeout-minutes: 10
         with:
           fetch-depth: 0
@@ -192,7 +192,7 @@ jobs:
 
       - name: Checkout maxi-config policy
         if: ${{ github.actor != 'dependabot[bot]' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         timeout-minutes: 10
         with:
           repository: maxi-tools/maxi-config
@@ -272,17 +272,36 @@ jobs:
           set -euo pipefail
           docs_only=true
           non_doc_first=""
+          seen=0
           while IFS= read -r file; do
+            # Whitespace-only lines are not filenames. Without the second
+            # test a line of spaces counted as a changed file, which made
+            # the empty-lookup case below unreachable for that input.
             [ -z "$file" ] && continue
+            [ -z "${file//[[:space:]]/}" ] && continue
+            seen=$((seen + 1))
             case "$file" in
-              ""|README.md|CHANGELOG.md|LICENSE*|.gitignore|docs/*|*.md) ;;
+              README.md|CHANGELOG.md|LICENSE*|.gitignore|docs/*|*.md) ;;
               *)
                 docs_only=false
                 [ -z "$non_doc_first" ] && non_doc_first="$file"
                 ;;
             esac
           done <<< "$CHANGED_FILES"
-          if [ "$docs_only" = "true" ]; then
+          # An empty list is a FAILED LOOKUP, not a documentation-only PR.
+          # A pull request always changes at least one file, so nothing to
+          # classify means the collection step returned nothing -- and
+          # `docs_only` starts true, so the previous shape answered
+          # "skip check and test" to the question "I could not see the
+          # diff". That is the fail-open this repository refuses elsewhere
+          # by name: check-owned-files.py and check-intra-org-pins.py both
+          # say an empty changed-file list is a failed lookup rather than a
+          # clean PR. Same rule here, where the cost is skipping every
+          # test lane in ~38 consumers. (codacy, maxi-config#790.)
+          if [ "$seen" -eq 0 ]; then
+            echo "scope=full" >> "$GITHUB_OUTPUT"
+            echo "scope_reason=changed-file lookup returned nothing; refusing to skip lanes on an unread diff" >> "$GITHUB_OUTPUT"
+          elif [ "$docs_only" = "true" ]; then
             echo "scope=merge-gate-only" >> "$GITHUB_OUTPUT"
             echo "scope_reason=all changed paths are documentation or metadata" >> "$GITHUB_OUTPUT"
           else

@@ -7,11 +7,15 @@ top-level object in its combined stdout/stderr. Earlier text may include
 `::error::` annotations, a dry-run preamble, or `::warning::` lines that
 GitHub itself parses.
 
-We track brace depth rather than using a recursive regex so the action does
-not depend on Python >=3.14 (the `re` module's `(?N)` recursive subpattern
-was added in 3.14). A depth walk is O(N) in the captured text size, and the
-captured text is the script's own output which is bounded by the PR's
-thread count.
+We ask the JSON parser where each object ends rather than counting braces.
+A depth walk cannot tell a brace inside a string literal from a structural
+one, and the text it walks includes BOT COMMENT BODIES -- which in this org
+routinely contain `${{ ... }}` workflow expressions, code fences and URLs.
+One unbalanced brace in a quoted body shifted every subsequent boundary, so
+the last "object" was a slice that did not parse and the action reported
+`nothing to dedupe` over a run that had resolved threads. `raw_decode`
+knows about string literals; a recursive regex would need Python >=3.14.
+(codacy, on maxi-config#797, which vendors this file.)
 
 Lives in the action's directory so the run step can call it as
 `"${{ github.action_path }}/parse_summary.py"` without a checkout. The
@@ -24,21 +28,31 @@ import json
 import sys
 
 
-def find_top_level_objects(text: str) -> list[str]:
-    depth = 0
-    start: int | None = None
-    matches: list[str] = []
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                matches.append(text[start : i + 1])
-                start = None
-    return matches
+def find_top_level_objects(text: str) -> list[dict]:
+    """Every JSON object in `text`, in order, decoded.
+
+    Scans to each `{` and asks the decoder to read one value there. A
+    position that does not start a valid object is skipped -- that is the
+    common case for prose containing a brace -- and the scan resumes one
+    character later. A position that DOES decode is consumed whole, so a
+    brace inside one of its string literals can never be mistaken for a
+    boundary.
+    """
+    decoder = json.JSONDecoder()
+    found: list[dict] = []
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except ValueError:
+            index = text.find("{", index + 1)
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+            index = text.find("{", end)
+        else:
+            index = text.find("{", index + 1)
+    return found
 
 
 def main() -> int:
@@ -53,12 +67,13 @@ def main() -> int:
         # writes "nothing to dedupe", which is at least an honest line.
         print(0)
         return 0
-    try:
-        report = json.loads(objects[-1])
-    except json.JSONDecodeError:
-        print(0)
-        return 0
-    print(len(report.get("resolved", [])))
+    report = objects[-1]
+    resolved = report.get("resolved", [])
+    # A report whose `resolved` is not a list is a script bug, not a count.
+    # Print 0 rather than raising: the wrapper turns this number into the
+    # summary line, and "nothing to dedupe" is an honest line where a
+    # traceback in a parser would only hide the real failure upstream.
+    print(len(resolved) if isinstance(resolved, list) else 0)
     return 0
 
 

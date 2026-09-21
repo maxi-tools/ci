@@ -35,6 +35,15 @@ on:
         type: string
         default: standard-rust
 
+      scope:
+        description: >-
+          lane-plan's classification of the change: `full`, or
+          `merge-gate-only` when every changed path is documentation or
+          metadata. The lane skips itself on `merge-gate-only` -- see the
+          `if:` on the job for why the skip lives here and not on the caller.
+        required: false
+        type: string
+        default: full
     secrets:
       APP_ID:
         required: true
@@ -91,7 +100,39 @@ jobs:
     #
     # The durable fix is org-level DEPENDABOT secrets for APP_ID /
     # APP_PRIVATE_KEY, which would make this guard inert rather than wrong.
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    #
+    # THE SAME RULE COVERS THE OTHER TWO SKIPS. A docs-only change
+    # (`inputs.scope == 'merge-gate-only'`, classified by lane-plan) and a
+    # maxi-config fan-out PR (branch prefix AND distributor id, both halves,
+    # per maxi-config ci/fanout-identity.toml) do not need this lane either.
+    # Measured 2026-09-19: one distribute run touched 48 consumer PRs; with
+    # all 35 runners busy the resulting queue stalled unrelated work for 15+
+    # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
+    # not queue time. A fan-out PR carries a byte-for-byte copy of a payload
+    # already tested on the canon, so building it in every consumer
+    # re-derives one answer ~48 times. A head ref is chosen by whoever
+    # pushes the branch, so the prefix alone would let anyone skip CI by
+    # naming a branch; the numeric id is the half that cannot be claimed.
+    # ci#20 and ci#10 put those skips on the CALLER's `check`/`test` jobs,
+    # which is the placement this comment warns against: under the fleet's
+    # rulesets (44 repos require `merge-gate / check / lane-check` and
+    # `merge-gate / test / lane-test` by name, measured 2026-09-20) a skipped
+    # caller leaves those contexts ABSENT and the PR can never merge. The
+    # pin fan-out would have shipped that to every consumer on its next
+    # advance. Here, the check run exists with conclusion `skipped`, which
+    # satisfies a required-status-check rule, and `merge-gate`'s aggregate
+    # step treats `skipped` as fine.
+    #
+    # The fan-out half tests `github.event_name` explicitly rather than
+    # leaning on a null `pull_request` object coercing to false on push and
+    # workflow_dispatch. The `github` context inside a reusable workflow is
+    # the caller's, so the same predicate works here unchanged.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      inputs.scope != 'merge-gate-only' &&
+      !(github.event_name == 'pull_request' &&
+        startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
+        github.event.pull_request.user.id == 264883562)
     runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
     continue-on-error: ${{ inputs.advisory }}
     # Backstop against a wedged job holding a runner for GitHub's 6h default.
@@ -101,7 +142,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         # Checkout is where jobs actually wedge: git has no default stall
         # timeout, so a dead HTTPS fetch parks `git remote-https` at 0% CPU
         # forever. Two runners were held 33min and 2h04m this way on
