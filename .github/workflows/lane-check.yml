@@ -313,6 +313,44 @@ jobs:
           source .maxi-config/hooks/clippy-strict-lints.sh
           echo "Deny-tier flags:"
           get_clippy_deny_flags
+          # Two passes, because the panic-safety denial belongs to shipping
+          # code and the lane had no way to say so.
+          #
+          # maxi-config's clippy.toml states the policy outright -- "unwrap()/
+          # expect()/panic!() are legitimate in test code -- a failed assertion
+          # *should* abort the test. Keep the panic-safety lints focused on
+          # shipping code." -- and encodes it as `allow-unwrap-in-tests = true`.
+          # That config is necessary but not sufficient. Clippy suppresses the
+          # lint only inside items it recognises as tests: a `#[test]`-attributed
+          # fn, or anything under `#[cfg(test)]`. A plain helper fn in
+          # tests/foo.rs, or a closure handed to tokio::spawn inside one, is an
+          # ordinary item in a crate that merely happens to be built with
+          # --test, so the lint fires there and the config never sees it.
+          #
+          # A single --all-targets pass therefore denied unwrap in exactly the
+          # harness code the policy intends to allow. Ten repos carried
+          # `allow_unwrap_used: true` to get past it; when a fan-out replaced
+          # their wrapper with the canonical template that input was dropped,
+          # and six went red at once on this lane. The override was load-bearing
+          # for a policy bug -- which is why removing it broke them, and why
+          # restoring it would only rearm the same trap.
+          #
+          # So: every target gets the full deny tier minus the unwrap rule, and
+          # lib/bins then get the tier intact. The trailing -A wins over the
+          # earlier -D on the same lint, and the second pass is a subset of the
+          # first rather than a repeat of it.
+          #
+          # Cost is one extra clippy invocation. The flag sets differ, so the
+          # second pass re-lints lib and bins rather than reusing the first
+          # pass's fingerprint; it does not rebuild dependencies, and it never
+          # touches the test, bench or example targets that dominate lane time.
+          #
+          # Repos that genuinely unwrap in src/ still set `allow_unwrap_used:
+          # true`. That drops -D clippy::unwrap_used from the tier entirely, so
+          # both passes agree and the second one costs nothing new.
+          #
           # Word-splitting of the trusted flag list is intentional.
           # shellcheck disable=SC2046
-          cargo clippy --workspace --all-targets -- $(get_clippy_deny_flags)
+          cargo clippy --workspace --all-targets -- $(get_clippy_deny_flags) -A clippy::unwrap_used
+          # shellcheck disable=SC2046
+          cargo clippy --workspace --lib --bins -- $(get_clippy_deny_flags)
