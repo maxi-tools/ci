@@ -558,7 +558,7 @@ class MutationInputFieldNames(unittest.TestCase):
         a reader looking in the wrong place."""
         for query, _fields in self._capture():
             head, _, body = query.partition("{")
-            for var in re.findall(r"[$]([A-Za-z_][A-Za-z0-9_]*)\s*:", head):
+            for var in re.findall(r"[$](\w+)\s*:", head):
                 self.assertIn(
                     "$" + var, body,
                     "$" + var + " is declared but never used in: " + query,

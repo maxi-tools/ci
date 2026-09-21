@@ -561,7 +561,7 @@ def reply_and_resolve(
     """
     reply_body = _reply_body(keeper, thread)
 
-    # NOTE the asymmetry, which is GitHub's and not ours:
+    # The asymmetry below is GitHub's, not ours:
     # AddPullRequestReviewThreadReplyInput's field is
     # `pullRequestReviewThreadId`, while ResolveReviewThreadInput's is
     # plain `threadId`. Spelling the reply one `threadId` is accepted by
