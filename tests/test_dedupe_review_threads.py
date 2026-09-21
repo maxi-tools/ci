@@ -496,6 +496,75 @@ class Plan(unittest.TestCase):
         self.assertEqual((kept, to_resolve), ([], []))
 
 
+class MutationInputFieldNames(unittest.TestCase):
+    """The two mutations reply_and_resolve issues do NOT share a field name.
+
+    AddPullRequestReviewThreadReplyInput takes `pullRequestReviewThreadId`;
+    ResolveReviewThreadInput takes `threadId`. Spelling the reply one
+    `threadId` is what shipped, and it made every --apply run fail with a
+    three-error cascade whose last line -- the only one the action wrapper
+    surfaces -- said `Variable $threadId is declared by anonymous mutation
+    but not used`, naming neither the field nor the mutation.
+
+    Nothing caught it because every other test here replaces
+    reply_and_resolve with a stub, so the mutation text was never read by
+    anything except GitHub. These tests capture the real query strings the
+    function sends, which is the cheapest thing that could have failed.
+    """
+
+    def _capture(self):
+        sent = []
+        original = dedupe._gh_graphql
+        dedupe._gh_graphql = lambda q, **f: sent.append((q, f)) or {}
+        try:
+            dedupe.reply_and_resolve(
+                "maxi-tools", "ci", 208,
+                thread(tid="d", author=BOT_B, path="src/x.rs", line=14),
+                thread(tid="k", author=BOT_A, path="src/x.rs", line=10,
+                       url="https://gh/k"),
+            )
+        finally:
+            dedupe._gh_graphql = original
+        return sent
+
+    def test_reply_uses_pull_request_review_thread_id(self):
+        reply_q = self._capture()[0][0]
+        self.assertIn("addPullRequestReviewThreadReply", reply_q)
+        self.assertIn("pullRequestReviewThreadId:$threadId", reply_q)
+        self.assertNotIn("input:{threadId:", reply_q)
+
+    def test_resolve_uses_thread_id(self):
+        resolve_q = self._capture()[1][0]
+        self.assertIn("resolveReviewThread", resolve_q)
+        self.assertIn("input:{threadId:$threadId}", resolve_q)
+
+    def test_every_declared_variable_is_used(self):
+        """A RELATED class, not this bug: GitHub rejects a mutation that
+        declares a variable it never references.
+
+        Checked and stated honestly: this test does NOT catch the
+        pullRequestReviewThreadId bug. With `input:{threadId:$threadId}`
+        the variable IS referenced textually, so this assertion passes
+        against the broken query -- verified by reverting the field name
+        and watching only the test above go red. The server's
+        "declared but not used" message was a CONSEQUENCE of the unknown
+        field being dropped from the parsed input object, not something
+        visible in the query text.
+
+        It stays because the class it does guard is real and cheap to
+        check, and because the distinction is worth writing down: the
+        error GitHub reported and the mistake that caused it were two
+        different things, which is why the last line of the cascade sent
+        a reader looking in the wrong place."""
+        for query, _fields in self._capture():
+            head, _, body = query.partition("{")
+            for var in re.findall(r"[$]([A-Za-z_][A-Za-z0-9_]*)\s*:", head):
+                self.assertIn(
+                    "$" + var, body,
+                    "$" + var + " is declared but never used in: " + query,
+                )
+
+
 class ReplyBody(unittest.TestCase):
     """The reply body is what a human reader sees after a dedupe. The
     spec calls out one exact sentence plus our sentinel; the tests
