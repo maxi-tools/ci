@@ -110,6 +110,30 @@ jobs:
           persist-credentials: false
           submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
 
+      # See lane-check.yml: repositories whose correctness is wholly outside
+      # Rust ship the standard Rust CI wrapper regardless (every Rust
+      # consumer in the org installs it at .github/workflows/ci.yml), so the
+      # lane itself must no-op cleanly when there is no Cargo.toml. The skip
+      # is conditional on ABSENCE, not on failure -- a Rust repo whose
+      # fetch fails for some other reason still runs the lane and still
+      # reports red, which is the difference between a quiet skip and a
+      # green check on broken CI. See lane-check.yml for the full rationale.
+      - name: Detect Rust workspace
+        id: workspace
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml at repo root; skipping Rust lanes (non-Rust repository)."
+            {
+              echo "## lane-test summary"
+              echo "- Lane: lane-test"
+              echo "- Workspace: absent (no root Cargo.toml); Rust steps skipped"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
       # feature) declare them in ci/apt-packages.txt — one package per line,
       # '#' comments allowed. Absent file means no extra packages.
@@ -180,40 +204,46 @@ jobs:
           permission-contents: read
 
       - name: Install Rust toolchain
+        if: steps.workspace.outputs.has_workspace == 'true'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           components: rustfmt, clippy
 
       - name: Fetch maxi-config rust-lane policy
+        if: steps.workspace.outputs.has_workspace == 'true'
         # One implementation, in .github/actions/fetch-policy. This block
         # existed in four near-identical copies until #462, which is how #460
         # fixed a live bug in a file nothing runs. Its reasoning -- the
         # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
         # the success condition -- moved into the action unchanged, along with
         # why that action is referenced by its full owner/repo path.
-        uses: maxi-tools/ci/.github/actions/fetch-policy@main
+        uses: maxi-tools/maxi-config/.github/actions/fetch-policy@main
         with:
           policy-files: |
             scripts/select-rust-toolchain.sh
             scripts/emit-runner-paths.sh
           token: ${{ steps.app-token.outputs.token }}
       - name: Expose installed macOS native build tools
-        if: ${{ runner.os == 'macOS' }}
+        if: steps.workspace.outputs.has_workspace == 'true' && runner.os == 'macOS'
         shell: bash
         run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
       - name: Verify installed Rust toolchain before cache restore
+        if: steps.workspace.outputs.has_workspace == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
       - name: Cache Rust dependencies
+        if: steps.workspace.outputs.has_workspace == 'true'
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           prefix-key: v1-rust-no-bin
           cache-bin: false
 
       - name: Verify installed Rust toolchain after cache restore
+        if: steps.workspace.outputs.has_workspace == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
       - name: Configure git for private deps
+        if: steps.workspace.outputs.has_workspace == 'true'
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -238,6 +268,7 @@ jobs:
           # connection parks `git remote-https` at 0% CPU indefinitely.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
+        if: steps.workspace.outputs.has_workspace == 'true'
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked
@@ -265,6 +296,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test workspace
+        if: steps.workspace.outputs.has_workspace == 'true'
         run: cargo test --workspace --all-targets
 
       # A repository whose correctness is not fully expressed by `cargo test`
@@ -293,6 +325,7 @@ jobs:
       #
       # Absent file means no repo-local checks, which is every repo today.
       - name: Repo-local lane-test checks
+        if: steps.workspace.outputs.has_workspace == 'true'
         shell: bash
         run: |
           set -euo pipefail
