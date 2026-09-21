@@ -629,6 +629,18 @@ def main(argv: list[str]) -> int:
     if argv and argv[0].endswith(".py"):
         argv = argv[1:]
     args = parse_args(argv)
+
+    # `--token` was parsed and then ignored: every `gh` call below inherits
+    # whatever GH_TOKEN the environment already carries, so passing a token
+    # explicitly did nothing and failed as an authentication error nobody
+    # could explain from the flag they had set. Export it before the first
+    # GraphQL call. (codacy, on maxi-config#797, which vendors this file.)
+    #
+    # The default comes from GITHUB_TOKEN or GH_TOKEN, so the common case
+    # writes the same value back and the assignment is a no-op.
+    if args.token:
+        os.environ["GH_TOKEN"] = args.token
+
     if not args.owner or not args.repo or not args.pr:
         print(
             "::error::owner/repo/pr are required (set --owner/--repo/--pr or "
