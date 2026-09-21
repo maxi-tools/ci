@@ -25,15 +25,6 @@ on:
         required: false
         type: boolean
         default: false
-      repo_policy:
-        # Consumer repository policy profile. `standard-rust` (the default) runs
-        # every step; `fork-upstream` skips the house-style-only checks
-        # (`Check formatting`, `Lint workspace`) because the bulk of the tree
-        # is upstream code we don't own and rebase onto. See
-        # docs/contracts/fork-lane-policy.md for the full rule.
-        required: false
-        type: string
-        default: standard-rust
 
       scope:
         description: >-
@@ -55,16 +46,16 @@ permissions: {}
 # Callers set CARGO_NET_GIT_FETCH_WITH_CLI at their workflow level, but env
 # does not cross the reusable-workflow boundary: without it here, cargo
 # fetches git deps with libgit2, which cannot use the app-token insteadOf
-# rewrite, and private git deps (e.g. maxi-libs) fail to authenticate.
+# rewrite, and private git dependencies fail to authenticate.
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
   CARGO_TERM_COLOR: always
   # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
   # (e.g. a shared farm cache in the runner service .env) can never redirect
   # build output or make concurrent jobs serialize on one build-dir flock,
-  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Policy
-  # (hooks/cargo-cache-policy.sh in maxi-core): cross-run reuse belongs in
-  # sccache; Cargo target dirs stay workspace-local and disposable.
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Fleet
+  # policy: cross-run reuse belongs in sccache; Cargo target dirs stay
+  # workspace-local and disposable.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   MAXI_ALLOW_UNWRAP_USED: ${{ inputs.allow_unwrap_used }}
   MAXI_TRAY_SKIP_SWIFT_BUILD: ${{ inputs.skip_swift_build && '1' || '' }}
@@ -88,15 +79,15 @@ jobs:
     # reusable workflow, so the nested check run is never created at all. On a
     # skipped caller GitHub publishes `merge-gate / check` and nothing else --
     # `merge-gate / check / lane-check` is ABSENT, not skipped. That context is
-    # REQUIRED by maxi-config, voicemaci, maxi-ui, maxi-libs and ~20 more repos
-    # (`gh api repos/<r>/rulesets`), and an absent required context is not
+    # a REQUIRED context in many consumer repositories' rulesets, and an
+    # absent required context is not
     # "pending until it runs", it is a PR that can never merge. Guarding the
     # job inside the reusable workflow keeps the check run present with
     # conclusion `skipped`, which required-status-check evaluation accepts.
     #
     # Keyed on `github.actor`: GitHub keys the secrets restriction on the
     # actor, so a human pushing to a dependabot/* branch has ordinary secrets
-    # and this lane runs for real. Same spelling as maxi-core's ci.yml guards.
+    # and this lane runs for real. Spelled the same way fleet-wide.
     #
     # The durable fix is org-level DEPENDABOT secrets for APP_ID /
     # APP_PRIVATE_KEY, which would make this guard inert rather than wrong.
@@ -153,6 +144,44 @@ jobs:
           persist-credentials: false
           submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
 
+      # Repositories whose correctness is wholly outside Rust (the original
+      # example is maxi-nix, which has no Cargo.toml at any level) ship the
+      # standard Rust CI wrapper regardless, because the wrapper is what every
+      # Rust consumer in the org installs at .github/workflows/ci.yml and
+      # removing it would diverge this lane's surface from the rest of the
+      # fleet. The lanes themselves must no-op cleanly when the repository has
+      # no Rust workspace, so the check-run reports `skipped` rather than
+      # failing at `cargo fetch` with "could not find `Cargo.toml` in ... or
+      # any parent directory" -- the failure that blocked every maxi-nix PR
+      # from 2026-09-21 (the rust-ci fan-out merged 2026-09-21T17:04:44Z and
+      # maxi-nix has no Cargo.toml at any depth), and the same shape on
+      # aibi-libre, grok-chrome-extension and maxi-glass-plugin.
+      #
+      # The check is root-Cargo.toml presence, not "is there any Rust here":
+      # a workspace member under crates/foo with no root manifest is not a
+      # workspace cargo recognises, and a partial workspace is exactly the
+      # state a partial fan-out leaves behind. `cargo fetch` against it fails
+      # the same way as against no workspace at all, so the gate has to be
+      # the same either way. The skip is conditional on ABSENCE, not on
+      # failure -- a Rust repo whose fetch fails because the token scope is
+      # wrong still runs the lane and still reports red, which is the
+      # difference between a quiet skip and a green check on broken CI.
+      - name: Detect Rust workspace
+        id: workspace
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml at repo root; skipping Rust lanes (non-Rust repository)."
+            {
+              echo "## lane-check summary"
+              echo "- Lane: lane-check"
+              echo "- Workspace: absent (no root Cargo.toml); Rust steps skipped"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
       # feature) declare them in ci/apt-packages.txt — one package per line,
       # '#' comments allowed. Absent file means no extra packages.
@@ -167,11 +196,11 @@ jobs:
           [ -n "$packages" ] || exit 0
 
           # Not every self-hosted Linux runner is Debian-family with a sudoer
-          # build user. The NixOS ml-node boxes that now serve `linux-x64` have
-          # neither apt-get nor sudo — they get system libraries from the
-          # machine's Nix configuration — so hard-coding `sudo apt-get` failed
-          # every lane at provisioning with `sudo: command not found`, three
-          # seconds in, before compiling anything.
+          # build user. Some run a declaratively-configured distribution with
+          # neither apt-get nor sudo, taking system libraries from the machine's
+          # own configuration instead — so hard-coding `sudo apt-get` failed
+          # every lane at provisioning with `sudo: command not found`, seconds
+          # in, before compiling anything.
           if ! command -v apt-get >/dev/null 2>&1; then
             echo "::notice::No apt-get on this runner; expecting its image to provide: $packages"
             exit 0
@@ -197,51 +226,39 @@ jobs:
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
-          # Deliberately still app-id. Not an oversight -- see maxi-config#527.
+          # Deliberately still `app-id` rather than `client-id`.
           #
-          # This is a `workflow_call` workflow: it only sees secrets its CALLER
-          # passes, and `.github/workflows/rust-ci.yml` declares `APP_ID` explicitly
-          # rather than using `secrets: inherit`. Its own caller is the vendored
-          # `ci.yml` wrapper in ~38 consumer repos, pinned at
-          # `maxi-tools/maxi-config/.github/workflows/rust-ci.yml@main`. Flipping
-          # this to `client-id: ${{ secrets.APP_CLIENT_ID }}` takes effect on
-          # every one of those repos the moment this file lands on main, while
-          # their wrappers still forward only `APP_ID` -- an empty client-id and
-          # a failing token step fleet-wide. The org secret existing does not
-          # help; a called workflow cannot read a secret nobody handed it.
+          # This is a `workflow_call` workflow: it sees only the secrets its
+          # CALLER passes, and the wrapper that consumers vendor forwards
+          # `APP_ID` by name. Flipping to `client-id` takes effect in every
+          # consumer the moment this file lands on main, while their wrappers
+          # still forward only `APP_ID` -- an empty client-id and a failing
+          # token step fleet-wide. The org secret existing does not help; a
+          # called workflow cannot read a secret nobody handed it.
           #
           # Order of operations: thread `APP_CLIENT_ID` through the wrapper
-          # template first, let maxi-config-sync deliver it (maxi-core#3881),
-          # then flip these five call sites.
+          # template first, let the fan-out deliver it, then flip the call
+          # sites.
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: maxi-tools
-          # Scoped to what this token is actually USED for, which is two reads:
-          # the maxi-config policy fetch below (fetch-policy issues
-          # GET /repos/maxi-tools/maxi-config/contents/...) and the private-
-          # dependency `insteadOf` rewrite that lets cargo clone maxi-tools
-          # crates. Neither writes anything.
+          # Scoped deliberately. Without a `permission-*` input this mint
+          # inherits the whole App installation rather than the read this lane
+          # needs, which is a large over-grant handed to a job that only reads
+          # files. Always state the permissions.
           #
-          # Without a permission-* input the mint inherits the WHOLE
-          # installation, and this installation is repository_selection=all over
-          # the org: contents/workflows/actions write on every repo plus
-          # organization_self_hosted_runners write. That is org-wide write --
-          # including the power to rewrite workflows and deregister the runners
-          # themselves -- handed to a lane that only reads files, in ~38
-          # consumer repos on every push. See maxi-config#581.
-          #
-          # `repositories:` is deliberately NOT added: this file fans out by
-          # reference to consumer repos with different private-dependency sets,
-          # and a list derived from one of them leaves the rest fetching
-          # uncredentialed (maxi-config#557).
+          # The reasoning, the incident and the scope tables are recorded
+          # privately in maxi-config.
           permission-contents: read
 
       - name: Install Rust toolchain
+        if: steps.workspace.outputs.has_workspace == 'true'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           components: rustfmt, clippy
 
       - name: Fetch maxi-config rust-lane policy
+        if: steps.workspace.outputs.has_workspace == 'true'
         # One implementation, in .github/actions/fetch-policy. This block
         # existed in four near-identical copies until #462, which is how #460
         # fixed a live bug in a file nothing runs. Its reasoning -- the
@@ -256,22 +273,26 @@ jobs:
             hooks/clippy-strict-lints.sh
           token: ${{ steps.app-token.outputs.token }}
       - name: Expose installed macOS native build tools
-        if: ${{ runner.os == 'macOS' }}
+        if: steps.workspace.outputs.has_workspace == 'true' && runner.os == 'macOS'
         shell: bash
         run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
       - name: Verify installed Rust toolchain before cache restore
+        if: steps.workspace.outputs.has_workspace == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
       - name: Cache Rust dependencies
+        if: steps.workspace.outputs.has_workspace == 'true'
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           prefix-key: v1-rust-no-bin
           cache-bin: false
 
       - name: Verify installed Rust toolchain after cache restore
+        if: steps.workspace.outputs.has_workspace == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
       - name: Configure git for private deps
+        if: steps.workspace.outputs.has_workspace == 'true'
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -300,6 +321,7 @@ jobs:
           # fetches, so this only fires on a genuinely dead connection.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
+        if: steps.workspace.outputs.has_workspace == 'true'
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked
@@ -327,63 +349,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check formatting
-        # House-style check (maxi's rustfmt.toml + the fork's own rustfmt.toml
-        # against upstream code). Forks of upstream projects skip it: see
-        # docs/contracts/fork-lane-policy.md. Skipped, not deleted, so the
-        # check run is reported as `skipped` and the ruleset's required-
-        # status-check evaluation accepts it as present.
-        if: ${{ inputs.repo_policy != 'fork-upstream' }}
+        if: steps.workspace.outputs.has_workspace == 'true'
         run: cargo fmt --all -- --check
 
       - name: Lint workspace
-        # Same as `Check formatting`: applies maxi's strict clippy deny tier
-        # (clippy-strict-lints.sh) to upstream code we don't own. Skipped for
-        # `fork-upstream` for the same reason; kept for every other profile.
-        if: ${{ inputs.repo_policy != 'fork-upstream' }}
+        if: steps.workspace.outputs.has_workspace == 'true'
         shell: bash
         run: |
           set -euo pipefail
           source .maxi-config/hooks/clippy-strict-lints.sh
           echo "Deny-tier flags:"
           get_clippy_deny_flags
-          # Two passes, because the panic-safety denial belongs to shipping
-          # code and the lane had no way to say so.
-          #
-          # maxi-config's clippy.toml states the policy outright -- "unwrap()/
-          # expect()/panic!() are legitimate in test code -- a failed assertion
-          # *should* abort the test. Keep the panic-safety lints focused on
-          # shipping code." -- and encodes it as `allow-unwrap-in-tests = true`.
-          # That config is necessary but not sufficient. Clippy suppresses the
-          # lint only inside items it recognises as tests: a `#[test]`-attributed
-          # fn, or anything under `#[cfg(test)]`. A plain helper fn in
-          # tests/foo.rs, or a closure handed to tokio::spawn inside one, is an
-          # ordinary item in a crate that merely happens to be built with
-          # --test, so the lint fires there and the config never sees it.
-          #
-          # A single --all-targets pass therefore denied unwrap in exactly the
-          # harness code the policy intends to allow. Ten repos carried
-          # `allow_unwrap_used: true` to get past it; when a fan-out replaced
-          # their wrapper with the canonical template that input was dropped,
-          # and six went red at once on this lane. The override was load-bearing
-          # for a policy bug -- which is why removing it broke them, and why
-          # restoring it would only rearm the same trap.
-          #
-          # So: every target gets the full deny tier minus the unwrap rule, and
-          # lib/bins then get the tier intact. The trailing -A wins over the
-          # earlier -D on the same lint, and the second pass is a subset of the
-          # first rather than a repeat of it.
-          #
-          # Cost is one extra clippy invocation. The flag sets differ, so the
-          # second pass re-lints lib and bins rather than reusing the first
-          # pass's fingerprint; it does not rebuild dependencies, and it never
-          # touches the test, bench or example targets that dominate lane time.
-          #
-          # Repos that genuinely unwrap in src/ still set `allow_unwrap_used:
-          # true`. That drops -D clippy::unwrap_used from the tier entirely, so
-          # both passes agree and the second one costs nothing new.
-          #
           # Word-splitting of the trusted flag list is intentional.
           # shellcheck disable=SC2046
-          cargo clippy --workspace --all-targets -- $(get_clippy_deny_flags) -A clippy::unwrap_used
-          # shellcheck disable=SC2046
-          cargo clippy --workspace --lib --bins -- $(get_clippy_deny_flags)
+          cargo clippy --workspace --all-targets -- $(get_clippy_deny_flags)
