@@ -1,0 +1,14 @@
+.github/workflows/coverage.yml
+  h_cebe5b6d461c32 76-78,82-100,220,229-234,241-253,256-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fd1863d2de83d4866e2921bff0e9085c6dec33f7",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
