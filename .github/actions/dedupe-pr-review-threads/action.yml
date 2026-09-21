@@ -71,9 +71,14 @@ runs:
     # `set -euo pipefail`. A non-zero exit from python aborted the step
     # before any human-readable line reached the summary and the only
     # artefact was the script's own `::error::` annotation -- which is not
-    # a sentence a reader can act on. Removing `set -e` from the run step
+    # a sentence a reader can act on. Clearing `set -e` in the run step
     # is what lets the failure path write its own summary line and then
     # propagate python's exit code up to the calling step.
+    #
+    # "Clearing", not "omitting": `shell: bash` hands the script to
+    # `bash -e -o pipefail`, so simply not writing `set -e` leaves it on.
+    # The first version of this fix did exactly that and the failure path
+    # stayed dead for a month. See the `set +e` note in the run block.
     - name: Run dedupe
       id: dedupe
       shell: bash
@@ -94,11 +99,26 @@ runs:
         DEDUPE_OWNER: ${{ inputs.owner }}
         DEDUPE_REPO: ${{ inputs.repo }}
       run: |
-        # NO `set -e`: we want python's exit code captured, not propagated
-        # through `set -e` before the failure-path summary line is written.
+        # `set +e` — NOT merely "no set -e". `shell: bash` makes the runner
+        # invoke this script as `bash --noprofile --norc -e -o pipefail {0}`,
+        # so `-e` is ALREADY ON before the first line runs, and `set -uo
+        # pipefail` does not clear it. Omitting `set -e` is therefore not
+        # enough; the flag has to be turned off explicitly.
+        #
+        # Without this the whole failure path below is dead code: python's
+        # non-zero exit aborts the step at the `python3` line, so `rc=$?`,
+        # the `cat` into the summary and the `dedupe unavailable: <reason>`
+        # line never run. The step goes red with an exit code and no
+        # sentence — which is the diagnosability half of the same defect
+        # the `continue-on-error` removal was meant to close. Observed on
+        # maxi-dist#208, 2026-09-21: two consecutive runs, 909ms, log
+        # ending at `##[error]Process completed with exit code 1` with
+        # none of the three end-of-script messages present.
+        #
         # `-u` and `-o pipefail` stay: unbound variables are still bugs,
         # and any pipeline's exit code still has to come from its leftmost
         # failing command.
+        set +e
         set -uo pipefail
         out="$(mktemp)"
         trap 'rm -f "$out"' EXIT
