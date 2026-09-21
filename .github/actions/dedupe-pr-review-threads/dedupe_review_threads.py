@@ -561,13 +561,26 @@ def reply_and_resolve(
     """
     reply_body = _reply_body(keeper, thread)
 
-    reply_query = """
+    # The asymmetry below is GitHub's, not ours:
+    # AddPullRequestReviewThreadReplyInput's field is
+    # `pullRequestReviewThreadId`, while ResolveReviewThreadInput's is
+    # plain `threadId`. Spelling the reply one `threadId` is accepted by
+    # no schema and fails the whole mutation with a three-error cascade
+    # whose LAST line -- the one the action wrapper surfaces -- is the
+    # least informative of the three:
+    #
+    #   Argument 'pullRequestReviewThreadId' on InputObject ... is required
+    #   InputObject ... doesn't accept argument 'threadId'
+    #   Variable $threadId is declared by anonymous mutation but not used
+    #
+    # The middle line is the cause; the third is what got reported.
+    reply_query = '''
     mutation($threadId:ID!,$body:String!){
-      addPullRequestReviewThreadReply(input:{threadId:$threadId,body:$body}){
+      addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){
         comment{ id }
       }
     }
-    """
+    '''
     _gh_graphql(reply_query, threadId=thread["id"], body=reply_body)
 
     resolve_query = """
