@@ -1,0 +1,276 @@
+# Reusable coverage lane for maxi-tools Rust repositories.
+#
+# Produces an lcov report with cargo-llvm-cov and publishes it to Qlty Cloud.
+#
+# WHY THIS IS A LANE OF ITS OWN, AND NOT A JOB IN rust-ci.yml
+#
+# `cargo llvm-cov --workspace` is a full instrumented rebuild of the
+# workspace. Attaching it to the PR lanes would add that to every pull
+# request in every consumer, on a self-hosted pool that was measured at
+# 33 of 34 runners busy on 2026-09-21 with a merge queued 30 minutes behind
+# it. Qlty's coverage view is a property of the DEFAULT BRANCH, so this runs
+# on push to main and on a schedule, where one run per merge answers the
+# question once instead of once per push per PR.
+#
+# THE TWO THINGS THAT MADE THE PREVIOUS UPLOADS LIE
+#
+# 1. PATHS. Coverage produced anywhere other than the repository root emits
+#    `SF:` paths Qlty cannot resolve, and it rejects the whole report with
+#    "Only 0.00% of files are present (threshold: 90.00%)". maxi-kvm measured
+#    92.43% line coverage and published NOTHING for weeks because its lcov
+#    said `/workspace/crates/...` from inside the coverage container
+#    (maxi-kvm#144). This lane runs cargo in the checkout, so paths are
+#    already repo-relative; `strip_prefix` exists for callers that do not.
+#
+# 2. SILENCE. `qltysh/qlty-action/coverage` defaults `skip-errors` to TRUE --
+#    "Do not error the action if the upload fails" -- so a rejected upload
+#    and an accepted one are the same green step. It is set to false here and
+#    the caller cannot change it. A reporting step may legitimately be
+#    non-fatal; it may not report success for work it did not do.
+#
+# AND THE THIRD, WHICH NEITHER OF THOSE COVERS: a report that is structurally
+# valid and measures nothing. maxi-core uploads successfully today and
+# publishes `Covered Lines: 8, Line Coverage: 0.00%`, because its workflow
+# runs a single named test. An upload is not evidence of a measurement, so
+# this lane asserts the report actually describes the repository before
+# sending it.
+name: CI lane / coverage
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: >-
+          Runner label set, as a JSON array string. Defaults to the x86-64
+          Linux fleet: this lane is a long instrumented build, which is
+          exactly the work that belongs on our own hardware rather than on
+          hosted minutes. X64 rather than bare Linux because six of the
+          fleet's twenty Linux runners are ARM64 (jasper, pearl, peridot).
+        required: false
+        type: string
+        default: '["self-hosted", "Linux", "X64"]'
+      cargo_args:
+        description: >-
+          Arguments to `cargo llvm-cov`. The default measures the whole
+          workspace. A repository that cannot build every feature at once
+          overrides it -- but see `min_files`: narrowing this far enough to
+          measure nothing is a failure, not a smaller answer.
+        required: false
+        type: string
+        default: '--workspace --all-features'
+      lcov_path:
+        required: false
+        type: string
+        default: target/lcov.info
+      strip_prefix:
+        description: >-
+          Removed from absolute paths in the report. Empty for an ordinary
+          repository, where cargo already emits repo-relative paths. Callers
+          that run tests somewhere else -- a container bind-mount, a
+          different working directory -- set it to that root.
+        required: false
+        type: string
+        default: ''
+      min_files:
+        description: >-
+          The report must describe at least this many source files. Catches an
+          empty or near-empty report -- but NOT a narrowed one; see
+          min_covered_lines.
+        required: false
+        type: number
+        default: 5
+      min_covered_lines:
+        description: >-
+          The report must show at least this many COVERED lines, summed from
+          its `LH:` records.
+
+          This is the guard that actually catches the maxi-core shape, and
+          `min_files` alone does not. lcov emits an `SF:` record for every
+          INSTRUMENTED file, whether or not a single line in it ran, so a run
+          that compiled the workspace and then executed almost nothing still
+          lists hundreds of files. Counting `SF:` would pass it. maxi-core
+          publishes exactly that today: a valid, accepted report of
+          `Covered Lines: 8, Line Coverage: 0.00%`.
+
+          The question this asks is "did a measurement happen", not "is
+          coverage good". A repository genuinely at zero should not be running
+          this lane at all. (Caught by coderabbitai on ci#39.)
+        required: false
+        type: number
+        default: 50
+      toolchain:
+        required: false
+        type: string
+        default: stable
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+      QLTY_COVERAGE_TOKEN:
+        description: >-
+          The WORKSPACE coverage token, already an org secret with visibility
+          `all`. Qlty infers the project from the git origin, so one token
+          serves every repository and no per-repo token is needed.
+        required: true
+
+permissions: {}
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: always
+  # Same reason as lane-test: a runner-level CARGO_TARGET_DIR must never
+  # redirect this build onto a shared farm flock.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Generate org dependency token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          permission-contents: read
+
+      - name: Configure git for private deps
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/cov-lane"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/cov-lane"
+          gitconfig="$RUNNER_TEMP/cov-lane/.gitconfig-ci"
+          cat > "$gitconfig" <<GITEOF
+          [url "https://x-access-token:${GH_APP_TOKEN}@github.com/maxi-tools/"]
+            insteadOf = https://github.com/maxi-tools/
+            insteadOf = git@github.com:maxi-tools/
+            insteadOf = ssh://git@github.com/maxi-tools/
+          [http]
+            lowSpeedLimit = 1000
+            lowSpeedTime = 300
+          GITEOF
+          echo "GIT_CONFIG_GLOBAL=$gitconfig" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
+        with:
+          toolchain: ${{ inputs.toolchain }}
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af  # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Fetch private dependencies
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.lock ]; then
+            cargo fetch --locked
+          else
+            cargo fetch
+          fi
+
+      - name: Measure coverage
+        env:
+          CARGO_ARGS: ${{ inputs.cargo_args }}
+          LCOV_PATH: ${{ inputs.lcov_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$LCOV_PATH")"
+          # `llvm-cov clean` first: a stale profraw set from an earlier run on
+          # a PERSISTENT runner would otherwise be merged into this report,
+          # and coverage attributed to code that this commit does not contain
+          # is worse than no coverage at all.
+          cargo llvm-cov clean --workspace
+          # Unquoted on purpose -- CARGO_ARGS is a caller-supplied argument
+          # list ("--workspace --all-features"), not one argument.
+          # shellcheck disable=SC2086
+          cargo llvm-cov $CARGO_ARGS --lcov --output-path "$LCOV_PATH"
+
+      - name: Remove private dependency auth
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/cov-lane"
+          (umask 077 && : > "$RUNNER_TEMP/gitconfig-empty")
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig-empty" >> "$GITHUB_ENV"
+
+      # The guard the fleet did not have. An lcov file can exist, parse, and
+      # describe nothing -- that is what maxi-core publishes today. Counting
+      # `SF:` records is the cheapest honest question: how many source files
+      # does this report actually claim to have measured?
+      - name: Assert the report describes this repository
+        env:
+          LCOV_PATH: ${{ inputs.lcov_path }}
+          MIN_FILES: ${{ inputs.min_files }}
+          MIN_COVERED: ${{ inputs.min_covered_lines }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "$LCOV_PATH" ]; then
+            echo "::error::$LCOV_PATH is missing or empty; cargo llvm-cov produced no report"
+            exit 1
+          fi
+          files="$(grep -c '^SF:' "$LCOV_PATH" || true)"
+          : "${files:=0}"
+          # LH is lcov's per-file "lines hit"; LF is "lines found". Summing LH
+          # is the only one of the three numbers that says anything RAN.
+          covered="$(awk -F: '/^LH:/ { n += $2 } END { print n + 0 }' "$LCOV_PATH")"
+          found="$(awk -F: '/^LF:/ { n += $2 } END { print n + 0 }' "$LCOV_PATH")"
+          echo "report describes $files file(s): $covered of $found lines covered"
+
+          if [ "$files" -lt "$MIN_FILES" ]; then
+            echo "::error::only $files source file(s) in $LCOV_PATH (minimum $MIN_FILES)."
+            echo "::error::A report this small is a narrowed or failed measurement, not a low score."
+            echo "::error::Widen inputs.cargo_args, or lower inputs.min_files deliberately if this repo really is that small."
+            exit 1
+          fi
+
+          # The file count alone cannot catch this, which is the whole point:
+          # lcov writes an SF record for every INSTRUMENTED file, hit or not,
+          # so a run that built everything and executed nothing still lists
+          # hundreds of files with LH:0. That is precisely what maxi-core
+          # publishes -- 8 covered lines, accepted, 0.00%.
+          if [ "$covered" -lt "$MIN_COVERED" ]; then
+            echo "::error::only $covered covered line(s) across $files file(s) (minimum $MIN_COVERED)."
+            echo "::error::The report lists files but almost nothing in them ran, which is a failed or"
+            echo "::error::narrowed test run rather than low coverage. Check that the tests actually"
+            echo "::error::executed, or lower inputs.min_covered_lines deliberately."
+            exit 1
+          fi
+          {
+            echo "## coverage"
+            echo "- files measured: $files"
+            echo "- lines covered: $covered of $found"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # skip-errors is FALSE and the caller cannot raise it. See the header.
+      - name: Publish coverage to Qlty
+        uses: qltysh/qlty-action/coverage@08a0a862c159eae9b9003081da6663d96efef637  # v2
+        with:
+          token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
+          files: ${{ inputs.lcov_path }}
+          strip-prefix: ${{ inputs.strip_prefix }}
+          skip-errors: false
+
+      - name: Retain the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coverage-lcov
+          path: ${{ inputs.lcov_path }}
+          if-no-files-found: error
+          retention-days: 7
