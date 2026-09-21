@@ -1,0 +1,19 @@
+.github/workflows/review-gate-reusable.yml
+  s_b1f4d8d95745a7::t_d0371c1f61bfa7 209-227,229-230,240,253-266,269-286
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "88c898d4408010629c7a0ffd4c56877a91f203d3",
+  "prompts": {},
+  "sessions": {
+    "s_b1f4d8d95745a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bd3649f8-1e62-42b5-9f11-9c0187233ba8",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

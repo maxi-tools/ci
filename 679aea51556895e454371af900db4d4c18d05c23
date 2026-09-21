@@ -1,0 +1,14 @@
+.github/workflows/rust-ci.yml
+  h_cebe5b6d461c32 170-181,190-192,217-228,237-239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "679aea51556895e454371af900db4d4c18d05c23",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

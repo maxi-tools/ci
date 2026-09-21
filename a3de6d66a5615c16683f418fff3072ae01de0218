@@ -1,0 +1,20 @@
+.github/workflows/lane-plan.yml
+  h_cebe5b6d461c32 275,277-279,281-282,284,291-304
+.github/workflows/rust-ci.yml
+  h_cebe5b6d461c32 155-178,180-181
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 112,121
+tests/test_lane_decisions.py
+  h_cebe5b6d461c32 1-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a3de6d66a5615c16683f418fff3072ae01de0218",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
