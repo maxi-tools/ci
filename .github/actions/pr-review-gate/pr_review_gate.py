@@ -211,9 +211,13 @@ ROSTER_CONTEXT = 'review-roster'
 #: renderer, which is how a human-readable status gets re-pasted into the
 #: runner.
 #:
-#: Asked names are bracket-delimited and comma-separated, may be empty, and
-#: are GitHub reviewer slugs (login or login[bot], both accepted as the
-#: GraphQL/REST split elsewhere in this file handles). `skipped` is a count:
+#: Asked names are bracket-delimited and comma-separated and may be empty.
+#: They are the selector's `reviewer_label` values (`coderabbit`), not the
+#: reviewer's login (`coderabbitai[bot]`): the roster publishes labels and
+#: the reviews arrive as logins, and the two are not the same string for
+#: most reviewers. `LABEL_TO_LOGIN` below maps one to the other before the
+#: gate intersects. A `login[bot]` arriving in `asked` is still accepted,
+#: because the comparison strips the suffix on both sides. `skipped` is a count:
 #: one or more digits. A description that still carries the old
 #: comma-separated name list parses too -- the count is the number of names
 #: -- so a status published before this change does not fail the gate closed.
@@ -230,6 +234,75 @@ ROSTER_DESCRIPTION_RE = re.compile(
     r'(?:\s+profiles=\S+)?'
     r'\s*$'
 )
+
+
+#: Roster label -> the login a review by that reviewer arrives under.
+#:
+#: The selector publishes `reviewer_label` in `asked` (select-roster.py
+#: writes `entry['reviewer']`, and every `asked` entry sets that from
+#: `reviewer_label`). The collector reads `author{login}` over GraphQL,
+#: which returns the actor's bare slug -- the same string as the table's
+#: `reviewer_key` with the `[bot]` suffix removed. Intersecting the two
+#: raw strings matches only the reviewers whose label happens to equal
+#: their login, which is one of ten. A clean PR whose only review came
+#: from CodeRabbit then reads as unreviewed, and the gate stays red on the
+#: one reviewer the roster asked for. (maxi-dist#312, #310, #859.)
+#:
+#: Copied from `REVIEWER_TABLE` in maxi-config maxi-review/select-roster.py,
+#: which is the source of truth: the roster cannot name a reviewer that is
+#: not in that table, and a reviewer added there without a row here is the
+#: unmapped case `roster_logins` fails closed on, naming the label. The
+#: values keep the `[bot]` suffix the table spells them with; the
+#: comparison strips it, so the GraphQL bare slug and the REST bracketed
+#: spelling both match.
+#:
+#: `maxi-lint` is not a reviewer. The fan-out fast-path collapses `asked`
+#: to that one label, and the gate never reaches the roster on a fan-out
+#: branch (the author+prefix bypass returns first). Mapping it would turn
+#: a lint label into a login that no review can ever carry.
+LABEL_TO_LOGIN = {
+    'maxi-reviewer': 'maxi-reviewer[bot]',
+    'qwen-coder-local': 'qwen-coder-review',
+    'coderabbit': 'coderabbitai[bot]',
+    'copilot': 'copilot-pull-request-reviewer[bot]',
+    'claude-review': 'claude-review',
+    'cubic': 'cubic-dev-ai[bot]',
+    'codacy': 'codacy-production',
+    'qlty': 'qlty[bot]',
+    'qodana': 'qodana',
+    'gemini': 'gemini-review',
+}
+
+
+def roster_logins(asked):
+    """The logins a roster's `asked` labels correspond to.
+
+    Returns the set of logins with the `[bot]` suffix removed, so a review
+    collected over GraphQL (bare slug) and one collected over REST
+    (`login[bot]`) both match. Raises Malformed when a label has no row in
+    `LABEL_TO_LOGIN`: an unmapped label would otherwise match nothing and
+    read as "nobody reviewed", which is the silent miss this mapping
+    exists to close. The message names the label.
+    """
+    logins = set()
+    for label in asked:
+        bare = label.removesuffix('[bot]')
+        login = LABEL_TO_LOGIN.get(bare)
+        if login is None:
+            # A label that already IS a login still resolves: the roster
+            # publishes labels, but a hand-edited status or an older
+            # publisher could spell the login, and refusing a name the
+            # table itself uses would fail the gate on a roster that
+            # named its reviewer correctly.
+            if bare in {value.removesuffix('[bot]') for value in LABEL_TO_LOGIN.values()}:
+                login = bare
+            else:
+                raise Malformed(
+                    'review-roster asked for ' + repr(label)
+                    + ', which is not a known reviewer label'
+                )
+        logins.add(login.removesuffix('[bot]'))
+    return logins
 
 
 def _skipped_count(roster):
@@ -490,12 +563,13 @@ def evaluate(doc, only=ONLY_ALL):
     # not silently desync from the others.
     if roster is not None and roster.get('asked'):
         active_roster = roster
-        # Match the bracket-tolerant GraphQL/REST split the FANOUT_AUTHORS
-        # block above already handles: a roster entry is a bare slug, and
-        # REST-port code may spell the same actor with `[bot]`. The
-        # intersection accepts both, just like the existing author checks.
-        asked_logins = {name.removesuffix('[bot]')
-                        for name in active_roster['asked']}
+        # The roster publishes labels (`coderabbit`); reviews arrive as
+        # logins (`coderabbitai`, or `coderabbitai[bot]` over REST). Map
+        # before intersecting, and strip `[bot]` on both sides so the
+        # GraphQL bare slug and the REST spelling match the same row.
+        # An asked label with no row fails closed inside roster_logins,
+        # naming the label, rather than matching nothing.
+        asked_logins = roster_logins(active_roster['asked'])
         covered = [name for name in reviewers
                    if name.removesuffix('[bot]') in asked_logins]
     else:
