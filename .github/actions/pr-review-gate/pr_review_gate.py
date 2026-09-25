@@ -191,6 +191,15 @@ WAIVED_PREFIX = 'WAIVED:'
 #: characters, and the step summary prints both from the JSON. An operator
 #: who needs to know WHY a reviewer was skipped follows the status's
 #: target_url into the run.
+#:
+#: A head not re-reviewed since the shortening still carries the previous
+#: wire format, which this parser also accepts:
+#:
+#:     band=<band> asked=[a,b,...] skipped=[c,d,...] profiles=<state>
+#:
+#: `skipped` there is a name list; the gate only ever reads the length, so
+#: the parser normalises it to a count. Dropping the line would fail the
+#: gate closed on every such head.
 ROSTER_CONTEXT = 'review-roster'
 
 #: Roster description regex. Tolerates whitespace between the fields and an
@@ -208,10 +217,17 @@ ROSTER_CONTEXT = 'review-roster'
 #: one or more digits. A description that still carries the old
 #: comma-separated name list parses too -- the count is the number of names
 #: -- so a status published before this change does not fail the gate closed.
+#:
+#: Two shapes match. The current one starts at `asked=`. The previous one
+#: starts at `band=` and ends at `profiles=`; its `skipped` group is the
+#: name list, which parse_roster counts. A description that starts with
+#: either prefix and matches neither is a corruption and fails closed.
 ROSTER_DESCRIPTION_RE = re.compile(
-    r'^asked=\[([^\]]*)\]\s+'
+    r'^(?:band=[a-z]+\s+)?'
+    r'asked=\[([^\]]*)\]\s+'
     r'skipped=([^\s]+)'
     r'(?:\s+unknown=(\d+))?'
+    r'(?:\s+profiles=\S+)?'
     r'\s*$'
 )
 
@@ -249,19 +265,23 @@ def parse_roster(description):
     gate only ever reads the length. A description that still carries the
     old comma-separated name list parses as well, and the count is the
     number of names, so a status published before the change does not fail
-    closed.
+    closed. That includes the complete previous wire format, which starts
+    with `band=` and ends with `profiles=` and is still published on every
+    head not re-reviewed since the shortening.
     """
     if not isinstance(description, str) or not description.strip():
         return None
     match = ROSTER_DESCRIPTION_RE.match(description.strip())
     if not match:
         # Decide between "this is not a roster description" and "this is a
-        # corrupted roster description". The selector never publishes anything
-        # that does not start with `asked=`, so a description that doesn't is
-        # either an older status, an unrelated context, or human editing --
-        # all "not a roster". A description that DOES start with `asked=` and
-        # then fails to match is a corruption and must fail closed.
-        if description.lstrip().startswith('asked='):
+        # corrupted roster description". The selector publishes either the
+        # current `asked=` line or the previous `band=` line, so a
+        # description that starts with neither is an unrelated context or
+        # human editing -- "not a roster". A description that starts with
+        # one of those prefixes and then fails to match is a corruption
+        # and must fail closed.
+        stripped = description.lstrip()
+        if stripped.startswith('asked=') or stripped.startswith('band='):
             raise Malformed(
                 'review-roster description is not in the expected shape: '
                 + repr(description)
