@@ -271,7 +271,7 @@ def parse_roster(description):
     def _split(raw):
         return [name for name in raw.split(',') if name]
 
-    skipped_raw = match.group(2)
+    skipped_raw = match.group(2).strip('[]')
     if skipped_raw.isdigit():
         skipped = int(skipped_raw)
     else:
