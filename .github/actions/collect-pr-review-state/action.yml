@@ -156,7 +156,7 @@ runs:
         # already has a defined absence fallback.
         #
         # A genuine roster the script cannot parse still fails closed: the
-        # gate's parse_roster raises Malformed on a `band=...` description
+        # gate's parse_roster raises Malformed on an `asked=...` description
         # it cannot shape-match, and that propagates through evaluate().
         # An UNRELATED status description ("reviewed by a non-author",
         # etc.) returns None and lands on `roster=absent`.
@@ -216,10 +216,11 @@ runs:
           if ! ROSTER_PARSED="$(
             jq -R -r '
               def parse:
-                if test("^band=[a-z]+\\s+asked=\\[[^\\]]*\\]\\s+skipped=\\[[^\\]]*\\]\\s+profiles=\\S+\\s*$") then
-                  capture("^band=[a-z]+\\s+asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=\\[(?<skipped>[^\\]]*)\\]\\s+profiles=\\S+\\s*$")
+                if test("^asked=\\[[^\\]]*\\]\\s+skipped=\\S+(\\s+unknown=[0-9]+)?\\s*$") then
+                  capture("^asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=(?<skipped>\\S+)(\\s+unknown=(?<unknown>[0-9]+))?\\s*$")
                   | { asked: (.asked | split(",") | map(select(length > 0))),
-                      skipped: (.skipped | split(",") | map(select(length > 0))) }
+                      skipped: (if (.skipped | test("^[0-9]+$")) then (.skipped | tonumber)
+                                else (.skipped | split(",") | map(select(length > 0)) | length) end) }
                 else
                   error("malformed review-roster description: " + .)
                 end;

@@ -182,39 +182,58 @@ WAIVED_PREFIX = 'WAIVED:'
 #: Status description format (single line, from
 #: maxi-review/select-roster.py:summary):
 #:
-#:     band=<trivial|routine|complex> asked=[a,b,...] skipped=[c,d,...] profiles=<state>
+#:     asked=[a,b,...] skipped=<n> [unknown=<n>]
 #:
-#: The gate only parses `asked=` and `skipped=`. `band=` and `profiles=` are
-#: for humans reading the PR face; an operator who needs to know WHY CodeRabbit
-#: was skipped follows the status's target_url into the run.
+#: The gate consumes the `asked` NAMES and the `skipped` COUNT. A review
+#: counts only when its author is in `asked`; `skipped` is printed as a
+#: length on the passing line and never matched against an author. `band`
+#: and `profiles` are not on this line: GitHub caps the description at 140
+#: characters, and the step summary prints both from the JSON. An operator
+#: who needs to know WHY a reviewer was skipped follows the status's
+#: target_url into the run.
 ROSTER_CONTEXT = 'review-roster'
 
-#: Roster description regex. Tolerates whitespace between the four fields
-#: (band=, asked=, skipped=, profiles=) and an optional trailing newline the
-#: collector may append after the description -- the selector emits the four
-#: fields on one line with single spaces between them, but a hand-edited
-#: description with a final `\n` would otherwise fail to match. The selector
-#: never emits whitespace around `=`; matching `\s+` between the four fields
-#: is enough to survive a copy-paste through a markdown renderer, which is
-#: how a human-readable status gets re-pasted into the runner.
+#: Roster description regex. Tolerates whitespace between the fields and an
+#: optional trailing newline the collector may append after the description.
+#: The selector emits the fields on one line with single spaces between them,
+#: but a hand-edited description with a final `\n` would otherwise fail to
+#: match. The selector never emits whitespace around `=`; matching `\s+`
+#: between the fields is enough to survive a copy-paste through a markdown
+#: renderer, which is how a human-readable status gets re-pasted into the
+#: runner.
 #:
-#: Asked and skipped lists are bracket-delimited, comma-separated, may be
-#: empty, and the names are GitHub reviewer slugs (login or login[bot], both
-#: accepted as the GraphQL/REST split elsewhere in this file handles). The
-#: selector only ever emits bare slugs -- it reads GitHub logins, never the
-#: bracketed REST spelling -- so a `login[bot]` arriving in `asked` is the
-#: gate's bracketed-form allowance matching the GraphQL bare-slug spelling.
+#: Asked names are bracket-delimited and comma-separated, may be empty, and
+#: are GitHub reviewer slugs (login or login[bot], both accepted as the
+#: GraphQL/REST split elsewhere in this file handles). `skipped` is a count:
+#: one or more digits. A description that still carries the old
+#: comma-separated name list parses too -- the count is the number of names
+#: -- so a status published before this change does not fail the gate closed.
 ROSTER_DESCRIPTION_RE = re.compile(
-    r'^band=[a-z]+\s+'
-    r'asked=\[([^\]]*)\]\s+'
-    r'skipped=\[([^\]]*)\]\s+'
-    r'profiles=\S+'
+    r'^asked=\[([^\]]*)\]\s+'
+    r'skipped=([^\s]+)'
+    r'(?:\s+unknown=(\d+))?'
     r'\s*$'
 )
 
 
+def _skipped_count(roster):
+    """The number of skipped reviewers, whether the payload carries a count or a list.
+
+    The selector publishes a count, because the description is capped at 140
+    characters and the gate only ever prints the length. A payload built
+    before that change, or a test, still carries the name list. Both answer
+    the same question.
+    """
+    skipped = roster.get('skipped')
+    if isinstance(skipped, int):
+        return skipped
+    if isinstance(skipped, list):
+        return len(skipped)
+    return 0
+
+
 def parse_roster(description):
-    """Parse a `review-roster` status description into (asked, skipped) lists.
+    """Parse a `review-roster` status description into asked names and a skip count.
 
     Returns None when the description cannot be trusted to be a roster --
     a None roster tells the gate to behave exactly as it did before T3,
@@ -225,9 +244,12 @@ def parse_roster(description):
     selector that is publishing the wrong thing in the right slot, which an
     `ignored` rule would silently turn into a green gate.
 
-    The selector emits one reviewer per slot on main today. A future change
-    that adds whitespace between reviewers (`[a, b]` vs `[a,b]`) would still
-    parse -- the regex does not anchor on internal whitespace.
+    `asked` is a list of names. `skipped` is a count: the selector publishes
+    a number because GitHub caps the description at 140 characters and the
+    gate only ever reads the length. A description that still carries the
+    old comma-separated name list parses as well, and the count is the
+    number of names, so a status published before the change does not fail
+    closed.
     """
     if not isinstance(description, str) or not description.strip():
         return None
@@ -235,11 +257,11 @@ def parse_roster(description):
     if not match:
         # Decide between "this is not a roster description" and "this is a
         # corrupted roster description". The selector never publishes anything
-        # that does not start with `band=`, so a description that doesn't is
+        # that does not start with `asked=`, so a description that doesn't is
         # either an older status, an unrelated context, or human editing --
-        # all "not a roster". A description that DOES start with `band=` and
+        # all "not a roster". A description that DOES start with `asked=` and
         # then fails to match is a corruption and must fail closed.
-        if description.lstrip().startswith('band='):
+        if description.lstrip().startswith('asked='):
             raise Malformed(
                 'review-roster description is not in the expected shape: '
                 + repr(description)
@@ -249,8 +271,14 @@ def parse_roster(description):
     def _split(raw):
         return [name for name in raw.split(',') if name]
 
+    skipped_raw = match.group(2)
+    if skipped_raw.isdigit():
+        skipped = int(skipped_raw)
+    else:
+        skipped = len(_split(skipped_raw))
+
     return {'asked': _split(match.group(1)),
-            'skipped': _split(match.group(2))}
+            'skipped': skipped}
 
 
 class Malformed(Exception):
@@ -327,9 +355,11 @@ def evaluate(doc, only=ONLY_ALL):
         _require('asked' in raw_roster and isinstance(raw_roster['asked'], list)
                  and all(isinstance(n, str) for n in raw_roster['asked']),
                  'payload field "roster.asked" is not a list of strings')
-        _require('skipped' in raw_roster and isinstance(raw_roster['skipped'], list)
-                 and all(isinstance(n, str) for n in raw_roster['skipped']),
-                 'payload field "roster.skipped" is not a list of strings')
+        _require('skipped' in raw_roster and (
+                     (isinstance(raw_roster['skipped'], int) and raw_roster['skipped'] >= 0)
+                     or (isinstance(raw_roster['skipped'], list)
+                         and all(isinstance(n, str) for n in raw_roster['skipped']))),
+                 'payload field "roster.skipped" is not a count or a list of strings')
         # A roster that names no one as `asked` cannot impose a narrower rule
         # than the old "any non-author review" rule -- an empty `asked` is
         # indistinguishable from "the selector wanted no reviews at all", and
@@ -539,7 +569,7 @@ def evaluate(doc, only=ONLY_ALL):
             # reader scanning the log sees how many reviewers the roster
             # asked for.
             lines.append('  roster=present asked=' + str(len(active_roster['asked']))
-                         + ' skipped=' + str(len(active_roster['skipped'])))
+                         + ' skipped=' + str(_skipped_count(active_roster)))
         else:
             lines.append('  roster=absent - behaving as before the roster selector shipped')
 
