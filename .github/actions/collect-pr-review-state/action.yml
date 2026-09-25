@@ -220,7 +220,7 @@ runs:
                   capture("^asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=(?<skipped>\\S+)(\\s+unknown=(?<unknown>[0-9]+))?\\s*$")
                   | { asked: (.asked | split(",") | map(select(length > 0))),
                       skipped: (if (.skipped | test("^[0-9]+$")) then (.skipped | tonumber)
-                                else (.skipped | split(",") | map(select(length > 0)) | length) end) }
+                                else (.skipped | gsub("[\\[\\]]"; "") | split(",") | map(select(length > 0)) | length) end) }
                 else
                   error("malformed review-roster description: " + .)
                 end;
