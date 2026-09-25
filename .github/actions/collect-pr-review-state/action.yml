@@ -156,10 +156,10 @@ runs:
         # already has a defined absence fallback.
         #
         # A genuine roster the script cannot parse still fails closed: the
-        # gate's parse_roster raises Malformed on an `asked=...` description
-        # it cannot shape-match, and that propagates through evaluate().
-        # An UNRELATED status description ("reviewed by a non-author",
-        # etc.) returns None and lands on `roster=absent`.
+        # gate's parse_roster raises Malformed on an `asked=...` or `band=...`
+        # description it cannot shape-match, and that propagates through
+        # evaluate(). An UNRELATED status description ("reviewed by a
+        # non-author", etc.) returns None and lands on `roster=absent`.
         if ! gh api "repos/$OWNER/$REPO/commits/$HEAD_SHA/statuses" \
             > roster_statuses.json 2>/dev/null; then
           echo "::warning::could not read commit statuses for $HEAD_SHA; gate will fall back to roster=absent"
@@ -216,11 +216,21 @@ runs:
           if ! ROSTER_PARSED="$(
             jq -R -r '
               def parse:
+                # Two wire formats. The current one is
+                # `asked=[names] skipped=<n> [unknown=<n>]`. The previous one,
+                # still published on every head not re-reviewed since the
+                # shortening, is `band=<band> asked=[names] skipped=[names]
+                # profiles=<state>`. Both yield the same object: asked names,
+                # and skipped as a count (the length of the name list).
                 if test("^asked=\\[[^\\]]*\\]\\s+skipped=\\S+(\\s+unknown=[0-9]+)?\\s*$") then
                   capture("^asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=(?<skipped>\\S+)(\\s+unknown=(?<unknown>[0-9]+))?\\s*$")
                   | { asked: (.asked | split(",") | map(select(length > 0))),
                       skipped: (if (.skipped | test("^[0-9]+$")) then (.skipped | tonumber)
                                 else (.skipped | gsub("[\\[\\]]"; "") | split(",") | map(select(length > 0)) | length) end) }
+                elif test("^band=[a-z]+\\s+asked=\\[[^\\]]*\\]\\s+skipped=\\[[^\\]]*\\]\\s+profiles=\\S+\\s*$") then
+                  capture("^band=[a-z]+\\s+asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=\\[(?<skipped>[^\\]]*)\\]\\s+profiles=\\S+\\s*$")
+                  | { asked: (.asked | split(",") | map(select(length > 0))),
+                      skipped: (.skipped | split(",") | map(select(length > 0)) | length) }
                 else
                   error("malformed review-roster description: " + .)
                 end;
