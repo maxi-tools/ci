@@ -15,11 +15,15 @@ description: >-
   and used as the artifact name, and `summary_thumbnails` is the number of
   inline base64 thumbnails written to the job summary (GitHub renders
   <img> in summaries; images cannot be linked from an artifact, so the
-  first few are embedded). Pages deploys are deliberately NOT inside this
-  action -- the caller composes a separate `actions/deploy-pages` step
-  with `data/index.html` as the entry, the same way `pr-review-gate`'s
-  callers compose `actions/checkout` themselves. That keeps Pages policy
-  in the caller and this action usable without `pages: write`.
+  first few are embedded). Pages deploys are inside this action when the
+  caller sets `pages: true`: the gallery is staged at
+  `gallery/<name>/latest/` and uploaded with `actions/upload-pages-artifact`,
+  and `actions/deploy-pages` publishes it. Both steps are gated on the
+  input, so a caller that leaves it at the default never requests
+  `pages: write` and the action stays usable in a job that has none.
+  `pages: write` is a job-level permission, so a caller that sets
+  `pages: true` must grant it on the job; the action cannot grant it
+  itself.
 
   Why a composite action rather than a reusable workflow: the renderer is
   one script with no secrets and no cross-lane policy. A reusable workflow
@@ -59,6 +63,7 @@ runs:
         GALLERY_ROOT: ${{ inputs.root }}
         GALLERY_NAME: ${{ inputs.name }}
         GALLERY_SUMMARY_THUMBNAILS: ${{ inputs.summary_thumbnails }}
+        GALLERY_PAGES: ${{ inputs.pages }}
         GALLERY_SCRIPT: ${{ github.action_path }}/moments_gallery.py
       run: python3 "$GALLERY_SCRIPT"
     - name: Upload gallery artifact
@@ -69,6 +74,31 @@ runs:
         path: ${{ steps.render.outputs.out_dir }}
         if-no-files-found: warn
         retention-days: 14
+    - name: Upload Pages artifact
+      id: pages-upload
+      if: inputs.pages == 'true'
+      uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      with:
+        path: ${{ steps.render.outputs.pages_root }}
+    - name: Deploy to GitHub Pages
+      id: pages-deploy
+      if: inputs.pages == 'true'
+      uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+    - name: Record the Pages deployment
+      id: pages-record
+      if: inputs.pages == 'true'
+      shell: bash
+      env:
+        PAGE_URL: ${{ steps.pages-deploy.outputs.page_url }}
+        LANE: ${{ steps.render.outputs.lane }}
+      run: |
+        # page_url is the site root; the staged tree puts this lane at
+        # gallery/<lane>/latest/, which is the URL the output reports.
+        case "$PAGE_URL" in
+          */) latest="${PAGE_URL}gallery/${LANE}/latest/" ;;
+          *) latest="${PAGE_URL}/gallery/${LANE}/latest/" ;;
+        esac
+        echo "latest_deployment=$latest" >> "$GITHUB_OUTPUT"
 
 inputs:
   manifest:
@@ -95,11 +125,20 @@ inputs:
   summary_thumbnails:
     description: >-
       How many inline base64 thumbnails to embed in the job summary (one
-      per scenario, up to this count). GitHub renders `<img>` in job
-      summaries but cannot resolve image URLs that point into an artifact,
-      so a handful are embedded directly. 0 disables the section.
+      per scenario, up to this count). Each is downscaled to 240px wide
+      before embedding: GitHub caps one step's summary at 1 MiB and
+      discards the upload past that, so a raw frame would be invisible.
+      0 disables the section.
     required: false
     default: '3'
+  pages:
+    description: >-
+      Deploy the gallery to GitHub Pages at `<repo>/gallery/<name>/latest`.
+      The job must grant `pages: write` and `id-token: write` when this is
+      `true`; the steps are skipped entirely otherwise, so the default
+      needs no Pages permission.
+    required: false
+    default: 'false'
 
 outputs:
   out_dir:
@@ -108,3 +147,19 @@ outputs:
   html_path:
     description: Absolute path of the rendered `index.html`.
     value: ${{ steps.render.outputs.html_path }}
+  pages:
+    description: >-
+      Whether a Pages deploy was requested (`true` or `false`). Mirrors
+      the `pages` input so a later step can branch on what this run did.
+    value: ${{ steps.render.outputs.pages_enabled }}
+  lane:
+    description: >-
+      The gallery lane, taken from the `name` input. The Pages URL is
+      `<repo>/gallery/<lane>/latest`.
+    value: ${{ steps.render.outputs.lane }}
+  latest_deployment:
+    description: >-
+      URL of the deployed `<lane>/latest` gallery, empty when `pages` was
+      not requested. Set from the deploy step's `page_url`, so it is only
+      populated once the deploy has actually run.
+    value: ${{ steps.pages-record.outputs.latest_deployment }}

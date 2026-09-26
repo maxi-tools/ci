@@ -18,8 +18,16 @@ relocatable.
 
 Outputs (via `$GITHUB_OUTPUT`):
 
-    out_dir   absolute path of the gallery output directory
-    html_path absolute path of the rendered `index.html`
+    out_dir              absolute path of the gallery output directory
+    html_path            absolute path of the rendered `index.html`
+    pages_enabled        `true` when the caller asked for a Pages deploy
+    lane                 the gallery name, used as the Pages sub-path
+    pages_root           absolute path of the staged `<lane>/latest` tree
+                         when Pages was requested, else empty
+
+The latest-deployment URL is not one of these: it only exists after the
+deploy step has run, and a composite action's outputs are fixed when the
+action starts, so the action records it from a later step of its own.
 
 Side effects:
 
@@ -29,7 +37,11 @@ Side effects:
     * The first `GALLERY_SUMMARY_THUMBNAILS` scenarios' first frame are
       embedded as base64 `<img src="data:...">` rows appended to the job
       summary, so a reader who never opens the artifact still sees what
-      the run looked like at a glance.
+      the run looked like at a glance. Each frame is downscaled to a
+      240px-wide PNG thumbnail first: GitHub rejects a step summary over
+      1 MiB, and a raw e2e frame (the verifier's 1024x1024 PNG was
+      3,147,775 bytes, 4,197,472 once base64-wrapped) blows that cap on
+      its own.
 
 Inputs are passed via environment variables rather than argv so a hostile
 manifest cannot break out of the python invocation. The script refuses to
@@ -46,10 +58,21 @@ import os
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
 from typing import Any
 
 SCHEMA = "maxi-tools.moments-gallery.v1"
+
+# GitHub's per-step job-summary cap is 1 MiB
+# (https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#step-isolation-and-limits).
+# The thumbnail block must leave room for the surrounding markdown, so the
+# budget is the cap minus a fixed headroom rather than the cap itself.
+SUMMARY_BYTE_CAP = 1024 * 1024
+SUMMARY_HEADROOM_BYTES = 8 * 1024
+# Display width of the summary thumbnail. The <img width> matches it, so
+# the bytes we embed are the bytes the reader sees.
+SUMMARY_THUMB_WIDTH = 240
 
 # Slug used for scenario ids; conservative so a hand-edited
 # manifest cannot escape the gallery root via `moments/<id>/`.
@@ -679,9 +702,94 @@ def _render_html(manifest: dict[str, Any], scenarios: list[dict[str, Any]]) -> s
 """
 
 
-def _png_data_url(path: pathlib.Path) -> str:
-    """Encode a PNG as a base64 data URL for inline summary embedding."""
-    data = path.read_bytes()
+def _png_thumbnail(data: bytes, width: int) -> bytes:
+    """Downscale a PNG to `width` pixels wide, nearest-neighbour, stdlib only.
+
+    Summary thumbnails are a glance, not the evidence: the full frame is
+    in the artifact. Nearest-neighbour keeps the implementation inside
+    the stdlib (no Pillow on the runner) and the result is still a real,
+    decodable PNG. A frame already at or under `width` is returned as-is,
+    so a small synthetic fixture is embedded unchanged.
+    """
+    import struct
+    import zlib as _zlib
+
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise GalleryError("thumbnail source is not a PNG")
+    # Walk the chunks until IHDR and the concatenated IDAT are both in
+    # hand. Ancillary chunks (tEXt, iCCP, ...) are dropped on purpose:
+    # they can be megabytes and would defeat the size cap.
+    pos = 8
+    ihdr = None
+    idat = bytearray()
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        kind = data[pos + 4 : pos + 8]
+        payload = data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if kind == b"IHDR":
+            ihdr = payload
+        elif kind == b"IDAT":
+            idat.extend(payload)
+        elif kind == b"IEND":
+            break
+    if ihdr is None or not idat:
+        raise GalleryError("PNG is missing IHDR or IDAT")
+    src_w, src_h, bit_depth, color_type = struct.unpack(">IIBB", ihdr[:10])
+    if bit_depth != 8 or color_type not in (2, 6):
+        # Indexed, greyscale, and 16-bit frames are not what the e2e
+        # lanes emit. Refuse rather than guess a decode.
+        raise GalleryError(
+            f"PNG thumbnail only handles 8-bit RGB/RGBA, got "
+            f"bit_depth={bit_depth} color_type={color_type}"
+        )
+    if src_w <= width:
+        return data
+    channels = 3 if color_type == 2 else 4
+    raw = _zlib.decompress(bytes(idat))
+    stride = 1 + src_w * channels
+    if len(raw) < src_h * stride:
+        raise GalleryError("PNG IDAT is shorter than its IHDR claims")
+    dst_w = width
+    dst_h = max(1, round(src_h * dst_w / src_w))
+    out = bytearray()
+    for y in range(dst_h):
+        sy = min(src_h - 1, y * src_h // dst_h)
+        row = raw[sy * stride + 1 : (sy + 1) * stride]
+        out.append(0)
+        for x in range(dst_w):
+            sx = min(src_w - 1, x * src_w // dst_w)
+            start = sx * channels
+            # Flatten alpha onto black so the summary PNG is always RGB
+            # and a transparent frame does not render as a browser default.
+            if channels == 4:
+                alpha = row[start + 3] / 255
+                out.extend(
+                    bytes(int(round(row[start + c] * alpha)) for c in range(3))
+                )
+            else:
+                out.extend(row[start : start + 3])
+    ihdr_out = struct.pack(">IIBBBBB", dst_w, dst_h, 8, 2, 0, 0, 0)
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", _zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr_out)
+        + chunk(b"IDAT", _zlib.compress(bytes(out), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _png_data_url(path: pathlib.Path, width: int = SUMMARY_THUMB_WIDTH) -> str:
+    """Encode a downscaled PNG as a base64 data URL for the job summary."""
+    data = _png_thumbnail(path.read_bytes(), width)
     return f"data:image/png;base64,{base64.b64encode(data).decode('ascii')}"
 
 
@@ -704,12 +812,14 @@ def _write_summary(
         first_frame_path = out_dir / first_frame_name
         if not first_frame_path.is_file():
             continue
-        # Thumbnail size: GitHub caps job-summary body size at 20 MiB.
-        # PNG bytes are encoded inline; a 480px wide frame at ~30 KB
-        # comfortably fits well within the limit even with a dozen rows.
+        # GitHub caps ONE step's summary at 1 MiB and drops the upload
+        # (without failing the step) when it is exceeded, so a raw frame
+        # inlined here is silently invisible. Downscale first; the full
+        # frame stays in the artifact the table links to.
         try:
             data_url = _png_data_url(first_frame_path)
-        except OSError:
+        except (OSError, GalleryError) as exc:
+            _log(f"summary thumbnail skipped for {scenario['id']}: {exc}")
             continue
         chips = " ".join(
             f"<span style=\"color:{'#2bb673' if c['held'] else '#e0625b'}\">{_html_escape(c['name'])}</span>"
@@ -730,7 +840,44 @@ def _write_summary(
         f"<sub>Open the <code>{_html_escape(html_relpath)}</code> artifact for the full gallery "
         f"(filmstrip + click-to-enlarge + keyboard left/right).</sub>\n"
     )
+    # Last line of defence: if the downscaled rows still exceed the cap
+    # (a pathological number of scenarios), drop rows from the end until
+    # the block fits, and say so. A summary GitHub will actually render
+    # beats one it silently discards.
+    budget = SUMMARY_BYTE_CAP - SUMMARY_HEADROOM_BYTES
+    encoded = table.encode("utf-8")
+    while len(encoded) > budget and rows:
+        rows.pop()
+        table = (
+            f"## {title}\n\n"
+            f"<table><thead><tr><th>scenario</th><th>first frame</th><th>claims</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>\n\n"
+            f"<sub>Further thumbnails omitted to stay under GitHub's 1 MiB "
+            f"step-summary cap. Open the <code>{_html_escape(html_relpath)}</code> "
+            f"artifact for the full gallery.</sub>\n"
+        )
+        encoded = table.encode("utf-8")
+    if len(encoded) > budget:
+        _log("summary block exceeds 1 MiB even with no thumbnails; skipped")
+        return
     _append_summary(table)
+
+
+def _stage_pages(out_dir: pathlib.Path, root: pathlib.Path, lane: str) -> pathlib.Path:
+    """Stage the gallery at `<root>/<name>-pages/gallery/<lane>/latest/`.
+
+    GitHub Pages serves an artifact from the site root, so the directory
+    layout IS the URL. Staging under `gallery/<lane>/latest` makes the
+    deployed URL `<repo>/gallery/<lane>/latest/`, which is the contract
+    the acceptance states, and a later run of the same lane replaces
+    `latest` rather than accumulating dated copies.
+    """
+    pages_dir = root / f"{lane}-pages"
+    if pages_dir.exists():
+        shutil.rmtree(pages_dir)
+    staged = pages_dir / "gallery" / lane / "latest"
+    shutil.copytree(out_dir, staged)
+    return pages_dir
 
 
 def _main_impl() -> int:
@@ -739,6 +886,7 @@ def _main_impl() -> int:
         root = pathlib.Path(_env("GALLERY_ROOT")).resolve(strict=False)
         name = _env("GALLERY_NAME")
         summary_thumbnails = int(_env("GALLERY_SUMMARY_THUMBNAILS", "3"))
+        pages_enabled = _env("GALLERY_PAGES", "false").lower() == "true"
     except GalleryError as exc:
         _log(f"input error: {exc}")
         return 2
@@ -769,8 +917,15 @@ def _main_impl() -> int:
     html_path = out_dir / HTML_FILENAME
     html_path.write_text(html, encoding="utf-8")
 
+    pages_root = ""
+    if pages_enabled:
+        pages_root = str(_stage_pages(out_dir, root, name))
+
     _set_output("out_dir", str(out_dir))
     _set_output("html_path", str(html_path))
+    _set_output("pages_enabled", "true" if pages_enabled else "false")
+    _set_output("lane", name)
+    _set_output("pages_root", pages_root)
 
     _write_summary(manifest, scenarios, out_dir, summary_thumbnails, HTML_FILENAME)
     _log(f"wrote {html_path} ({len(scenarios)} scenarios)")
@@ -910,12 +1065,15 @@ def _self_test() -> int:
     os.environ["GALLERY_ROOT"] = str(tmp)
     os.environ["GALLERY_NAME"] = "hud-desktop-e2e"
     os.environ["GALLERY_SUMMARY_THUMBNAILS"] = "3"
+    os.environ.pop("GALLERY_PAGES", None)
     # Don't write a real summary file in self-test.
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     saved_summary = None
     if summary is not None:
         saved_summary = summary
         os.environ.pop("GITHUB_STEP_SUMMARY")
+    output_file = tmp / "github-output.txt"
+    os.environ["GITHUB_OUTPUT"] = str(output_file)
     rc = _main_impl()
     if saved_summary is not None:
         os.environ["GITHUB_STEP_SUMMARY"] = saved_summary
@@ -940,8 +1098,195 @@ def _self_test() -> int:
     _expect("held chip class", "chip chip-held" in html, "held chip class missing")
     _expect("failed chip class", "chip chip-failed" in html, "failed chip class missing")
     _expect("facts bar", 'class="bar"' in html, "facts bar missing")
+
+    outputs = _read_outputs(output_file)
+    _expect("pages output defaults false", outputs.get("pages_enabled") == "false", str(outputs))
+    _expect("lane output", outputs.get("lane") == "hud-desktop-e2e", str(outputs))
+    _expect("no pages staging by default", outputs.get("pages_root") == "", str(outputs))
+    _expect(
+        "pages tree absent by default",
+        not (tmp / "hud-desktop-e2e-pages").exists(),
+        "pages staging ran with pages disabled",
+    )
+
+    _self_test_pages(tmp)
+    _self_test_large_png_summary()
     print("SELF_TEST_OK")
     return 0
+
+
+def _read_outputs(path: pathlib.Path) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    if not path.is_file():
+        return outputs
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        if key:
+            outputs[key] = value
+    return outputs
+
+
+def _self_test_pages(tmp: pathlib.Path) -> None:
+    """Re-run with pages requested and check the staged tree and outputs."""
+    os.environ["GALLERY_ROOT"] = str(tmp)
+    os.environ["GALLERY_PAGES"] = "true"
+    output_file = tmp / "github-output-pages.txt"
+    os.environ["GITHUB_OUTPUT"] = str(output_file)
+    rc = _main_impl()
+    if rc != 0:
+        print(f"SELF_TEST_FAIL pages main() returned {rc}", file=sys.stderr)
+        raise SystemExit(1)
+    outputs = _read_outputs(output_file)
+    lane = "hud-desktop-e2e"
+    staged = tmp / f"{lane}-pages" / "gallery" / lane / "latest" / HTML_FILENAME
+    if outputs.get("pages_enabled") != "true":
+        print(f"SELF_TEST_FAIL pages_enabled: {outputs}", file=sys.stderr)
+        raise SystemExit(1)
+    if outputs.get("lane") != lane:
+        print(f"SELF_TEST_FAIL lane: {outputs}", file=sys.stderr)
+        raise SystemExit(1)
+    if not staged.is_file():
+        print(f"SELF_TEST_FAIL pages staging missing {staged}", file=sys.stderr)
+        raise SystemExit(1)
+    if outputs.get("pages_root") != str(tmp / f"{lane}-pages"):
+        print(f"SELF_TEST_FAIL pages_root: {outputs}", file=sys.stderr)
+        raise SystemExit(1)
+    # The deploy step's page_url does not exist until that step has run,
+    # so the recording step is exercised here the way the action runs it.
+    # The script is read out of action.yml rather than copied, so the two
+    # cannot drift.
+    record = tmp / "github-output-record.txt"
+    action_text = (
+        pathlib.Path(__file__).resolve().parent / "action.yml"
+    ).read_text(encoding="utf-8")
+    marker = '      run: |\n'
+    start = action_text.index(marker, action_text.index("Record the Pages deployment"))
+    body = action_text[start + len(marker) :]
+    script = "\n".join(
+        line[8:] for line in body.splitlines() if line.startswith("        ")
+    )
+    for page_url, expected in (
+        (
+            "https://maxi-tools.github.io/voicemaci/",
+            f"https://maxi-tools.github.io/voicemaci/gallery/{lane}/latest/",
+        ),
+        (
+            "https://maxi-tools.github.io/voicemaci",
+            f"https://maxi-tools.github.io/voicemaci/gallery/{lane}/latest/",
+        ),
+    ):
+        record.write_text("")
+        result = subprocess.run(
+            ["bash", "-c", script],
+            check=False,
+            env={
+                "PAGE_URL": page_url,
+                "LANE": lane,
+                "GITHUB_OUTPUT": str(record),
+                "PATH": os.environ.get("PATH", ""),
+            },
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"SELF_TEST_FAIL record step: {result.stderr}", file=sys.stderr)
+            raise SystemExit(1)
+        got = _read_outputs(record).get("latest_deployment")
+        if got != expected:
+            print(f"SELF_TEST_FAIL latest_deployment: {got!r}", file=sys.stderr)
+            raise SystemExit(1)
+    os.environ.pop("GALLERY_PAGES", None)
+
+
+def _self_test_large_png_summary() -> None:
+    """One valid 4 MB-class PNG must keep the step summary under 1 MiB.
+
+    This is the case the verifier reproduced: a 1024x1024 RGB PNG of
+    3,147,775 bytes inlined raw produced a 4,197,472-byte summary, which
+    GitHub discards. The thumbnail must be a real <img> and the summary
+    must fit the cap.
+    """
+    import struct
+    import tempfile
+    import zlib as _zlib
+
+    width, height = 1024, 1024
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)
+        for x in range(width):
+            raw.extend((x & 0xFF, y & 0xFF, (x + y) & 0xFF))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", _zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", _zlib.compress(bytes(raw), 1))
+        + chunk(b"IEND", b"")
+    )
+    # The verifier's frame was 3,147,775 bytes. A flat-colour fixture
+    # compresses far below that, so pad with a tEXt chunk to land past
+    # 4 MB and prove ancillary chunks are dropped rather than embedded.
+    pad = b"x" * (4 * 1024 * 1024)
+    png = (
+        png[: -len(chunk(b"IEND", b""))]
+        + chunk(b"tEXt", b"Comment\x00" + pad)
+        + chunk(b"IEND", b"")
+    )
+
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="moments-gallery-large-png-"))
+    (tmp / "big.png").write_bytes(png)
+    manifest = {
+        "schema": SCHEMA,
+        "title": "large frame",
+        "scenarios": [
+            {
+                "id": "big",
+                "label": "big frame",
+                "moments": [{"image": "big.png", "timestamp_ms": 0}],
+            }
+        ],
+    }
+    (tmp / "manifest.json").write_text(json.dumps(manifest))
+    summary = tmp / "summary.md"
+    os.environ["GALLERY_MANIFEST"] = "manifest.json"
+    os.environ["GALLERY_ROOT"] = str(tmp)
+    os.environ["GALLERY_NAME"] = "large-png"
+    os.environ["GALLERY_SUMMARY_THUMBNAILS"] = "3"
+    os.environ.pop("GALLERY_PAGES", None)
+    os.environ["GITHUB_STEP_SUMMARY"] = str(summary)
+    os.environ["GITHUB_OUTPUT"] = str(tmp / "github-output.txt")
+    rc = _main_impl()
+    if rc != 0:
+        print(f"SELF_TEST_FAIL large-png main() returned {rc}", file=sys.stderr)
+        raise SystemExit(1)
+    rendered = summary.read_text(encoding="utf-8")
+    size = summary.stat().st_size
+    if size >= SUMMARY_BYTE_CAP:
+        print(
+            f"SELF_TEST_FAIL summary is {size} bytes, cap is {SUMMARY_BYTE_CAP}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if 'src="data:image/png;base64,' not in rendered:
+        print("SELF_TEST_FAIL summary has no inline thumbnail", file=sys.stderr)
+        raise SystemExit(1)
+    # The raw frame must not have been embedded: its base64 alone is
+    # over the cap, so its absence is what keeps the summary renderable.
+    if base64.b64encode(png).decode("ascii") in rendered:
+        print("SELF_TEST_FAIL summary embeds the raw frame", file=sys.stderr)
+        raise SystemExit(1)
+    print(
+        f"SELF_TEST large png: frame {len(png)} bytes, summary {size} bytes"
+    )
 
 
 if __name__ == "__main__":  # noqa: F811 -- extended below

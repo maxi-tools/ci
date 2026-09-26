@@ -203,18 +203,39 @@ this action usable without `pages: write`.
 
 The action uploads `<root>/<name>-gallery/` as the artifact and writes
 the first three scenarios' first frame into the job summary as inline
-base64 PNGs.
+base64 PNGs, each downscaled to 240px wide so the summary stays under
+GitHub's 1 MiB per-step cap.
 
-To deploy to GitHub Pages, the caller adds:
+Pages is a boolean input, default `false`. Set it and the action stages
+the gallery at `gallery/<name>/latest/` inside `<root>/<name>-pages/`,
+uploads that tree with `actions/upload-pages-artifact`, and deploys it.
+The job must grant `pages: write` and `id-token: write` for that path;
+with the default the steps are skipped and no Pages permission is needed.
 
 ```yaml
-- name: Publish to GitHub Pages
-  uses: actions/upload-pages-artifact@v3
-  with:
-    path: target/hud-e2e/hud-e2e-gallery
-- name: Deploy to Pages
-  uses: actions/deploy-pages@v4
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+jobs:
+  gallery:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Render moments gallery
+        id: gallery
+        uses: maxi-tools/ci/.github/actions/moments-gallery@main
+        with:
+          manifest: hud-e2e.manifest.json
+          root: target/hud-e2e
+          name: hud-e2e
+          pages: true
 ```
+
+The action exposes three outputs for that deploy: `pages` (the boolean
+the caller set), `lane` (the gallery name, here `hud-e2e`), and
+`latest_deployment` (the URL of `<repo>/gallery/<lane>/latest/`, empty
+when `pages` was not set). `steps.gallery.outputs.latest_deployment` is
+the address to link from a later step.
 
 ## Upgrade path from each existing gallery
 
