@@ -172,7 +172,7 @@ class Consumer:
 # Every consumer the run looked at ends in exactly ONE of these. The
 # summary is a partition, not a count of the happy path: a consumer
 # whose pin could not be read is `unreadable`, not silently absent.
-OUTCOMES = ('opened', 'reused', 'already', 'dry-run', 'failed', 'unreadable',
+OUTCOMES = ('opened', 'reused', 'already', 'owned-sync', 'dry-run', 'failed', 'unreadable',
             'opt-out', 'no-pin', 'not-a-sha')
 
 
@@ -286,6 +286,12 @@ def _fetch_consumer_pin(consumer: Consumer, *, token: str) -> dict[str, str]:
             token=token,
         )
         text = _decode_b64(content)
+        # This whole workflow is shipped from maxi-config. An independent pin
+        # PR races its sync PR and the next sync reverts the pin. Change the
+        # maxi-config SOURCE first; its distributor handles these consumers.
+        if (name == 'review-gate.yml' and consumer.name != 'maxi-tools/maxi-config'
+                and '# maxi-config-owned Maxi review gate workflow.' in text.splitlines()):
+            return {'__owned_sync__': ''}
         for match in USES_RE.finditer(text):
             wf = match.group('workflow')
             if wf not in WORKFLOW_FILES:
@@ -329,6 +335,23 @@ def _open_fanout_prs(consumer: Consumer, *, token: str) -> list[dict]:
             if p['headRefName'] == HEAD_REF or LEGACY_HEAD_RE.match(p['headRefName'])]
 
 
+def _retire_owned_pin_prs(consumer: Consumer, *, token: str) -> None:
+    '''Close only our single-file pin proposals; sync now owns the advance.'''
+    for pr in _open_fanout_prs(consumer, token=token):
+        detail = json.loads(_gh(
+            ['pr', 'view', str(pr['number']), '--repo', consumer.name,
+             '--json', 'author,headRefName,files'], token=token))
+        if (detail['author']['login'] != 'app/maxi-tools-auth' or
+                detail['headRefName'] != pr['headRefName'] or
+                [f['path'] for f in detail['files']] != ['.github/workflows/review-gate.yml']):
+            raise RuntimeError(f'{consumer}#{pr["number"]}: unexpected author or files; not closing')
+        _gh(['pr', 'close', str(pr['number']), '--repo', consumer.name,
+             '--delete-branch', '--comment',
+             'Superseded by the maxi-config-owned review-gate.yml sync. '
+             'The ci pin now advances in maxi-config/maxi-review/review-gate.yml '
+             'and reaches this repo through its sync PR.'], token=token)
+
+
 def _push_pin_branch(
     consumer: Consumer, *, head_ref: str, new_ref: str, token: str,
 ) -> None:
@@ -346,7 +369,9 @@ def _push_pin_branch(
             str(cwd),
         ])
         _run(['git', 'checkout', '-B', head_ref], workdir=str(cwd))
-        target = cwd / '.github/workflows/review-gate.yml'
+        target = cwd / (('maxi-review/review-gate.yml'
+                         if consumer.name == 'maxi-tools/maxi-config'
+                         else '.github/workflows/review-gate.yml'))
         text = target.read_text(encoding='utf-8')
         new_text, n = USES_RE.subn(
             lambda m: (
@@ -363,6 +388,10 @@ def _push_pin_branch(
             )
         target.write_text(new_text, encoding='utf-8')
         _run(['git', 'add', str(target)], workdir=str(cwd))
+        if consumer.name == 'maxi-tools/maxi-config':
+            installed = cwd / '.github/workflows/review-gate.yml'
+            installed.write_text(new_text, encoding='utf-8')
+            _run(['git', 'add', str(installed)], workdir=str(cwd))
         _run(
             [
                 'git', '-c', 'user.name=Maxi Boch',
@@ -490,6 +519,10 @@ def _plan(
             dropped(consumer, 'no-pin',
                     'no `uses: maxi-tools/ci/.github/workflows/...` line')
             continue
+        if '__owned_sync__' in pins:
+            dropped(consumer, 'owned-sync',
+                    'review-gate.yml is maxi-config-owned; the source pin is distributed by sync')
+            continue
         for wf, ref in pins.items():
             if not SHA.match(ref):
                 dropped(consumer, 'not-a-sha',
@@ -509,6 +542,12 @@ def _execute(plan: list[FanOut], *, tip_sha: str, token: str, dry_run: bool) -> 
     executed: list[FanOut] = []
     for entry in plan:
         if entry.outcome != 'planned':
+            if entry.outcome == 'owned-sync' and not dry_run:
+                try:
+                    _retire_owned_pin_prs(entry.consumer, token=token)
+                except Exception as exc:  # noqa: BLE001
+                    executed.append(replace(entry, outcome='failed', detail=str(exc)))
+                    continue
             executed.append(entry)  # dropped in _plan, reason already set
             continue
         if entry.old_ref == entry.new_ref:

@@ -189,7 +189,7 @@ jobs:
           counts = collections.Counter(r['outcome'] for r in rows)
           print(f"fan-out: {len(rows)} consumer row(s): "
                 + (', '.join(f'{n} {o}' for o, n in sorted(counts.items())) or 'none'))
-          ok = {'opened', 'reused', 'already', 'opt-out', 'no-pin', 'not-a-sha'}
+          ok = {'opened', 'reused', 'already', 'owned-sync', 'opt-out', 'no-pin', 'not-a-sha'}
           bad = [r for r in rows if r['outcome'] not in ok]
           for r in bad:
               print(f"::error::{r['consumer']}: {r['outcome']} -- {r['detail']}")

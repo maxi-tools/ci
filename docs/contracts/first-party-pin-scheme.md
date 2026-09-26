@@ -110,6 +110,14 @@ advanced the same workflow files and made them conflict. This changes
 the operational policy, not the immutable-SHA pin format: every advance
 still has its own consumer PR and check history.
 
+For a `review-gate.yml` bearing the maxi-config ownership marker, the
+ci producer no longer opens a competing pin PR in that consumer. It
+advances both `maxi-review/review-gate.yml` (the source) and the installed
+copy in maxi-config's pin PR, then maxi-config's distributor sends the
+new source to its consumers as their single sync PR. Existing one-file
+`ci/fanout-pin` PRs in owned consumers are closed as superseded; a PR
+with an unexpected author or files is never closed automatically.
+
 ## Known limits
 
 1. **First-time consumer adoption.** A repo that does not yet have a

@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -166,7 +167,7 @@ class EveryConsumerIsAccountedFor(unittest.TestCase):
         """OUTCOMES is the schema the workflow's post-summary step reads."""
         src = SCRIPT.read_text(encoding="utf-8")
         for name in ("opened", "reused", "already", "dry-run", "failed",
-                     "unreadable", "opt-out", "no-pin", "not-a-sha"):
+                     "unreadable", "opt-out", "no-pin", "not-a-sha", "owned-sync"):
             self.assertIn(name, fp.OUTCOMES)
             self.assertIn(repr(name), src, f"{name!r} is declared but never emitted")
 
@@ -281,6 +282,52 @@ class ProtectedAutomerge(unittest.TestCase):
         with mock.patch.object(fp, '_gh', side_effect=['"main"', RuntimeError('HTTP 403')]):
             with self.assertRaises(RuntimeError):
                 fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'url', token='t')
+
+
+class OwnedSyncRouting(unittest.TestCase):
+    def test_owned_copy_is_not_a_second_pin_pr(self):
+        import base64
+        text = '# maxi-config-owned Maxi review gate workflow.\n' + (
+            '    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@' + OLD)
+        def gh(args, *, token):
+            if args[-1] == '.[].name':
+                return 'review-gate.yml\n'
+            return base64.b64encode(text.encode()).decode()
+        with mock.patch.object(fp, '_gh', gh):
+            plan = fp._plan(tip_sha=TIP, consumers=['maxi-tools/x'], token='t')
+        self.assertEqual(plan[0].outcome, 'owned-sync')
+
+    def test_source_and_installed_copy_advance_together(self):
+        text = '# maxi-config-owned Maxi review gate workflow.\n' + (
+            '    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@' + OLD + '\n')
+        with tempfile.TemporaryDirectory() as root:
+            src = pathlib.Path(root) / 'maxi-review/review-gate.yml'
+            dst = pathlib.Path(root) / '.github/workflows/review-gate.yml'
+            src.parent.mkdir(parents=True)
+            dst.parent.mkdir(parents=True)
+            src.write_text(text)
+            dst.write_text(text)
+            with mock.patch.object(fp, '_run', return_value=''), \
+                 mock.patch('tempfile.mkdtemp', return_value=root):
+                fp._push_pin_branch(fp.Consumer('maxi-tools/maxi-config'),
+                                    head_ref=fp.HEAD_REF, new_ref=TIP, token='t')
+            self.assertEqual(src.read_text(), dst.read_text())
+            self.assertIn(TIP, src.read_text())
+
+    def test_only_bot_owned_single_file_pin_pr_is_retired(self):
+        pr = {'number': 12, 'headRefName': fp.HEAD_REF}
+        calls = []
+        def gh(args, *, token):
+            calls.append(args)
+            if args[:2] == ['pr', 'view']:
+                return json.dumps({'author': {'login': 'app/maxi-tools-auth'},
+                                   'headRefName': fp.HEAD_REF,
+                                   'files': [{'path': '.github/workflows/review-gate.yml'}]})
+            return ''
+        with mock.patch.object(fp, '_open_fanout_prs', return_value=[pr]), \
+             mock.patch.object(fp, '_gh', gh):
+            fp._retire_owned_pin_prs(fp.Consumer('maxi-tools/x'), token='t')
+        self.assertEqual([c[1] for c in calls], ['view', 'close'])
 
 
 if __name__ == "__main__":
