@@ -1,0 +1,18 @@
+.github/dependabot.yml
+  h_cebe5b6d461c32 1-30
+.github/scripts/check_workflow_refs.py
+  h_cebe5b6d461c32 1-151
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 1-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2e423ab3481ec7c319bc28f8f865fe7dce0c74d0",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

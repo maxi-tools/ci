@@ -1,0 +1,14 @@
+.github/workflows/lane-check.yml
+  h_cebe5b6d461c32 316-351,354-356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "841b6965b1570af74c796c1ce9673b8c6015129c",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
