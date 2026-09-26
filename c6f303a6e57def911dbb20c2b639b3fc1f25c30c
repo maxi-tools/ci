@@ -1,0 +1,16 @@
+.github/workflows/lane-release-verify.yml
+  h_cebe5b6d461c32 47
+.github/workflows/lane-sign-publish.yml
+  h_cebe5b6d461c32 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c6f303a6e57def911dbb20c2b639b3fc1f25c30c",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

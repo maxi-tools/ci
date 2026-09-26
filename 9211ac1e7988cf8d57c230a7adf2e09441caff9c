@@ -1,0 +1,14 @@
+.github/actions/pr-review-gate/pr_review_gate.py
+  h_cebe5b6d461c32 66,71-88,368
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9211ac1e7988cf8d57c230a7adf2e09441caff9c",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

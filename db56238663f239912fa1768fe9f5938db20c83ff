@@ -1,0 +1,16 @@
+.github/actions/dedupe-pr-review-threads/dedupe_review_threads.py
+  h_cebe5b6d461c32 564
+tests/test_dedupe_review_threads.py
+  h_cebe5b6d461c32 561
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "db56238663f239912fa1768fe9f5938db20c83ff",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
