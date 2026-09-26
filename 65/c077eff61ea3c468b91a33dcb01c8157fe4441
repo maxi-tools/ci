@@ -1,0 +1,14 @@
+docs/contracts/first-party-pin-scheme.md
+  h_cebe5b6d461c32 102,104-111,161-162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "65c077eff61ea3c468b91a33dcb01c8157fe4441",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
