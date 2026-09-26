@@ -192,12 +192,16 @@ class OneBranchPerConsumer(unittest.TestCase):
             return ""
 
         pushes = []
+        merges = []
         with mock.patch.object(fp, "_gh", gh), \
              mock.patch.object(fp, "_push_pin_branch",
-                               lambda c, **kw: pushes.append(kw["head_ref"])):
+                               lambda c, **kw: pushes.append(kw["head_ref"])), \
+             mock.patch.object(fp, "_enable_automerge",
+                               lambda c, url, **kw: merges.append(url)):
             outcome, url = fp._open_pr(
                 consumer=fp.Consumer("maxi-tools/x"), workflow_file="review-gate-reusable",
                 old_ref=OLD, new_ref=TIP, tip_sha=TIP, token="t", dry_run=False)
+        self.assertEqual(merges, [url])
         return outcome, url, calls, pushes
 
     def test_no_open_pr_creates_one_on_the_stable_branch(self):
@@ -240,6 +244,43 @@ class OneBranchPerConsumer(unittest.TestCase):
                             workflow_file="review-gate-reusable", old_ref=OLD,
                             new_ref=TIP, tip_sha=TIP, token="t", dry_run=True),
                 ("dry-run", None))
+
+
+class ProtectedAutomerge(unittest.TestCase):
+    def test_effective_required_checks_enable_merge_commit(self):
+        calls = []
+        def gh(args, *, token):
+            calls.append(args)
+            if args[1] == 'repos/maxi-tools/x':
+                return json.dumps('main')
+            if '/rules/branches/' in args[1]:
+                return json.dumps([{'type': 'required_status_checks',
+                                    'parameters': {'required_status_checks': [{'context': 'build'}]}}])
+            if '/protection/' in args[1]:
+                raise RuntimeError('HTTP 404')
+            return ''
+        with mock.patch.object(fp, '_gh', gh):
+            fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'https://github.com/maxi-tools/x/pull/9', token='t')
+        self.assertEqual(calls[-1], ['pr', 'merge', 'https://github.com/maxi-tools/x/pull/9',
+                                     '--repo', 'maxi-tools/x', '--auto', '--merge'])
+
+    def test_empty_rules_do_not_merge(self):
+        calls = []
+        def gh(args, *, token):
+            calls.append(args)
+            if args[1] == 'repos/maxi-tools/x':
+                return json.dumps('main')
+            if '/protection/' in args[1]:
+                raise RuntimeError('HTTP 404')
+            return '[]'
+        with mock.patch.object(fp, '_gh', gh):
+            fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'url', token='t')
+        self.assertFalse(any(c[:2] == ['pr', 'merge'] for c in calls))
+
+    def test_unreadable_rules_fail_closed(self):
+        with mock.patch.object(fp, '_gh', side_effect=['"main"', RuntimeError('HTTP 403')]):
+            with self.assertRaises(RuntimeError):
+                fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'url', token='t')
 
 
 if __name__ == "__main__":

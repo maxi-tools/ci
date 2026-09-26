@@ -25,10 +25,8 @@ Override per-invocation with `--consumer-repo` (repeatable) or
 
 What this script does NOT do:
 
-* It does not auto-merge the consumer's PR. The fan-out PR is the
-  human-in-the-loop review surface. See
-  docs/contracts/first-party-pin-scheme.md for why auto-merging a
-  fleet-wide pin is the wrong shape.
+* It enables merge-commit auto-merge only when effective branch policy
+  requires checks. An unprotected consumer remains for manual acceptance.
 * It does not retry on a closed PR. A consumer that closes the
   fan-out PR with `pin: skip` is recorded in `OPT_OUTS` (constant
   below) and skipped on subsequent runs.
@@ -224,6 +222,37 @@ def _run(
 
 def _gh(args: list[str], *, token: str) -> str:
     return _run(['gh', *args], env={'GH_TOKEN': token})
+
+
+def _required_checks(consumer: Consumer, *, token: str) -> set[str]:
+    '''Fail closed on unreadable rules; include classic protection if present.'''
+    repo = consumer.name
+    branch = json.loads(_gh(['api', f'repos/{repo}', '--jq', '.default_branch | @json'], token=token))
+    rules = json.loads(_gh(['api', f'repos/{repo}/rules/branches/{branch}'], token=token))
+    if not isinstance(rules, list):
+        raise RuntimeError(f'{repo}: effective rules are not a list')
+    contexts = {
+        check['context'] for rule in rules if rule['type'] == 'required_status_checks'
+        for check in rule['parameters']['required_status_checks']
+    }
+    try:
+        classic = json.loads(_gh(
+            ['api', f'repos/{repo}/branches/{branch}/protection/required_status_checks'],
+            token=token))
+    except RuntimeError as exc:
+        if 'HTTP 404' not in str(exc):
+            raise
+    else:
+        contexts.update(classic['contexts'])
+        contexts.update(check['context'] for check in classic.get('checks', []))
+    return contexts
+
+
+def _enable_automerge(consumer: Consumer, url: str, *, token: str) -> None:
+    if not _required_checks(consumer, token=token):
+        print(f'{consumer}: no required checks; auto-merge withheld', file=sys.stderr)
+        return
+    _gh(['pr', 'merge', url, '--repo', consumer.name, '--auto', '--merge'], token=token)
 
 
 def _fetch_consumer_pin(consumer: Consumer, *, token: str) -> dict[str, str]:
@@ -424,6 +453,7 @@ def _open_pr(
             ],
             token=token,
         )
+    _enable_automerge(consumer, url, token=token)
     return (outcome, url)
 
 
