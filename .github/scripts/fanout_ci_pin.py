@@ -334,21 +334,48 @@ def _open_fanout_prs(consumer: Consumer, *, token: str) -> list[dict]:
             if head == HEAD_REF or LEGACY_HEAD_RE.match(head)]
 
 
+def _retire_pin_pr(consumer: Consumer, pr: dict, *, token: str,
+                   reason: str, expected_path: str | None = None) -> None:
+    '''Never close or delete a pin branch with human history or extra files.'''
+    number = str(pr['number'])
+    detail = json.loads(_gh(
+        ['pr', 'view', number, '--repo', consumer.name,
+         '--json', 'author,headRefName,files'], token=token))
+    commits = [json.loads(line) for line in _gh(
+        ['api', '--paginate', '-X', 'GET',
+         f'repos/{consumer.name}/pulls/{number}/commits',
+         '-f', 'per_page=100',
+         '--jq', '.[] | {author: .commit.author, committer: .commit.committer} | @json'],
+        token=token).splitlines()]
+    problems = []
+    if detail['author']['login'] != 'app/maxi-tools-auth':
+        problems.append('PR author is not the bot')
+    if detail['headRefName'] != pr['headRefName']:
+        problems.append('head branch changed')
+    paths = [f['path'] for f in detail['files']]
+    if len(paths) != 1 or (expected_path is not None and paths != [expected_path]):
+        problems.append('PR does not change exactly the expected single file' if expected_path
+                        else 'PR does not change exactly one file')
+    bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
+    if not commits or any(any(commit[role].get(key) != value for key, value in bot.items())
+                          for commit in commits for role in ('author', 'committer')):
+        problems.append('not every commit is bot-authored and bot-committed')
+    if problems:
+        _gh(['pr', 'comment', number, '--repo', consumer.name, '--body',
+             'Leaving this pin PR and its branch open: ' + '; '.join(problems) + '.'], token=token)
+        return
+    _gh(['pr', 'close', number, '--repo', consumer.name,
+         '--delete-branch', '--comment', reason], token=token)
+
+
 def _retire_owned_pin_prs(consumer: Consumer, *, token: str) -> None:
-    '''Close only our single-file pin proposals; sync now owns the advance.'''
+    '''Close only bot-owned single-file pin proposals; sync owns the advance.'''
     for pr in _open_fanout_prs(consumer, token=token):
-        detail = json.loads(_gh(
-            ['pr', 'view', str(pr['number']), '--repo', consumer.name,
-             '--json', 'author,headRefName,files'], token=token))
-        if (detail['author']['login'] != 'app/maxi-tools-auth' or
-                detail['headRefName'] != pr['headRefName'] or
-                [f['path'] for f in detail['files']] != ['.github/workflows/review-gate.yml']):
-            raise RuntimeError(f'{consumer}#{pr["number"]}: unexpected author or files; not closing')
-        _gh(['pr', 'close', str(pr['number']), '--repo', consumer.name,
-             '--delete-branch', '--comment',
-             'Superseded by the maxi-config-owned review-gate.yml sync. '
-             'The ci pin now advances in maxi-config/maxi-review/review-gate.yml '
-             'and reaches this repo through its sync PR.'], token=token)
+        _retire_pin_pr(
+            consumer, pr, token=token, expected_path='.github/workflows/review-gate.yml',
+            reason='Superseded by the maxi-config-owned review-gate.yml sync. '
+                   'The ci pin now advances in maxi-config/maxi-review/review-gate.yml '
+                   'and reaches this repo through its sync PR.')
 
 
 def _push_pin_branch(
@@ -469,17 +496,10 @@ def _open_pr(
         outcome = 'opened'
 
     for p in legacy:
-        _gh(
-            [
-                'pr', 'close', str(p['number']),
-                '--repo', consumer.name,
-                '--delete-branch',
-                '--comment',
-                f'Superseded by {url}: the fan-out now keeps one branch per '
-                f'consumer (`{HEAD_REF}`) and moves it forward on each tip.',
-            ],
-            token=token,
-        )
+        _retire_pin_pr(
+            consumer, p, token=token,
+            reason=f'Superseded by {url}: the fan-out now keeps one branch per '
+                   f'consumer (`{HEAD_REF}`) and moves it forward on each tip.')
     _enable_automerge(consumer, url, token=token)
     return (outcome, url)
 
