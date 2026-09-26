@@ -448,10 +448,9 @@ def _open_pr(
     if ours:
         _gh(
             [
-                'pr', 'edit', str(ours['number']),
-                '--repo', consumer.name,
-                '--title', title,
-                '--body', body,
+                'api', '--method', 'PATCH',
+                f'repos/{consumer.name}/pulls/{ours["number"]}',
+                '-f', f'title={title}', '-f', f'body={body}',
             ],
             token=token,
         )

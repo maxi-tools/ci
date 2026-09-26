@@ -220,9 +220,9 @@ class OneBranchPerConsumer(unittest.TestCase):
         self.assertEqual((outcome, url), ("reused", ours["url"]))
         self.assertEqual(pushes, [fp.HEAD_REF], "the branch is force-pushed to the new tip")
         self.assertFalse(any(c[:2] == ["pr", "create"] for c in calls), "no second PR")
-        edit = next(c for c in calls if c[:2] == ["pr", "edit"])
-        self.assertEqual(edit[2], "4")
-        self.assertIn(f"ci: advance pin to {TIP[:12]} (review-gate-reusable)", edit)
+        edit = next(c for c in calls if c[:3] == ["api", "--method", "PATCH"])
+        self.assertEqual(edit[3], "repos/maxi-tools/x/pulls/4")
+        self.assertIn(f"title=ci: advance pin to {TIP[:12]} (review-gate-reusable)", edit)
 
     def test_legacy_per_sha_prs_are_closed_as_superseded(self):
         legacy = {"number": 2, "url": "https://github.com/maxi-tools/x/pull/2",
