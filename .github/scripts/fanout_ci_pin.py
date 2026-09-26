@@ -225,27 +225,23 @@ def _gh(args: list[str], *, token: str) -> str:
 
 
 def _required_checks(consumer: Consumer, *, token: str) -> set[str]:
-    '''Fail closed on unreadable rules; include classic protection if present.'''
+    '''Fail closed on unreadable rules; decide from effective rules only.
+
+    The /rules/branches endpoint returns the EFFECTIVE rules (rulesets and
+    classic protection) and needs only metadata read. The classic protection
+    endpoint needs administration:read, which the fanout-ci-pin token lacks,
+    so it 403s and would fail closed fleet-wide. A required_status_checks
+    rule with a non-empty list means "requires checks".
+    '''
     repo = consumer.name
     branch = json.loads(_gh(['api', f'repos/{repo}', '--jq', '.default_branch | @json'], token=token))
     rules = json.loads(_gh(['api', f'repos/{repo}/rules/branches/{branch}'], token=token))
     if not isinstance(rules, list):
         raise RuntimeError(f'{repo}: effective rules are not a list')
-    contexts = {
+    return {
         check['context'] for rule in rules if rule['type'] == 'required_status_checks'
         for check in rule['parameters']['required_status_checks']
     }
-    try:
-        classic = json.loads(_gh(
-            ['api', f'repos/{repo}/branches/{branch}/protection/required_status_checks'],
-            token=token))
-    except RuntimeError as exc:
-        if 'HTTP 404' not in str(exc):
-            raise
-    else:
-        contexts.update(classic['contexts'])
-        contexts.update(check['context'] for check in classic.get('checks', []))
-    return contexts
 
 
 def _enable_automerge(consumer: Consumer, url: str, *, token: str) -> None:

@@ -266,8 +266,6 @@ class ProtectedAutomerge(unittest.TestCase):
             if '/rules/branches/' in args[1]:
                 return json.dumps([{'type': 'required_status_checks',
                                     'parameters': {'required_status_checks': [{'context': 'build'}]}}])
-            if '/protection/' in args[1]:
-                raise RuntimeError('HTTP 404')
             return ''
         with mock.patch.object(fp, '_gh', gh):
             fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'https://github.com/maxi-tools/x/pull/9', token='t')
@@ -280,8 +278,6 @@ class ProtectedAutomerge(unittest.TestCase):
             calls.append(args)
             if args[1] == 'repos/maxi-tools/x':
                 return json.dumps('main')
-            if '/protection/' in args[1]:
-                raise RuntimeError('HTTP 404')
             return '[]'
         with mock.patch.object(fp, '_gh', gh):
             fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'url', token='t')
