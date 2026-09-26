@@ -110,9 +110,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # A warning, not a failure. This job's only product is a signal that
+          # the downstream jobs may ignore, and a missing `gh` is an unreadable
+          # listing, which the contract above says evaluates rather than skips.
+          # Exiting non-zero here would skip `invalidate`, `dedupe` and `gate`
+          # through `needs:` and take the verdict off the board for a run that
+          # was entitled to write it -- the exact outcome the fail-open branch
+          # in the next step exists to prevent. (codacy, on the PR that added
+          # this.)
           if ! command -v gh >/dev/null 2>&1; then
-            echo "::error::gh is absent on ${RUNNER_NAME:-this runner}; this lane cannot tell whether a newer run exists"
-            exit 1
+            echo "::warning::gh is absent on ${RUNNER_NAME:-this runner}; this lane cannot tell whether a newer run exists, so it will evaluate"
           fi
 
       - name: Is a newer run of this lane already evaluating this head?
@@ -134,11 +141,25 @@ jobs:
           # reusable workflow cannot elevate, and there is a fan-out window
           # where a consumer has not granted it yet. An unreadable listing is
           # not evidence of a newer run, so the honest reading is "evaluate".
-          workflow_file="${GITHUB_WORKFLOW_REF%%@*}"
-          workflow_file="${workflow_file##*/}"
+          # The workflow is named by ID, not by the filename in GITHUB_WORKFLOW_REF.
+          #
+          # That variable names the workflow file of the run, and inside a
+          # reusable workflow the run's file is the CALLEE -- review-gate-
+          # reusable.yml, which lives in maxi-tools/ci and does not exist in the
+          # caller's repository. A listing built from it 404s on every consumer,
+          # and a 404 here is indistinguishable from "the caller has not granted
+          # actions: read", so the fail-open branch below would fire on every
+          # run and the skip would never happen. The run's own record carries
+          # the workflow id of the CALLER's workflow, which is what the listing
+          # has to be made against. (maxi-reviewer, on the PR that added this.)
+          workflow_id=""
+          if ! workflow_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.workflow_id' 2>/dev/null)" || [ -z "$workflow_id" ]; then
+            echo "::warning::could not read the workflow id for run $GITHUB_RUN_ID (the caller needs actions: read); evaluating rather than skipping"
+            exit 0
+          fi
           runs=""
           if ! runs="$(gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=$EVENT_NAME&per_page=100" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?head_sha=$HEAD_SHA&event=$EVENT_NAME&per_page=100" \
             --jq '.workflow_runs[] | "\(.run_started_at) \(.id)"' 2>/dev/null)"; then
             echo "::warning::could not list review-gate runs for $HEAD_SHA (the caller needs actions: read); evaluating rather than skipping"
             exit 0
