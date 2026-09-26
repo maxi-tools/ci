@@ -177,7 +177,9 @@ jobs:
           [ -n "$runs" ] || exit 0
           freshest="$(printf '%s\n' "$runs" | sort -k1,1 -k2,2n | tail -n 1 | awk '{ print $2 }')"
           if [ -n "$freshest" ] && [ "$freshest" != "$GITHUB_RUN_ID" ]; then
-            echo "run $freshest started later than $GITHUB_RUN_ID for $EVENT_NAME on $HEAD_SHA; this run is superseded and will be skipped"
+            note="superseded by run $freshest; run $GITHUB_RUN_ID for $EVENT_NAME on $HEAD_SHA will be skipped"
+            echo "$note"
+            echo "$note" >> "$GITHUB_STEP_SUMMARY"
             echo "superseded=true" >> "$GITHUB_OUTPUT"
           fi
 
