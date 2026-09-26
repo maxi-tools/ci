@@ -21,6 +21,14 @@ on:
         required: false
         type: boolean
         default: false
+      repo_policy:
+        # Forwarded for parity with lane-check.yml: the test lane has no
+        # house-style-only step to skip, but consumers still set
+        # `repo_policy: fork-upstream` on the wrapper and the value travels
+        # here unchanged so the contract test can verify the threading.
+        required: false
+        type: string
+        default: standard-rust
 
       scope:
         description: >-
@@ -217,7 +225,11 @@ jobs:
         # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
         # the success condition -- moved into the action unchanged, along with
         # why that action is referenced by its full owner/repo path.
-        uses: maxi-tools/maxi-config/.github/actions/fetch-policy@main
+        # Public consumers cannot resolve maxi-tools/maxi-config (it is
+        # private). This copy must name maxi-tools/ci, which owns the same
+        # action. A mirror from maxi-config that copies the private path
+        # makes every public fork's lane fail at job setup.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@main
         with:
           policy-files: |
             scripts/select-rust-toolchain.sh

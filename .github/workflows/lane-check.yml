@@ -25,6 +25,15 @@ on:
         required: false
         type: boolean
         default: false
+      repo_policy:
+        # Consumer repository policy profile. `standard-rust` (the default) runs
+        # every step; `fork-upstream` skips the house-style-only checks
+        # (`Check formatting`, `Lint workspace`) because the bulk of the tree
+        # is upstream code we don't own and rebase onto. See
+        # docs/contracts/fork-lane-policy.md in maxi-config.
+        required: false
+        type: string
+        default: standard-rust
 
       scope:
         description: >-
@@ -265,7 +274,11 @@ jobs:
         # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
         # the success condition -- moved into the action unchanged, along with
         # why that action is referenced by its full owner/repo path.
-        uses: maxi-tools/maxi-config/.github/actions/fetch-policy@main
+        # Public consumers cannot resolve maxi-tools/maxi-config (it is
+        # private). This copy must name maxi-tools/ci, which owns the same
+        # action. A mirror from maxi-config that copies the private path
+        # makes every public fork's lane fail at job setup.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@main
         with:
           policy-files: |
             scripts/select-rust-toolchain.sh
@@ -349,11 +362,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check formatting
-        if: steps.workspace.outputs.has_workspace == 'true'
+        # House-style check. Forks of upstream projects skip it when
+        # repo_policy is fork-upstream; a repo with no Cargo.toml skips it
+        # via the workspace gate. Both must hold. Skipped, not deleted.
+        if: ${{ steps.workspace.outputs.has_workspace == 'true' && inputs.repo_policy != 'fork-upstream' }}
         run: cargo fmt --all -- --check
 
       - name: Lint workspace
-        if: steps.workspace.outputs.has_workspace == 'true'
+        # Same conjunction as Check formatting.
+        if: ${{ steps.workspace.outputs.has_workspace == 'true' && inputs.repo_policy != 'fork-upstream' }}
         shell: bash
         run: |
           set -euo pipefail

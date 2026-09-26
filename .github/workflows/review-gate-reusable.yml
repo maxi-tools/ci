@@ -56,6 +56,131 @@ on:
 permissions: {}
 
 jobs:
+  # The preemptive half of the collapse. The caller's wrapper holds one
+  # concurrency lane per (PR, event) with `cancel-in-progress: false`, so a
+  # review burst queues runs behind the in-flight one instead of cancelling
+  # them. That serialisation covers the head of the burst; this job covers the
+  # OVERFLOW, and it covers it for free.
+  #
+  # A run that reaches a runner spends a slot on a self-hosted pool that is
+  # already exhausted (the org's hosted allowance is gone, so every job here
+  # competes for the same boxes). A run that is SKIPPED by its `if:` never
+  # reaches a runner at all -- GitHub evaluates the condition before
+  # allocation, and a skipped job's check-run concludes SKIPPED, which reads
+  # as a grey pass-equivalent rather than the red CANCELLED the fleet merge
+  # tool refuses. So the question this job exists to answer is "has a newer
+  # run of this lane already started for this head SHA?", and the answer is
+  # cheap: it is the same listing the two publishers below already make, and
+  # it costs nothing when the answer is "no" either, because a skipped job
+  # skips its steps.
+  #
+  # WHEN THE LOOKUP CANNOT BE MADE the job does NOT skip. The listing needs
+  # `actions: read` on the CALLER, and a reusable workflow cannot elevate the
+  # caller's token; during a fan-out there is a window where a consumer has
+  # not granted it yet. An unreadable answer is not evidence that a newer run
+  # exists, so the honest reading is "evaluate", and that is what the `if:`
+  # below does: a failed lookup leaves the output unset, the comparison is
+  # false, and the downstream jobs run exactly as they did before this job
+  # existed. Losing the skip is a far smaller fault than skipping a run that
+  # was entitled to write the verdict.
+  #
+  # KEYED ON THE EVENT, not just the head SHA. The lane split exists because a
+  # comment burst must not be able to take the `pull_request` run off the board
+  # (maxi-ml #2235/#2259/#2263/#2264). A freshness check that ignored the event
+  # would reintroduce exactly that: the comment run that started a second later
+  # would make the code run look stale and skip it. The listing filters on
+  # `event`, so a run is only stale against a NEWER run of its own lane.
+  #
+  # ORDERED BY run_started_at, WITH THE RUN ID AS A TIE-BREAK, for the same
+  # reason the publishers below are: GitHub keeps the run id across a re-run
+  # and increments the attempt, so an operator who resolves the last thread and
+  # re-runs an older run is producing the NEWEST evaluation under an OLDER id.
+  # Comparing ids alone made that re-run a no-op. run_started_at resets on
+  # re-run; the id only breaks ties.
+  supersede-check:
+    name: 'per-run: superseded by a newer run of this lane?'
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      superseded: ${{ steps.freshness.outputs.superseded }}
+    # Same-repo only, like every other self-hosted job in this file. A fork
+    # PR's run reaches this job otherwise, and the fork guard
+    # (tests/test_self_hosted_fork_guard.py) rejects a self-hosted lane that a
+    # fork can reach. Skipping here is safe in a way it is not for the jobs
+    # below: a skipped dependency skips its dependents, and a fork PR that
+    # skips the whole gate publishes nothing, which leaves the verdicts
+    # pending and blocks rather than permits. The downstream jobs' own
+    # same-repo checks stay, because each of them can also be reached through
+    # a path this one does not cover.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Check gh is on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A warning, not a failure. This job's only product is a signal that
+          # the downstream jobs may ignore, and a missing `gh` is an unreadable
+          # listing, which the contract above says evaluates rather than skips.
+          # Exiting non-zero here would skip `invalidate`, `dedupe` and `gate`
+          # through `needs:` and take the verdict off the board for a run that
+          # was entitled to write it -- the exact outcome the fail-open branch
+          # in the next step exists to prevent. (codacy, on the PR that added
+          # this.)
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::warning::gh is absent on ${RUNNER_NAME:-this runner}; this lane cannot tell whether a newer run exists, so it will evaluate"
+          fi
+
+      - name: Is a newer run of this lane already evaluating this head?
+        id: freshness
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          echo "superseded=false" >> "$GITHUB_OUTPUT"
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "::warning::no pull request head sha in the payload; evaluating rather than skipping"
+            exit 0
+          fi
+          # FAILS OPEN, deliberately, and for the same reason the publishers
+          # below do: the listing needs `actions: read` on the CALLER, which a
+          # reusable workflow cannot elevate, and there is a fan-out window
+          # where a consumer has not granted it yet. An unreadable listing is
+          # not evidence of a newer run, so the honest reading is "evaluate".
+          # The workflow is named by ID, not by the filename in GITHUB_WORKFLOW_REF.
+          #
+          # That variable names the workflow file of the run, and inside a
+          # reusable workflow the run's file is the CALLEE -- review-gate-
+          # reusable.yml, which lives in maxi-tools/ci and does not exist in the
+          # caller's repository. A listing built from it 404s on every consumer,
+          # and a 404 here is indistinguishable from "the caller has not granted
+          # actions: read", so the fail-open branch below would fire on every
+          # run and the skip would never happen. The run's own record carries
+          # the workflow id of the CALLER's workflow, which is what the listing
+          # has to be made against. (maxi-reviewer, on the PR that added this.)
+          workflow_id=""
+          if ! workflow_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.workflow_id' 2>/dev/null)" || [ -z "$workflow_id" ]; then
+            echo "::warning::could not read the workflow id for run $GITHUB_RUN_ID (the caller needs actions: read); evaluating rather than skipping"
+            exit 0
+          fi
+          runs=""
+          if ! runs="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?head_sha=$HEAD_SHA&event=$EVENT_NAME&per_page=100" \
+            --jq '.workflow_runs[] | "\(.run_started_at) \(.id)"' 2>/dev/null)"; then
+            echo "::warning::could not list review-gate runs for $HEAD_SHA (the caller needs actions: read); evaluating rather than skipping"
+            exit 0
+          fi
+          [ -n "$runs" ] || exit 0
+          freshest="$(printf '%s\n' "$runs" | sort -k1,1 -k2,2n | tail -n 1 | awk '{ print $2 }')"
+          if [ -n "$freshest" ] && [ "$freshest" != "$GITHUB_RUN_ID" ]; then
+            echo "run $freshest started later than $GITHUB_RUN_ID for $EVENT_NAME on $HEAD_SHA; this run is superseded and will be skipped"
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # Both contexts are invalidated HERE, in one job that runs before either leg,
   # rather than by each leg for itself. A leg that has not started cannot mark
   # its own context pending, and on a saturated pool one leg routinely starts
@@ -68,7 +193,22 @@ jobs:
   invalidate:
     # `per-run:` for the same reason as the gate legs below: this job's check
     # run is one run's row, and a PR routinely shows several of them.
+    #
+    # SKIPPED, not cancelled, when a newer run of this lane is already
+    # evaluating the same head. `needs:` makes the skip transitive: a skipped
+    # dependency skips its dependents unless they opt out, and none of the
+    # three jobs below opt out of a skipped `supersede-check`. The `if:` is
+    # what makes the skip a decision rather than an accident -- a
+    # `supersede-check` that FAILED (gh absent, listing refused) must not take
+    # the verdict off the board, so this only fires on the explicit
+    # "superseded" output and not on a missing one. A skipped job needs no
+    # runner and concludes SKIPPED, which is the whole point: the fleet merge
+    # tool scores a cancelled check-run as "not passed" and a skipped one as a
+    # grey pass-equivalent, and a review burst used to leave a dozen of the
+    # former on every bot-reviewed PR.
     name: 'per-run: invalidate previous verdicts'
+    needs: supersede-check
+    if: needs.supersede-check.outputs.superseded != 'true'
     runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 5
     permissions:
@@ -207,8 +347,21 @@ jobs:
   dedupe:
     name: 'per-run: dedupe bot review threads'
     runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
-    needs: invalidate
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    needs: [supersede-check, invalidate]
+    # Both halves are load-bearing and they fail differently, which is why
+    # neither is implied by the other:
+    #
+    #   superseded   a skipped `supersede-check` skips this job through
+    #                `needs:` alone, but a SUCCEEDED one does not, and that is
+    #                the case this exists for. Without the comparison a
+    #                superseded run would still dedupe -- spending a runner and
+    #                posting replies on a PR whose verdict a newer run is about
+    #                to write.
+    #   fork         a fork PR's token is read-only, so the dedupe (which needs
+    #                `pull-requests: write`) cannot run there. Skipping rather
+    #                than failing is what lets `gate` still run: its `if:` opts
+    #                out of a skipped `dedupe` and not of a failed one.
+    if: needs.supersede-check.outputs.superseded != 'true' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     permissions:
       actions: read
@@ -251,7 +404,7 @@ jobs:
           pr: ${{ github.event.pull_request.number }}
 
   gate:
-    needs: [invalidate, dedupe]
+    needs: [supersede-check, invalidate, dedupe]
     # RUNS EVEN IF `dedupe` DID NOT.
     #
     # A `needs:` dependency that is skipped or failed skips the dependent job
@@ -268,6 +421,16 @@ jobs:
     # reaches a real verdict is strictly better than one that skips because
     # the placeholder could not be written.
     #
+    # A SUPERSEDED run skips this job too, and unlike the two cases above that
+    # is decided by the OUTPUT rather than by the dependency's conclusion. A
+    # skipped `supersede-check` would already skip this job through `needs:`,
+    # but the interesting case is a succeeded one: the freshness job ran, found
+    # a newer run of this lane, and said so. Running the gate anyway would
+    # spend a runner to compute a verdict the staleness guards below would then
+    # refuse to publish -- the same work, twice, with the second copy
+    # guaranteed to throw its answer away. Skipping keeps the runner for the
+    # run that is actually going to write the statuses.
+    #
     # A `dedupe` FAILURE, on the other hand, skips this job. That is the
     # correct direction: since the dedupe composite was rewritten to fail
     # the step on mechanism unavailability (no more `continue-on-error`),
@@ -280,8 +443,9 @@ jobs:
     # outcome.
     #
     # This job's verdict is the only thing in this file that decides anything.
-    # Nothing upstream of it may be able to take it off the board.
-    if: ${{ !cancelled() }}
+    # Nothing upstream of it may be able to take it off the board -- except a
+    # newer run of the same lane, which is entitled to.
+    if: ${{ !cancelled() && needs.supersede-check.outputs.superseded != 'true' }}
     # The check name IS the spec.
     #
     # "review gate" told a reader nothing, so both humans and review bots read

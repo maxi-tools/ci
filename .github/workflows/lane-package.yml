@@ -173,12 +173,37 @@ jobs:
           git submodule foreach --recursive 'git config --local --unset-all http.https://github.com/.extraheader || :'
           git config --local --unset-all http.https://github.com/.extraheader || :
 
-      - name: Install Rust toolchain
+      # should_run is true on main and on release refs even when the change
+      # has no packaging impact (rust-ci.yml). check and test already no-op
+      # when the root manifest is absent; this lane did not, so a non-Rust
+      # consumer push died at `cargo fetch` with "could not find Cargo.toml"
+      # (maxi-nix main, 2026-09-26). Same absence gate as lane-check.yml: a
+      # Rust repo whose fetch fails still runs and still reports red. Detect
+      # only when should_run, because that is the only time this lane checks
+      # the tree out -- a skipped checkout must not be inspected.
+      - name: Detect Rust workspace
+        id: workspace
         if: ${{ inputs.should_run }}
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml at repo root; skipping Rust lanes (non-Rust repository)."
+            {
+              echo "## lane-package summary"
+              echo "- Lane: lane-package"
+              echo "- Workspace: absent (no root Cargo.toml); Rust steps skipped"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install Rust toolchain
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
 
       - name: Fetch maxi-config rust-lane policy
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         # One implementation, in .github/actions/fetch-policy. This block
         # existed in four near-identical copies until #462, which is how #460
         # fixed a live bug in a file nothing runs. Its reasoning -- the
@@ -192,26 +217,26 @@ jobs:
             scripts/emit-runner-paths.sh
           token: ${{ steps.app-token.outputs.token }}
       - name: Expose installed macOS native build tools
-        if: ${{ inputs.should_run && runner.os == 'macOS' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && runner.os == 'macOS' }}
         shell: bash
         run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
       - name: Verify installed Rust toolchain before cache restore
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
       - name: Cache Rust dependencies
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           prefix-key: v1-rust-no-bin
           cache-bin: false
 
       - name: Verify installed Rust toolchain after cache restore
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
       - name: Configure git for private deps
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -236,7 +261,7 @@ jobs:
           # connection parks `git remote-https` at 0% CPU indefinitely.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked
@@ -257,12 +282,12 @@ jobs:
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig-empty" >> "$GITHUB_ENV"
 
       - name: Build release artifacts
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         run: cargo build --workspace --release
 
       - name: Build release artifact identity
         id: artifact-key
-        if: ${{ inputs.should_run }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -302,7 +327,7 @@ jobs:
         # The lane still BUILDS on pull requests; that is the PR-time packaging
         # verification and it is unchanged. This only stops publishing a tree
         # nobody fetches.
-        if: ${{ inputs.should_run && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact-key.outputs.name }}
@@ -319,10 +344,14 @@ jobs:
         run: |
           {
             echo "## lane-package summary"
-            echo "- package-bundle lane ran"
-            if [ "$GITHUB_REF" = "refs/heads/main" ] || case "$GITHUB_REF" in refs/heads/release/*) true;; *) false;; esac; then
-              echo "- Uploaded artifact: ${ARTIFACT_NAME}"
+            if [ -z "${ARTIFACT_NAME:-}" ]; then
+              echo "- Workspace: absent (no root Cargo.toml); Rust package steps skipped"
             else
-              echo "- Built ${ARTIFACT_NAME}; upload skipped (no consumer off main/release)"
+              echo "- package-bundle lane ran"
+              if [ "$GITHUB_REF" = "refs/heads/main" ] || case "$GITHUB_REF" in refs/heads/release/*) true;; *) false;; esac; then
+                echo "- Uploaded artifact: ${ARTIFACT_NAME}"
+              else
+                echo "- Built ${ARTIFACT_NAME}; upload skipped (no consumer off main/release)"
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
