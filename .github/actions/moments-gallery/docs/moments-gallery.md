@@ -122,13 +122,12 @@ everything else.
 | `manifest` | yes | Path to the moments manifest, relative to `root`. |
 | `root` | yes | Directory the manifest is read from and the moment PNG paths are resolved against. The gallery output is written under `<root>/<name>-gallery/`. |
 | `name` | yes | Gallery name. Used as the lane label in the HTML header and as the artifact name suffix. |
-| `summary_thumbnails` | no (default `3`) | How many scenarios' first frame to embed as a base64 thumbnail in the job summary. |
+| `summary_thumbnails` | no (default `3`) | How many scenarios' first frame to embed as a base64 thumbnail in the job summary (capped at 1 MiB per step). |
+| `pages` | no (default `false`) | Boolean: stage under `gallery/<name>/latest/` and run Pages upload/deploy when true. The caller grants `pages: write` and `id-token: write` only for jobs opting in. |
 
-Pages deploys are deliberately *not* inside this action. The caller
-composes a separate `actions/upload-pages-artifact` + `actions/deploy-pages`
-step in their workflow, the same way callers of `pr-review-gate` compose
-`actions/checkout` themselves. That keeps Pages policy in the caller and
-this action usable without `pages: write`.
+Outputs: `pages` reflects the requested boolean, `lane` is the gallery name,
+and `latest_deployment` is the deployed `gallery/<lane>/latest/` URL (empty
+when Pages is disabled). The action does not request permissions itself.
 
 ## Example manifest
 
@@ -239,21 +238,39 @@ the address to link from a later step.
 
 ## Upgrade path from each existing gallery
 
-The deliverable collapses three previously-separate gallery
-implementations into one:
+The implementation reuses *concepts*, not source code: the maxi-e2e Rust
+`GalleryGenerator`/`src/gallery.rs` presents test results as HTML; the Python
+`scripts/gallery_generator.py` groups voice artifacts, timing, screenshots and
+audio; `tools/glass-gallery` supplies the capture/visual-review workflow.
+This action's manifest, renderer, PNG downscaler, Pages staging and tests are
+new Python/HTML code; none of those three generators or simulator drivers was
+copied or imported. The Rust `src/gallery.rs` is currently a back-compat
+re-export of `maxi-e2e-gallery`, not the actual renderer. Its report-generation
+role and the voice Python HTML report are redundant *for migrated callers*;
+the glass simulator capture driver is not redundant because it makes the PNGs.
+
+In maxi-ui, `maxi-ui-gallery/src/lib.rs` is the canonical WaterUI view tree
+and proof contract, not a generic HTML gallery. `tools/waterui_gallery_snapshot.sh`
+produces snapshots/receipts, while `tools/waterui_gallery_trace_artifacts.py`
+exports interaction traces; verification helpers under `tools/waterui_gallery_*`
+validate those outputs. We reused the idea of a versioned proof manifest and
+PNG artifacts, not their source or schema. The view tree, snapshot capture,
+trace exporter and verifiers remain necessary, not redundant copies. A later
+adapter could turn their PNGs into moments without replacing the WaterUI
+renderer-test contract.
 
 | Existing | Where it lives | What replaces it |
 | --- | --- | --- |
 | `GalleryGenerator` HTML (cross-platform test report) | `maxi-tools/maxi-e2e/src/gallery.rs`, `adapters/maxi-e2e-gallery/src/generator.rs` | This action emits the gallery HTML; the Rust generator is now redundant for any caller that can write a manifest. Mark the Rust generator for retirement once the Rust consumers that need a Rust-built gallery have adopted the action. |
 | `review_gallery.html` template (scenario/media report) | `maxi-tools/maxi-e2e/adapters/maxi-e2e-gallery/src/review_gallery.rs` | Same replacement. Marked for retirement. |
-| `glass-gallery` per-page HTML | `maxi-tools/maxi-e2e/tools/glass-gallery/` | Same replacement. Marked for retirement. |
+| `glass-gallery` simulator capture/review harness | `maxi-tools/maxi-e2e/tools/glass-gallery/` | Not replaced as a capture driver; its PNG output can feed this action through a manifest. Any separate HTML report after capture is redundant only after that caller migrates. |
 | `waterui-gallery` workflow artifacts | `maxi-tools/maxi-ui/.github/workflows/waterui-gallery.yml` (the workflow that calls `tools/waterui_gallery_snapshot.sh`) | **Not replaced.** The WaterUI gallery's manifest is `maxi-ui.waterui-gallery.v1`, which is a renderer-test contract (capture receipts, expected sections), not a moments timeline. Adopting the action here would force a schema downgrade on a different concern. A follow-up PR can add a *second* workflow in `maxi-ui` that calls this action against the WaterUI gallery's PNGs -- the manifest is trivially writable in Python from the existing layout, because each page becomes one scenario and each is a single moment. |
 
 In every replacement the existing tool continues to work until the
 caller migrates; this is a *new* shared lane, not a deprecation of
-any other tool today. A separate PR may mark the Rust generator and
-`glass-gallery` for retirement once the consumers that need them have
-moved across.
+any other tool today. The Rust/Python HTML reports can be retired only
+once their consumers migrate; the simulator capture and WaterUI verification
+tools still produce/validate evidence independently of this viewer.
 
 ## Self-test
 

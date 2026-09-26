@@ -412,21 +412,11 @@ def _render_scenario(scenario: dict[str, Any]) -> str:
             f"<audio controls preload=\"metadata\" src=\"{_html_escape(scenario['_out_audio'])}\"></audio>"
         )
     facts_blocks = "\n".join(
-        f"<section class=\"facts-pane\" data-index=\"{index}\" hidden>"
+        f"<section class=\"facts-pane\" data-index=\"{index}\"{' hidden' if index else ''}>"
         f"<h4>{_html_escape(moment.get('label') or f'moment {index}')}</h4>"
         f"{_format_facts(moment.get('facts'))}</section>"
         for index, moment in enumerate(scenario["moments"])
     )
-    # The first frame's facts pane is shown by default; the JS toggles
-    # `hidden` when a different frame is selected.
-    first_facts_unhide = ""
-    if scenario["moments"]:
-        first_facts_unhide = (
-            f"<script>document.currentScript && "
-            f"(document.currentScript.previousElementSibling || "
-            f"document.currentScript.parentElement).querySelector("
-            f"'.facts-pane[data-index=\"0\"]').removeAttribute('hidden');</script>"
-        )
     chips_joined = "".join(chips_html)
     if not chips_joined:
         chips_joined = '<span class="empty">no claims recorded</span>'
@@ -441,7 +431,7 @@ def _render_scenario(scenario: dict[str, Any]) -> str:
         f"<div class=\"viewer\"><img class=\"viewer-img\" "
         f"src=\"{_html_escape(scenario['moments'][0]['_out_image'])}\" "
         f"alt=\"\" /></div>"
-        f"<div class=\"facts-wrap\">{facts_blocks}{first_facts_unhide}</div>"
+        f"<div class=\"facts-wrap\">{facts_blocks}</div>"
         f"</div>"
         f"<footer class=\"scenario-footer\">"
         f"<div class=\"chips\">{chips_joined}</div>"
@@ -596,6 +586,13 @@ def _render_html(manifest: dict[str, Any], scenarios: list[dict[str, Any]]) -> s
   const data = JSON.parse(document.getElementById("moments-data").textContent);
   const scenarios = data.scenarios || [];
 
+  let activeScenario = null;
+  let activeIndex = 0;
+  let returnFocus = null;
+  const enlarged = document.getElementById("enlarged");
+  const enlargedImg = document.getElementById("enlarged-img");
+  const closeButton = document.getElementById("enlarged-close");
+
   scenarios.forEach(function (scenario) {{
     const root = document.querySelector(
       '.scenario[data-scenario="' + scenario.id + '"]'
@@ -625,14 +622,13 @@ def _render_html(manifest: dict[str, Any], scenarios: list[dict[str, Any]]) -> s
     frames.forEach(function (frame, index) {{
       frame.addEventListener("click", function () {{
         select(index);
-      }});
-      frame.addEventListener("dblclick", function () {{
         enlarge(scenario.id, index);
       }});
     }});
     select(0);
 
     root.addEventListener("keydown", function (event) {{
+      if (document.body.classList.contains("enlarged")) return;
       const current = root._selectedIndex || 0;
       if (event.key === "ArrowRight") {{
         event.preventDefault();
@@ -650,49 +646,44 @@ def _render_html(manifest: dict[str, Any], scenarios: list[dict[str, Any]]) -> s
     root.tabIndex = 0;
   }});
 
-  // Enlarged view: a single overlay reused across scenarios, addressed by
-  // (scenario_id, moment_index). Click on a frame, double-click again to
-  // leave.
-  const enlarged = document.getElementById("enlarged");
-  const enlargedImg = document.getElementById("enlarged-img");
-  document.getElementById("enlarged-close").addEventListener("click", function () {{
+  // Overlay navigation keeps explicit state; focus is on the close button.
+  function closeEnlarged() {{
     document.body.classList.remove("enlarged");
-  }});
+    activeScenario = null;
+    if (returnFocus) returnFocus.focus();
+    returnFocus = null;
+  }}
+  closeButton.addEventListener("click", closeEnlarged);
   function enlarge(scenarioId, index) {{
-    const root = document.querySelector(
-      '.scenario[data-scenario="' + scenarioId + '"]'
-    );
-    if (!root) return;
-    const moment = root._selectedIndex !== undefined
-      ? scenarios.find(function (s) {{ return s.id === scenarioId; }}).moments[root._selectedIndex]
-      : null;
-    if (!moment) return;
-    enlargedImg.src = moment._out_image;
+    const scenario = scenarios.find(function (s) {{ return s.id === scenarioId; }});
+    const root = document.querySelector('.scenario[data-scenario="' + scenarioId + '"]');
+    if (!scenario || !root || !scenario.moments[index]) return;
+    if (!document.body.classList.contains("enlarged")) returnFocus = document.activeElement;
+    root._select(index);
+    activeScenario = scenarioId;
+    activeIndex = index;
+    enlargedImg.src = scenario.moments[index]._out_image;
+    enlargedImg.alt = scenario.moments[index].label || "moment " + (index + 1);
     document.body.classList.add("enlarged");
+    closeButton.focus();
   }}
   enlarged.addEventListener("click", function (event) {{
-    if (event.target === enlarged) document.body.classList.remove("enlarged");
+    if (event.target === enlarged) closeEnlarged();
   }});
   document.addEventListener("keydown", function (event) {{
-    if (event.key === "Escape") document.body.classList.remove("enlarged");
     if (!document.body.classList.contains("enlarged")) return;
-    const active = document.activeElement;
-    const root = active && active.closest
-      ? active.closest(".scenario")
-      : null;
-    if (!root) return;
-    const scenarioId = root.getAttribute("data-scenario");
-    const current = root._selectedIndex || 0;
-    if (event.key === "ArrowRight") {{
+    if (event.key === "Escape") {{
       event.preventDefault();
-      const next = Math.min(current + 1, (root.querySelectorAll(".frame").length || 1) - 1);
-      root._select(next);
-      enlarge(scenarioId, next);
-    }} else if (event.key === "ArrowLeft") {{
+      closeEnlarged();
+      return;
+    }}
+    const scenario = scenarios.find(function (s) {{ return s.id === activeScenario; }});
+    if (!scenario) return;
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {{
       event.preventDefault();
-      const prev = Math.max(current - 1, 0);
-      root._select(prev);
-      enlarge(scenarioId, prev);
+      const delta = event.key === "ArrowRight" ? 1 : -1;
+      const next = Math.max(0, Math.min(activeIndex + delta, scenario.moments.length - 1));
+      enlarge(activeScenario, next);
     }}
   }});
 }})();
@@ -735,7 +726,15 @@ def _png_thumbnail(data: bytes, width: int) -> bytes:
             break
     if ihdr is None or not idat:
         raise GalleryError("PNG is missing IHDR or IDAT")
+    if len(ihdr) != 13:
+        raise GalleryError("invalid PNG IHDR")
     src_w, src_h, bit_depth, color_type = struct.unpack(">IIBB", ihdr[:10])
+    if src_w == 0 or src_h == 0:
+        raise GalleryError("invalid PNG IHDR")
+    if ihdr[10:13] != b"\x00\x00\x00":
+        # The scanline decoder below handles non-interlaced rows only.
+        # Adam7 uses seven differently-sized passes, not src_h full rows.
+        raise GalleryError("PNG thumbnail requires standard compression, filter method, and non-interlaced rows")
     if bit_depth != 8 or color_type not in (2, 6):
         # Indexed, greyscale, and 16-bit frames are not what the e2e
         # lanes emit. Refuse rather than guess a decode.
@@ -747,15 +746,45 @@ def _png_thumbnail(data: bytes, width: int) -> bytes:
         return data
     channels = 3 if color_type == 2 else 4
     raw = _zlib.decompress(bytes(idat))
-    stride = 1 + src_w * channels
-    if len(raw) < src_h * stride:
-        raise GalleryError("PNG IDAT is shorter than its IHDR claims")
+    row_bytes = src_w * channels
+    stride = 1 + row_bytes
+    if len(raw) != src_h * stride:
+        raise GalleryError("PNG IDAT size disagrees with its IHDR")
+    # PNG stores filtered differences, not pixel bytes. Each row's Up,
+    # Average and Paeth predictors depend on the *decoded* preceding row.
+    decoded = []
+    previous = bytearray(row_bytes)
+    for sy in range(src_h):
+        offset = sy * stride
+        filter_type = raw[offset]
+        if filter_type > 4:
+            raise GalleryError(f"unsupported PNG scanline filter {filter_type}")
+        row = bytearray(raw[offset + 1 : offset + stride])
+        for i in range(row_bytes):
+            left = row[i - channels] if i >= channels else 0
+            above = previous[i]
+            upper_left = previous[i - channels] if i >= channels else 0
+            if filter_type == 1:
+                predictor = left
+            elif filter_type == 2:
+                predictor = above
+            elif filter_type == 3:
+                predictor = (left + above) // 2
+            elif filter_type == 4:
+                p = left + above - upper_left
+                distances = (abs(p - left), abs(p - above), abs(p - upper_left))
+                predictor = (left, above, upper_left)[distances.index(min(distances))]
+            else:
+                predictor = 0
+            row[i] = (row[i] + predictor) & 255
+        decoded.append(row)
+        previous = row
     dst_w = width
     dst_h = max(1, round(src_h * dst_w / src_w))
     out = bytearray()
     for y in range(dst_h):
         sy = min(src_h - 1, y * src_h // dst_h)
-        row = raw[sy * stride + 1 : (sy + 1) * stride]
+        row = decoded[sy]
         out.append(0)
         for x in range(dst_w):
             sx = min(src_w - 1, x * src_w // dst_w)
