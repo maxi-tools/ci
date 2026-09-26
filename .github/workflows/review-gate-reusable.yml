@@ -105,6 +105,16 @@ jobs:
       actions: read
     outputs:
       superseded: ${{ steps.freshness.outputs.superseded }}
+    # Same-repo only, like every other self-hosted job in this file. A fork
+    # PR's run reaches this job otherwise, and the fork guard
+    # (tests/test_self_hosted_fork_guard.py) rejects a self-hosted lane that a
+    # fork can reach. Skipping here is safe in a way it is not for the jobs
+    # below: a skipped dependency skips its dependents, and a fork PR that
+    # skips the whole gate publishes nothing, which leaves the verdicts
+    # pending and blocks rather than permits. The downstream jobs' own
+    # same-repo checks stay, because each of them can also be reached through
+    # a path this one does not cover.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Check gh is on PATH
         shell: bash
