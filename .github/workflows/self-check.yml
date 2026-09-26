@@ -108,6 +108,10 @@ jobs:
         # would have caught --json returning before execution.
         run: |
           set -euo pipefail
+          # workspace-guard parses YAML; hosted Python does not guarantee PyYAML.
+          python3 -m venv "$RUNNER_TEMP/moments-python"
+          . "$RUNNER_TEMP/moments-python/bin/activate"
+          python3 -m pip install PyYAML==6.0.3
           failed=0
           for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_workspace_guard.py tests/test_moments_gallery.py tests/test_moments_png_filters.py; do
             echo "== $t"
