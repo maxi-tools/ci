@@ -21,6 +21,14 @@ on:
         required: false
         type: boolean
         default: false
+      repo_policy:
+        # Forwarded for parity with lane-check.yml: the test lane has no
+        # house-style-only step to skip, but consumers still set
+        # `repo_policy: fork-upstream` on the wrapper and the value travels
+        # here unchanged so the contract test can verify the threading.
+        required: false
+        type: string
+        default: standard-rust
 
       scope:
         description: >-

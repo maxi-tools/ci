@@ -239,6 +239,10 @@ jobs:
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
       allow_unwrap_used: ${{ inputs.allow_unwrap_used == true }}
+      # Forwarded unchanged. lane-check reads it to skip house-style steps
+      # when the consumer set repo_policy: fork-upstream. A literal here
+      # would strip that choice.
+      repo_policy: ${{ inputs.repo_policy }}
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
@@ -266,6 +270,8 @@ jobs:
       advisory: ${{ github.event_name == 'pull_request' && vars.CI_ENFORCEMENT_MODE != 'strict' }}
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
+      # Forwarded for parity with lane-check. lane-test does not gate on it.
+      repo_policy: ${{ inputs.repo_policy }}
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
