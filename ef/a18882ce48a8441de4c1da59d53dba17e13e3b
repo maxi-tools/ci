@@ -1,0 +1,22 @@
+.github/actions/moments-gallery/docs/moments-gallery.md
+  h_cebe5b6d461c32 125-126,128-130,241-260,266,271-273
+.github/actions/moments-gallery/moments_gallery.py
+  h_cebe5b6d461c32 415,434,589-595,631,649-650,652-656,658-666,668,671,675,677-682,684-686,729-730,732-737,749-781,787
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 112,121,127-134
+tests/test_moments_gallery_browser.js
+  h_cebe5b6d461c32 1-66
+tests/test_moments_png_filters.py
+  h_cebe5b6d461c32 1-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "efa18882ce48a8441de4c1da59d53dba17e13e3b",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
