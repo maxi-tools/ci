@@ -280,6 +280,7 @@ jobs:
       runs_on: ${{ needs.plan.outputs.runs_on }}
       should_run: ${{ needs.plan.outputs.packaging_impact == 'true' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
       skip_reason: no packaging impact on an ordinary PR
+      checkout_submodules: ${{ inputs.checkout_submodules == true }}
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}

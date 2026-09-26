@@ -15,6 +15,18 @@ on:
         required: false
         type: string
         default: lane skipped/deferred by workflow policy
+      checkout_submodules:
+        description: >-
+          Recursively initialize Git submodules before Cargo runs. The same
+          input lane-check and lane-test already honour; without it here a
+          caller that opts in (maxi-libs passes it because esp-sr-rs,
+          esp-dsp-rs and libopus-rs build scripts read headers out of git
+          submodules) still packages against an empty submodule tree and
+          `cargo build --release` dies in the build script (maxi-libs main
+          run 36145394613: `esp_wn_iface.h file not found`).
+        required: false
+        type: boolean
+        default: false
     outputs:
       artifact_name:
         description: Cargo release artifact uploaded by the package lane.
@@ -65,12 +77,6 @@ jobs:
             echo "## lane-package summary"
             echo "- lane skipped/deferred: ${{ inputs.skip_reason }}"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
-        timeout-minutes: 10
-        if: ${{ inputs.should_run }}
-        with:
-          persist-credentials: false
 
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
       # feature) declare them in ci/apt-packages.txt — one package per line,
@@ -141,6 +147,31 @@ jobs:
           # The reasoning, the incident and the scope tables are recorded
           # privately in maxi-config.
           permission-contents: read
+
+      # Checkout comes after the token mint on purpose: the submodules are
+      # public today, so an unauthenticated fetch would reach them, but the
+      # app token is passed the same way lane-check's private-dep rewrite
+      # uses it, so a private submodule authenticates instead of failing the
+      # lane. Passing `token` makes the action persist credentials, which is
+      # exactly what `persist-credentials: false` exists to prevent, so the
+      # token is handed to git for the fetch and the credentials are scrubbed
+      # immediately after -- the same scrub lane-check does before it hands
+      # the tree to anything that runs code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        timeout-minutes: 10
+        if: ${{ inputs.should_run }}
+        with:
+          persist-credentials: false
+          submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
+          token: ${{ inputs.checkout_submodules && steps.app-token.outputs.token || '' }}
+
+      - name: Scrub checkout credentials
+        if: ${{ inputs.should_run && inputs.checkout_submodules }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule foreach --recursive 'git config --local --unset-all http.https://github.com/.extraheader || :'
+          git config --local --unset-all http.https://github.com/.extraheader || :
 
       - name: Install Rust toolchain
         if: ${{ inputs.should_run }}
