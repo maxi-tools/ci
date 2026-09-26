@@ -186,8 +186,9 @@ class OneBranchPerConsumer(unittest.TestCase):
 
         def gh(args, *, token):
             calls.append(args)
-            if args[:2] == ["pr", "list"]:
-                return json.dumps(open_prs)
+            if args[:2] == ["api", "--paginate"]:
+                return "\n".join(json.dumps([p["number"], p["url"], p["headRefName"]])
+                                 for p in open_prs)
             if args[:2] == ["pr", "create"]:
                 return "https://github.com/maxi-tools/x/pull/9\n"
             return ""

@@ -322,17 +322,16 @@ def _open_fanout_prs(consumer: Consumer, *, token: str) -> list[dict]:
     '''Every open PR on `consumer` whose head is a fan-out branch of ours.'''
     out = _gh(
         [
-            'pr', 'list',
-            '--repo', consumer.name,
-            '--state', 'open',
-            '--limit', '100',
-            '--json', 'number,url,headRefName',
+            'api', '--paginate', '-X', 'GET', f'repos/{consumer.name}/pulls',
+            '-f', 'state=open', '-f', 'per_page=100',
+            '--jq', '.[] | [.number, .html_url, .head.ref] | @json',
         ],
         token=token,
     ).strip()
-    prs = json.loads(out) if out else []
-    return [p for p in prs
-            if p['headRefName'] == HEAD_REF or LEGACY_HEAD_RE.match(p['headRefName'])]
+    prs = [json.loads(line) for line in out.splitlines()]
+    return [{'number': n, 'url': url, 'headRefName': head}
+            for n, url, head in prs
+            if head == HEAD_REF or LEGACY_HEAD_RE.match(head)]
 
 
 def _retire_owned_pin_prs(consumer: Consumer, *, token: str) -> None:
