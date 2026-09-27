@@ -1,0 +1,16 @@
+.github/actions/collect-pr-review-state/action.yml
+  h_cebe5b6d461c32 144-149,163-164,171
+tests/test_collect_roster_statuses.py
+  h_cebe5b6d461c32 1-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6f3dab5ea9899bfc12b95e163719db1380b1a2c0",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
