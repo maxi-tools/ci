@@ -1,0 +1,16 @@
+.github/actions/pr-review-gate/pr_review_gate.py
+  h_cebe5b6d461c32 271
+tests/test_roster_label_login.py
+  h_cebe5b6d461c32 90-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c2d0e7455b8a1ac55dd35d1665935352db73cf50",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
