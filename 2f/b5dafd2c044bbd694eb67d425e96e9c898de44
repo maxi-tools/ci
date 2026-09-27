@@ -1,0 +1,16 @@
+.github/workflows/lane-sign-publish.yml
+  h_dce6f7715ff1f5 29
+.github/workflows/rust-ci.yml
+  h_dce6f7715ff1f5 299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2fb5dafd2c044bbd694eb67d425e96e9c898de44",
+  "prompts": {},
+  "humans": {
+    "h_dce6f7715ff1f5": {
+      "author": "Maxi Boch <maxiboch@users.noreply.github.com>"
+    }
+  }
+}
