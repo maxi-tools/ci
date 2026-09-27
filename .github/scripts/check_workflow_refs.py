@@ -99,14 +99,26 @@ def main():
                     # Materialised by a checkout step in this same workflow.
                     deferred.append(f'{rel}: {ref} (created at runtime)')
                     continue
-                if not (ROOT / inner).is_file():
-                    problems.append(
-                        f'{rel}: `uses: {ref}` does not resolve, and no '
-                        f'checkout step in this workflow creates '
-                        f'{root_dir!r}. Consumers execute this call inside '
-                        f'THIS repository at the sha they pinned, so a '
-                        f'missing target breaks all of them at once and '
-                        f'nothing here reports it.')
+                # `uses: ./.github/actions/<name>` resolves to
+                # .github/actions/<name>/action.yml at runtime -- GitHub's
+                # composite-action convention. A bare file reference (a
+                # .yml directly under the path) is also accepted, matching
+                # `uses: ./.github/workflows/lane-x.yml`. Either form being
+                # resolvable here is what makes the check mean anything:
+                # the call site fails on every consumer at job-setup time
+                # otherwise, with no local signal.
+                target = ROOT / inner
+                if target.is_file():
+                    continue
+                if target.is_dir() and (target / 'action.yml').is_file():
+                    continue
+                problems.append(
+                    f'{rel}: `uses: {ref}` does not resolve, and no '
+                    f'checkout step in this workflow creates '
+                    f'{root_dir!r}. Consumers execute this call inside '
+                    f'THIS repository at the sha they pinned, so a '
+                    f'missing target breaks all of them at once and '
+                    f'nothing here reports it.')
                 continue
 
             if '@' not in ref:

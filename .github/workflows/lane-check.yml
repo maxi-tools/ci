@@ -192,44 +192,12 @@ jobs:
           fi
 
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
-      # feature) declare them in ci/apt-packages.txt — one package per line,
-      # '#' comments allowed. Absent file means no extra packages.
+      # feature) declare them in ci/apt-packages.txt. The actual install
+      # lives in the shared ./.github/actions/install-apt-packages composite
+      # so all three lanes stay in sync; see maxi-tools/maxi-config#174.
       - name: Install repo-declared system packages
         if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          list="ci/apt-packages.txt"
-          [ -f "$list" ] || exit 0
-          packages="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$list" | xargs)"
-          [ -n "$packages" ] || exit 0
-
-          # Not every self-hosted Linux runner is Debian-family with a sudoer
-          # build user. Some run a declaratively-configured distribution with
-          # neither apt-get nor sudo, taking system libraries from the machine's
-          # own configuration instead — so hard-coding `sudo apt-get` failed
-          # every lane at provisioning with `sudo: command not found`, seconds
-          # in, before compiling anything.
-          if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::notice::No apt-get on this runner; expecting its image to provide: $packages"
-            exit 0
-          fi
-
-          # Root needs no sudo, and a non-root user without it cannot install.
-          # Saying so beats failing the lane over packages the image may
-          # already have.
-          elevate=()
-          if [ "$(id -u)" -ne 0 ]; then
-            if ! command -v sudo >/dev/null 2>&1; then
-              echo "::warning::Cannot install system packages (not root, no sudo); expecting this runner's image to provide: $packages"
-              exit 0
-            fi
-            elevate=(sudo)
-          fi
-
-          "${elevate[@]}" apt-get update
-          # shellcheck disable=SC2086
-          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
+        uses: ./.github/actions/install-apt-packages
 
       - name: Generate org repo token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
