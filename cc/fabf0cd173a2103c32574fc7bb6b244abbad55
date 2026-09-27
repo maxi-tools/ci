@@ -1,0 +1,21 @@
+.github/workflows/lane-check.yml
+  h_cebe5b6d461c32 263-273
+.github/scripts/check_workflow_refs.py
+  h_cebe5b6d461c32 14-18,103,105
+  h_cebe5b6d461c32 104
+.github/workflows/lane-test.yml
+  h_cebe5b6d461c32 214-224
+.github/actions/verify-sibling-checkouts/action.yml
+  h_cebe5b6d461c32 1-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ccfabf0cd173a2103c32574fc7bb6b244abbad55",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
