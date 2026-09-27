@@ -133,6 +133,22 @@ runs:
             ws = doc.get("workspace")
             if isinstance(ws, dict):
                 paths.extend(harvest_dep_table(ws.get("dependencies")))
+            # Target-specific dependency tables. `[target.'cfg(...)'.dependencies]`
+            # is parsed as doc["target"][<triple-quoted key>]["dependencies"],
+            # so walk the target map and harvest every {dependencies, dev-
+            # dependencies, build-dependencies} table under it. These are
+            # the tables Cargo consults when the matching cfg is active --
+            # e.g. Apple lanes resolve `[target.'cfg(target_os = "macos")'.
+            # dependencies]`, so missing or stale siblings there would
+            # otherwise surface as cargo-time errors on the lane the issue
+            # documents.
+            target = doc.get("target")
+            if isinstance(target, dict):
+                for t in target.values():
+                    if not isinstance(t, dict):
+                        continue
+                    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                        paths.extend(harvest_dep_table(t.get(key)))
             # `[patch.<registry>]` may live at doc["patch"] (single
             # registry block) or under doc["workspace"]["patch"] (the
             # workspace-wide patch). Either way it's a registry map.
@@ -251,6 +267,18 @@ runs:
           # with the runner's SSH key (broader scope than this job's app
           # token) instead of with GH_TOKEN. The explicit URL keeps
           # authentication scoped to the token this step received.
+          # Cleanup-on-failure: a clone that fails midway leaves $dest
+          # with the authenticated remote URL written into a half-
+          # initialised $dest/.git, and a hard set -e exit short-circuits
+          # the post-clone `rm -rf $dest/.git` below. Without this the
+          # runner would carry the token URL until the next job wiped the
+          # path itself. Set AFTER `rm -rf $dest` so a successful path
+          # doesn't trigger the trap on the just-cloned tree; cleared
+          # explicitly once the safe state is reached.
+          cleanup_dest() {
+            rm -rf "$dest"
+          }
+          trap 'cleanup_dest' EXIT
           if ! gh repo clone "https://github.com/${org}/${name}.git" "$dest" -- --depth=1 --quiet; then
             echo "::endgroup::"
             echo "::error::required sibling path dependency '../${name}' " \
@@ -270,5 +298,9 @@ runs:
           # leak or where a future job can be misled into thinking this
           # sibling is an in-tree workspace member.
           rm -rf "$dest/.git"
+          # Past this point the trap would only destroy verified work, so
+          # disarm it. A later failure in the loop (unrelated to this
+          # clone) still leaves dest behind for inspection.
+          trap - EXIT
           echo "verified fresh checkout: ../${name}"
         done
