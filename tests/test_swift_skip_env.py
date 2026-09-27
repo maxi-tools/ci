@@ -8,6 +8,7 @@ unset. lane-check, lane-test, and lane-package must share that mapping.
 
 Run directly: `python3 tests/test_swift_skip_env.py`.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -49,9 +50,7 @@ def named_step(doc: dict, name: str) -> dict:
             if step.get("name") == name:
                 matches.append(step)
     if len(matches) != 1:
-        raise AssertionError(
-            f"expected 1 step named {name!r}, got {len(matches)}"
-        )
+        raise AssertionError(f"expected 1 step named {name!r}, got {len(matches)}")
     return matches[0]
 
 
@@ -99,11 +98,9 @@ class SwiftSkipEnvMapping(unittest.TestCase):
                 self.assertNotIn("=''", run)
 
     def test_rust_ci_forwards_skip_swift_build_to_package(self):
-        text = (ROOT / ".github/workflows/rust-ci.yml").read_text(
-            encoding="utf-8"
-        )
+        text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
         package = re.search(
-            r"^  package:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:|\Z)",
+            r"^ {2}package:\n(?P<body>(?:(?!^ {2}[A-Za-z0-9_-]+:).)*)",
             text,
             re.MULTILINE | re.DOTALL,
         )
