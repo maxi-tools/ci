@@ -1,0 +1,14 @@
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 111-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "98506af83b97a4223d27bf36fe0d998ed08939e9",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

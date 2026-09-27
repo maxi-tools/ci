@@ -1,0 +1,26 @@
+.github/workflows/lane-check.yml
+  h_cebe5b6d461c32 28-36,277-281,365-368,372-373
+.github/workflows/lane-package.yml
+  h_cebe5b6d461c32 176-185,187-202,206,220,224,228,235,239,264,285,290,330,347-348,350-355
+.github/workflows/lane-test.yml
+  h_cebe5b6d461c32 24-31,228-232
+.github/workflows/review-gate-reusable.yml
+  h_cebe5b6d461c32 59-183,196-208,210-211,350-364,407,424-433,446-448
+.github/workflows/rust-ci.yml
+  h_cebe5b6d461c32 242-245,273-274
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 112,121
+tests/test_workspace_guard.py
+  h_cebe5b6d461c32 1-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "06b76e84d65abebe71257605d64887fdb8af2fbc",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

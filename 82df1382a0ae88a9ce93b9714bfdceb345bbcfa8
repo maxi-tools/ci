@@ -1,0 +1,14 @@
+.github/workflows/review-gate-reusable.yml
+  h_cebe5b6d461c32 180-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "82df1382a0ae88a9ce93b9714bfdceb345bbcfa8",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

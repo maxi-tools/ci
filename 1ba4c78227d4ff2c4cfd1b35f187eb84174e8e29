@@ -1,0 +1,14 @@
+.github/workflows/lane-package.yml
+  h_cebe5b6d461c32 151-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1ba4c78227d4ff2c4cfd1b35f187eb84174e8e29",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}

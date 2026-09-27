@@ -1,0 +1,16 @@
+.github/workflows/review-gate-reusable.yml
+  h_cebe5b6d461c32 474-478,493-496,508,551-553,556,611
+tests/test_review_gate_rollup.py
+  h_cebe5b6d461c32 1-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "db352acd87e0d42f6f058228078953d401c93579",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
