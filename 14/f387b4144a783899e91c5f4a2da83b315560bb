@@ -1,0 +1,14 @@
+.github/actions/verify-sibling-checkouts/action.yml
+  h_cebe5b6d461c32 136-151,270-281,301-304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "14f387b4144a783899e91c5f4a2da83b315560bb",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
