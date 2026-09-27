@@ -47,15 +47,30 @@ runs:
     # read-only under $RUNNER_TEMP for a container, this clones directly to
     # the path cargo itself will resolve).
     #
-    # Only the dependency tables are walked. `[package.metadata.<tool>]`
-    # blocks legitimately carry their own `path` keys, and treating those
-    # as Cargo path dependencies would clone (and on a persistent runner
-    # delete) directories Cargo never reads.
+    # Only Cargo's recognised dependency tables are walked:
+    #   [dependencies], [dev-dependencies], [build-dependencies],
+    #   [workspace.dependencies], [patch.<registry>], and the deprecated
+    #   [replace] block. Anything else -- e.g. [package.metadata.<tool>]
+    #   with its own `path` keys -- is intentionally ignored; treating
+    # those as Cargo path dependencies would `rm -rf` directories Cargo
+    # never reads.
     - name: Discover sibling path dependencies
       id: discover
       shell: bash
       run: |
         set -euo pipefail
+        # Discover uses stdlib `tomllib`, which is Python 3.11+. The
+        # org's macOS runners ship python@3.14 and the GitHub-hosted Linux
+        # images ship 3.13; both are fine. A self-hosted NixOS box that
+        # exposes an older `python3` would fail with a bare ImportError at
+        # the top of the embedded script; surface a clear, attributable
+        # error here instead of letting the traceback reach the runner
+        # log, and the lane-plan tool check already gates boxes that have
+        # no `python3` on PATH at all.
+        if ! python3 -c 'import sys, tomllib; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+          echo "::error::verify-sibling-checkouts requires python3 >= 3.11 (tomllib); the runner's python3 is too old. Lane-plan already gates the absence of python3; this gate covers the version."
+          exit 1
+        fi
         discover="$RUNNER_TEMP/sibling-discover.py"
         cat > "$discover" <<'PY'
         import os, pathlib, sys, tomllib
@@ -65,19 +80,38 @@ runs:
             ".git", "target", ".worktrees", ".maxi-worktrees",
             "node_modules", "vendor",
         }
-        # Tables whose `path = "..."` values are Cargo path dependencies.
-        # Other tables (e.g. `[package.metadata.<tool>]`) legitimately carry
-        # `path` keys for unrelated tooling; collecting those here would
-        # clone (and `rm -rf`) directories Cargo never resolves.
-        dep_keys = {
-            "dependencies", "dev-dependencies", "build-dependencies",
-            "workspace.dependencies",
-        }
-        # `[patch.crates-io]`, `[patch.<registry>]`, and `[[patch.<url>]]`
-        # blocks also carry `path =` entries that resolve as cargo path
-        # dependencies. Walked separately because their value layout is a
-        # table of crates, not a table of deps-with-keys-of-their-own.
-        patch_keys = {"patch"}
+
+        def harvest_dep_table(table):
+            """[dependencies] / [dev-dependencies] / [build-dependencies]
+            / [workspace.dependencies] -- a name -> dep-spec table. Each
+            spec is either a string (version) or a table that may carry
+            `path`. Skip string specs."""
+            if not isinstance(table, dict):
+                return
+            for v in table.values():
+                if isinstance(v, dict) and isinstance(v.get("path"), str):
+                    yield v["path"]
+
+        def harvest_patch_table(table):
+            """[patch.<registry>] -- registry name -> crate-name -> spec."""
+            if not isinstance(table, dict):
+                return
+            for reg in table.values():
+                if not isinstance(reg, dict):
+                    continue
+                for v in reg.values():
+                    if isinstance(v, dict) and isinstance(v.get("path"), str):
+                        yield v["path"]
+
+        def harvest_replace_table(table):
+            """[replace] -- crate-name -> spec (single map, not registry-
+            scoped). Same shape as a dependency spec."""
+            if not isinstance(table, dict):
+                return
+            for v in table.values():
+                if isinstance(v, dict) and isinstance(v.get("path"), str):
+                    yield v["path"]
+
         siblings = {}
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
@@ -90,50 +124,33 @@ runs:
                 print(f"::error::cannot read {manifest}: {exc}", file=sys.stderr)
                 sys.exit(1)
             paths = []
-
-            def walk_deps(node):
-                if isinstance(node, dict):
-                    for value in node.values():
-                        walk_deps(value)
-                elif isinstance(node, list):
-                    for value in node:
-                        walk_deps(value)
-
-            def harvest_dep(node):
-                # A dependency table looks like { name = { version = ..., path = ... } }.
-                # Some entries are `name = "version"` (string) rather than a table.
-                if not isinstance(node, dict):
-                    return
-                for v in node.values():
-                    if isinstance(v, dict) and isinstance(v.get("path"), str):
-                        paths.append(v["path"])
-
-            def harvest_patch(node):
-                # A `[patch]` block is { "<registry>" = { name = { path = ... } } }.
-                # The registry key may itself contain a `.` (e.g. `crates-io`).
-                if not isinstance(node, dict):
-                    return
-                for reg in node.values():
-                    if not isinstance(reg, dict):
-                        continue
-                    for v in reg.values():
-                        if isinstance(v, dict) and isinstance(v.get("path"), str):
-                            paths.append(v["path"])
-
-            def walk(node, keys, harvest):
-                if isinstance(node, dict):
-                    for k, v in node.items():
-                        if k in keys:
-                            harvest(v)
-                        walk(v, keys, harvest)
-                elif isinstance(node, list):
-                    for v in node:
-                        walk(v, keys, harvest)
-
-            walk(doc, dep_keys, harvest_dep)
-            walk(doc, patch_keys, harvest_patch)
+            # Top-level dependency tables. tomllib parses nested tables as
+            # nested dicts, so `[workspace]` and `[workspace.dependencies]`
+            # both appear under doc["workspace"]; harvest_dep_table is
+            # called on both shapes directly.
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                paths.extend(harvest_dep_table(doc.get(key)))
+            ws = doc.get("workspace")
+            if isinstance(ws, dict):
+                paths.extend(harvest_dep_table(ws.get("dependencies")))
+            # `[patch.<registry>]` may live at doc["patch"] (single
+            # registry block) or under doc["workspace"]["patch"] (the
+            # workspace-wide patch). Either way it's a registry map.
+            for patch_root in (doc.get("patch"), (ws or {}).get("patch")):
+                paths.extend(harvest_patch_table(patch_root))
+            # Deprecated `[replace]` -- Cargo still honours it on 1.95.
+            paths.extend(harvest_replace_table(doc.get("replace")))
             for raw in paths:
-                if not raw.startswith(".."):
+                # `os.path.normpath` first, then re-check for `..` in the
+                # segment. A `path = "./../foo/crate"` declaration would
+                # be skipped by a raw `startswith("..")` check even though
+                # it normpath()s to `../foo/crate`; without normalisation
+                # the lane retains both original failure modes (missing
+                # manifest, false-positive green against a stale sibling).
+                if not os.path.normpath(raw).split(os.sep)[0].startswith(".."):
+                    # Pure intra-tree path, e.g. `path = "crates/foo"` or
+                    # `path = "./crates/foo"`. Cargo resolves it under
+                    # this checkout and the lane already handles it.
                     continue
                 # Lexical normalisation. `Path.resolve()` follows symlinks
                 # on disk, which means a leftover sibling at ../waterui
@@ -245,9 +262,13 @@ runs:
             exit 1
           fi
           echo "::endgroup::"
-          # The clone URL carried the token; drop it before anything later
-          # in the job (including the repo's own build scripts) can read it
-          # back out of a directory this job made writable.
-          rm -f "$dest/.git/config"
+          # The clone URL carried the token. Drop the whole .git directory
+          # (not just .git/config): the clone wrote the authenticated URL
+          # into config, the resolved HEAD ref into HEAD, a wire ref into
+          # refs/, and so on, and `cargo` itself only needs the working
+          # tree. Anything left behind is a place where the token can
+          # leak or where a future job can be misled into thinking this
+          # sibling is an in-tree workspace member.
+          rm -rf "$dest/.git"
           echo "verified fresh checkout: ../${name}"
         done

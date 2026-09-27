@@ -205,6 +205,30 @@ jobs:
         if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
 
+      # Fails fast, with an attributable error, when a Cargo `path =
+      # "../<repo>"` dependency does not resolve to a real checkout beside
+      # this one -- and equally, refuses to let such a checkout survive from
+      # an earlier unrelated job on this same self-hosted runner. See the
+      # action for the two failure shapes this closes (maxi-config#286).
+      #
+      # Referenced by its owning repository, not by `./.github/actions/...`.
+      # `uses: ./...` inside a reusable workflow that consumers call via
+      # `uses: maxi-tools/ci/.github/workflows/lane-package.yml@<sha>` would
+      # resolve relative to the CONSUMER's checkout (the actions/checkout
+      # step populated GITHUB_WORKSPACE with the consumer), and consumers
+      # do not vend this action. Same-owner refs are exempted from the
+      # external-pin SHA requirement in check_workflow_refs.py.
+      #
+      # The lane-package lane runs `cargo build --release --workspace`
+      # separately from lane-check/lane-test (a different job, possibly a
+      # different runner), so it must do its own sibling verify rather than
+      # rely on lane-check having already done it.
+      - name: Verify sibling path-dependency checkouts
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
       - name: Fetch maxi-config rust-lane policy
         if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         # One implementation, in .github/actions/fetch-policy. This block
