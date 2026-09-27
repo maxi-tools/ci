@@ -211,6 +211,25 @@ jobs:
           # privately in maxi-config.
           permission-contents: read
 
+      # Fails fast, with an attributable error, when a Cargo `path =
+      # "../<repo>"` dependency does not resolve to a real checkout beside
+      # this one -- and equally, refuses to let such a checkout survive from
+      # an earlier unrelated job on this same self-hosted runner. See the
+      # action for the two failure shapes this closes (maxi-config#286).
+      #
+      # Referenced by its owning repository, not by `./.github/actions/...`.
+      # `uses: ./...` inside a reusable workflow that consumers call via
+      # `uses: maxi-tools/ci/.github/workflows/lane-test.yml@<sha>` would
+      # resolve relative to the CONSUMER's checkout (the actions/checkout
+      # step populated GITHUB_WORKSPACE with the consumer), and consumers
+      # do not vend this action. Same-owner refs are exempted from the
+      # external-pin SHA requirement in check_workflow_refs.py.
+      - name: Verify sibling path-dependency checkouts
+        if: steps.workspace.outputs.has_workspace == 'true'
+        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
       - name: Install Rust toolchain
         if: steps.workspace.outputs.has_workspace == 'true'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
