@@ -1,0 +1,18 @@
+.github/workflows/lane-check.yml
+  h_cebe5b6d461c32 195-197,200
+.github/workflows/lane-package.yml
+  h_cebe5b6d461c32 82-84,87
+.github/workflows/lane-test.yml
+  h_cebe5b6d461c32 146-148,151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "817c0ee2f78b1e51fd55403e68c2171b876cec1b",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
