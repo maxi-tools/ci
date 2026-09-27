@@ -52,13 +52,16 @@ done, and what was kept. Exit 0 always when the PR could be read; non-zero
 when the inputs are unusable.
 
 WHY A SENTINEL. Two attempts on the same PR have to converge -- the second
-one must do nothing. State alone does not pin this: a thread can be left
-"resolved by us" and a third party can re-open it, or the reply can succeed
-while the resolve fails (a network blip in between). The reply carries a
-hidden HTML comment `<!-- maxi-config:dedupe -->`, so a re-run that finds a
-thread with our sentinel in its comment body skips the work -- whether the
-thread is currently resolved or not -- and re-runs only on threads we have
-not touched.
+one must not re-post work the first one already did. State alone does not
+pin this: a thread can be left "resolved by us" and a third party can
+re-open it, or the reply can succeed while the resolve fails (a network
+blip in between). The reply carries a hidden HTML comment
+`<!-- maxi-config:dedupe -->`, so a re-run that finds a thread with our
+sentinel in its comment body knows the REPLY half is done. The thread's
+resolved state is the other half: sentinel + unresolved is a previous
+run whose resolve mutation failed, so the re-run retries the resolve
+without re-posting the reply; sentinel + resolved is a fully-settled
+thread and is skipped.
 """
 
 from __future__ import annotations
@@ -491,8 +494,12 @@ def plan(
         path has more than one cluster (each duplicate belongs to a
         SPECIFIC cluster's keeper, not to whichever keeper of that path
         happens to sort first).
-      * already_processed is the list of duplicates our sentinel has
-        already replied to on a previous run.
+      * already_processed is the list of duplicates whose sentinel reply
+        a previous run posted AND whose thread is already resolved --
+        work a previous run completed in full. A duplicate with the
+        sentinel but an UNRESOLVED thread is a previous run whose
+        resolve mutation failed; it goes to to_resolve instead, so the
+        re-run retries the resolve without re-posting the reply.
 
     `fetch_bodies` is an injected dependency: given a list of thread IDs,
     return {thread_id: concatenated_body}. In production it is a closure
@@ -518,7 +525,30 @@ def plan(
         keeper = cluster_[0]
         kept.append(keeper)
         for dup in cluster_[1:]:
-            if _already_processed(bodies.get(dup["id"], "")):
+            if not _already_processed(bodies.get(dup["id"], "")):
+                to_resolve.append((dup, keeper))
+                continue
+            # The sentinel is in the body, so a previous run already
+            # posted the reply. The resolve may still have failed --
+            # reply and resolve are two separate mutations, and the
+            # one that succeeded is not proof of the other. A
+            # duplicate that reached this loop passed cluster()'s
+            # isResolved filter (the cluster input is unresolved
+            # threads only), so this is the recoverable half of the
+            # split-brain: retry the resolve WITHOUT re-posting the
+            # reply. The already_processed branch below is the
+            # settled case -- sentinel present AND thread resolved --
+            # and is kept (rather than left to the filter, which
+            # would have dropped the thread before plan() saw it) so
+            # the report still names what a previous run completed.
+            # cluster() drops isResolved threads defensively: a race
+            # (thread resolved between the two queries) or a hand-
+            # built fixture without the field can still put a
+            # resolved duplicate in front of this loop, and routing
+            # it into to_resolve would resolve an already-resolved
+            # thread -- harmless to GitHub but a wasted mutation and
+            # a misleading `resolved` count on the report.
+            if dup.get("isResolved"):
                 already_processed.append(dup)
             else:
                 to_resolve.append((dup, keeper))
@@ -549,15 +579,24 @@ def reply_and_resolve(
     pr: int,
     thread: dict[str, Any],
     keeper: dict[str, Any],
+    *,
+    already_replied: bool = False,
 ) -> None:
     """Post the duplicate-of reply and resolve the thread.
 
-    Idempotent at the per-thread level: if the reply is already present
-    (sentinel in the body), we still try the resolve, which is itself
+    Idempotent at the per-thread level. With `already_replied=False`
+    (first visit) both mutations run: reply, then resolve. With
+    `already_replied=True` -- set by the apply path when plan() found
+    our sentinel in the thread body but the thread is still unresolved
+    -- ONLY the resolve runs. That is the recovered half of the
+    two-mutation split-brain: a previous run posted the reply and its
+    resolve mutation failed, and re-posting the reply would leave a
+    second duplicate-of comment under the first. The resolve itself is
     idempotent (an already-resolved thread returns success). Two-step
     rather than atomic because GitHub's GraphQL has no single mutation
-    for "reply + resolve", and the failure mode of "reply posted, resolve
-    failed" is recoverable on the next run.
+    for "reply + resolve", and the failure mode of "reply posted,
+    resolve failed" is recoverable on the next run -- which is the
+    path `already_replied=True` exists to take.
     """
     reply_body = _reply_body(keeper, thread)
 
@@ -581,7 +620,8 @@ def reply_and_resolve(
       }
     }
     '''
-    _gh_graphql(reply_query, threadId=thread["id"], body=reply_body)
+    if not already_replied:
+        _gh_graphql(reply_query, threadId=thread["id"], body=reply_body)
 
     resolve_query = """
     mutation($threadId:ID!){
@@ -670,6 +710,24 @@ def main(argv: list[str]) -> int:
     else:
         threads = fetch_threads(args.owner, args.repo, args.pr)
 
+    # Memoised across plan() and the apply loop below. plan() fetches
+    # the candidate bodies once (one batched round-trip), and the apply
+    # loop needs the SAME answer -- which duplicates already carry the
+    # sentinel -- to retry resolve-only without re-posting the reply.
+    # A second fetch would be a second round-trip for data this run
+    # already holds, and a re-fetch mid-run could even race the reply
+    # this run is about to post. Keyed by thread ID; entries are the
+    # concatenated comment bodies as of the start of this run.
+    bodies_cache: dict[str, str] = {}
+
+    def _memoised_fetch(ids: list[str]) -> dict[str, str]:
+        missing = [i for i in ids if i not in bodies_cache]
+        if missing:
+            bodies_cache.update(
+                fetch_thread_bodies(args.owner, args.repo, args.pr, missing)
+            )
+        return {i: bodies_cache[i] for i in ids if i in bodies_cache}
+
     fetch_bodies: Callable[[list[str]], dict[str, str]] | None
     if args.payload is not None:
         # Fixture data: bodies are not in the fixture file (we keep the
@@ -677,22 +735,17 @@ def main(argv: list[str]) -> int:
         # an extra channel. The whole point of the fixture is offline
         # testing of the cluster/plan shape, not the bodies fetch.
         fetch_bodies = None
-    elif args.apply:
-        # Live apply path: bodies are necessary to skip threads we
-        # already replied to, otherwise the apply path re-posts replies
-        # on every re-run.
-        fetch_bodies = lambda ids: fetch_thread_bodies(  # noqa: E731
-            args.owner, args.repo, args.pr, ids
-        )
     else:
-        # Live dry-run path: report distinguishes "needs resolution"
-        # from "already processed" when the bodies fetch is available.
-        # It costs one GraphQL call per run, which is cheap on this
-        # lane and makes the report actually useful for the reviewer
-        # who sees it on the PR page.
-        fetch_bodies = lambda ids: fetch_thread_bodies(  # noqa: E731
-            args.owner, args.repo, args.pr, ids
-        )
+        # Both live paths (apply and dry-run) use the memoised fetch.
+        # The apply path needs bodies to skip threads we already
+        # replied to -- otherwise it re-posts replies on every re-run
+        # -- and, since the resolve-retry fix, to retry resolve-only on
+        # the ones whose reply landed but whose resolve didn't. The
+        # dry-run path reports "needs resolution" vs "already
+        # processed", which costs the same single call and makes the
+        # report actually useful for the reviewer who sees it on the
+        # PR page.
+        fetch_bodies = _memoised_fetch
 
     kept, to_resolve, already_processed = plan(
         threads, bot_logins, fetch_bodies=fetch_bodies, window=args.window
@@ -713,7 +766,21 @@ def main(argv: list[str]) -> int:
         # keeper of that path sorted first, which is the wrong keeper
         # for any later cluster.
         for dup, keeper in to_resolve:
-            reply_and_resolve(args.owner, args.repo, args.pr, dup, keeper)
+            reply_and_resolve(
+                args.owner,
+                args.repo,
+                args.pr,
+                dup,
+                keeper,
+                # Resolve-only retry when a previous run already posted
+                # the reply (sentinel in the body) and only the resolve
+                # failed. `bodies_cache` holds what plan() fetched; it
+                # is None/empty on the --payload offline path, whose
+                # fixtures are unmarked by construction.
+                already_replied=_already_processed(
+                    bodies_cache.get(dup["id"], "")
+                ),
+            )
 
     report = {
         "owner": args.owner,
