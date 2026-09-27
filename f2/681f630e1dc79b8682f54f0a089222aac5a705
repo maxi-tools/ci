@@ -1,0 +1,24 @@
+.github/workflows/lane-check.yml
+  h_cebe5b6d461c32 145-153
+.github/workflows/lane-package.yml
+  h_cebe5b6d461c32 30-34,78-86
+.github/workflows/lane-test.yml
+  h_cebe5b6d461c32 113-121
+.github/workflows/rust-ci.yml
+  h_cebe5b6d461c32 290
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 116,125
+tests/test_swift_skip_env.py
+  h_cebe5b6d461c32 1-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f2681f630e1dc79b8682f54f0a089222aac5a705",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
