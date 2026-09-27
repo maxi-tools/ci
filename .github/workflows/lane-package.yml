@@ -148,22 +148,25 @@ jobs:
           # privately in maxi-config.
           permission-contents: read
 
-      # Checkout comes after the token mint on purpose: the submodules are
-      # public today, so an unauthenticated fetch would reach them, but the
-      # app token is passed the same way lane-check's private-dep rewrite
-      # uses it, so a private submodule authenticates instead of failing the
-      # lane. Passing `token` makes the action persist credentials, which is
-      # exactly what `persist-credentials: false` exists to prevent, so the
-      # token is handed to git for the fetch and the credentials are scrubbed
-      # immediately after -- the same scrub lane-check does before it hands
-      # the tree to anything that runs code.
+      # Checkout comes after the token mint so a submodule fetch could use the
+      # app token, but the action's `token` input is `required: true` -- when
+      # it is expression-conditioned on `checkout_submodules` (falling back to
+      # `''` for ordinary non-submodule PRs), a false `checkout_submodules`
+      # hands the action an explicit empty string, which the action treats as
+      # "input not supplied" and fails before the build even starts (maxi-mux
+      # #384 run 36271068585 attempt 1, job 108499800720; all prior lanes
+      # green). Submodules here are public today, so an unauthenticated fetch
+      # reaches them fine, and the action's own default (falling back to the
+      # workflow's ambient GITHUB_TOKEN) already satisfies the required
+      # input -- exactly the same as lane-check.yml and lane-test.yml, which
+      # never pass `token` at all. Omit it here too instead of re-deriving a
+      # conditional that can produce an empty string again.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         timeout-minutes: 10
         if: ${{ inputs.should_run }}
         with:
           persist-credentials: false
           submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
-          token: ${{ inputs.checkout_submodules && steps.app-token.outputs.token || '' }}
 
       - name: Scrub checkout credentials
         if: ${{ inputs.should_run && inputs.checkout_submodules }}
