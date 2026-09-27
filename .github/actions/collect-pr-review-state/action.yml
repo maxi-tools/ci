@@ -141,12 +141,12 @@ runs:
           exit 1
         fi
 
-        # Fetch the commit status for the head SHA. The status endpoint
-        # returns one entry per context, newest first. We pull down the
-        # full list and filter for `review-roster` rather than asking the
-        # API for that context directly: the API has no per-context
-        # endpoint, so an attempt to ask for one would either 404 or
-        # return the whole list anyway.
+        # Fetch all commit statuses for the head SHA. This endpoint returns
+        # statuses newest first (including repeated contexts), not one entry
+        # per context. A roster can be older than the first page of unrelated
+        # statuses. gh --paginate follows every REST Link page; --slurp wraps
+        # the pages in an array, so flatten them before picking the newest
+        # review-roster status. The API has no per-context status endpoint.
         #
         # FAILS OPEN on a roster lookup failure: the gate has an explicit
         # `roster=absent` fallback (the pre-roster rule), and an unreadable
@@ -160,14 +160,15 @@ runs:
         # description it cannot shape-match, and that propagates through
         # evaluate(). An UNRELATED status description ("reviewed by a
         # non-author", etc.) returns None and lands on `roster=absent`.
-        if ! gh api "repos/$OWNER/$REPO/commits/$HEAD_SHA/statuses" \
+        if ! gh api --paginate --slurp \
+            "repos/$OWNER/$REPO/commits/$HEAD_SHA/statuses?per_page=100" \
             > roster_statuses.json 2>/dev/null; then
           echo "::warning::could not read commit statuses for $HEAD_SHA; gate will fall back to roster=absent"
           ROSTER_DESCRIPTION=""
         else
           ROSTER_DESCRIPTION="$(
             jq -r --arg ctx 'review-roster' \
-              '[.[] | select(.context == $ctx)][0].description // ""' \
+              '[.[][] | select(.context == $ctx)][0].description // ""' \
               roster_statuses.json
           )"
         fi
