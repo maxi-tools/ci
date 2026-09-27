@@ -1,0 +1,16 @@
+.github/scripts/fanout_ci_pin.py
+  h_cebe5b6d461c32 303-338,358,370,396
+tests/test_fanout_ci_pin.py
+  h_cebe5b6d461c32 174-243,290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7324b35980af9eac05fe06a5c3254377dd0561f5",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
