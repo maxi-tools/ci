@@ -171,6 +171,76 @@ class EveryConsumerIsAccountedFor(unittest.TestCase):
             self.assertIn(repr(name), src, f"{name!r} is declared but never emitted")
 
 
+class PinLineIsAFullSha(unittest.TestCase):
+    """The generated pin line carries a full 40-hex sha, not a short one.
+
+    Codacy flagged the 12-char short sha on the fan-out PR (maxi-kvm#166,
+    2026-09-27); in repos whose ruleset requires review-thread resolution
+    the unresolved thread BLOCKS the merge. The pin line, the commit
+    message, and the PR title all carry the full 40-char sha now. The
+    rewrite itself (`_advance_pin_line`) is exercised directly -- until
+    this class every test mocked `_push_pin_branch`, so the bytes this
+    repo's consumers receive were unmeasured.
+    """
+
+    CONSUMER_YML = (
+        "name: review-gate\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  review-gate:\n"
+        "    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@"
+        + OLD + "  # maxi-tools/ci main\n"
+        "    secrets: inherit\n"
+    )
+
+    def test_the_generated_pin_line_is_a_full_40_hex_sha(self):
+        new_text, n = fp._advance_pin_line(self.CONSUMER_YML, TIP)
+        self.assertEqual(n, 1)
+        (line,) = (l for l in new_text.splitlines() if "uses:" in l)
+        ref = line.split("@")[1].split()[0]
+        self.assertRegex(ref, r"^[0-9a-f]{40}$",
+                         "the ref written into the consumer workflow must be "
+                         "a full 40-char sha, not a short form")
+        self.assertEqual(ref, TIP)
+        self.assertTrue(line.endswith("# maxi-tools/ci main"),
+                        "the trailing human comment survives the advance")
+        self.assertNotIn(TIP[:12] + "\n", new_text.replace(TIP, ""),
+                         "no bare 12-char form is left on any line")
+
+    def test_a_consumer_pinned_at_a_short_sha_is_reported_not_advanced(self):
+        # The planner refuses to touch a non-40-hex pin (outcome
+        # `not-a-sha`), so a short-sha legacy pin is surfaced, not
+        # silently rewritten by the fan-out.
+        line = ("    uses: maxi-tools/ci/.github/workflows/"
+                "review-gate-reusable.yml@4618e2feec0c\n")
+        with mock.patch.object(fp, "_fetch_consumer_pin",
+                               lambda c, token: {"review-gate-reusable":
+                                                 "4618e2feec0c"}), \
+             mock.patch.object(fp, "_open_pr", no_network):
+            rc, out, _ = run_main("--tip", TIP,
+                                  "--consumer-repo", "maxi-tools/x", "--json")
+        self.assertEqual(rc, 0)
+        (row,) = rows(out)
+        self.assertEqual(row["outcome"], "not-a-sha")
+        self.assertIn("4618e2feec0c", line)  # shape guard on the fixture
+
+    def test_commit_message_and_pr_title_carry_the_full_sha(self):
+        # Codacy keyed on the 12-char form it found beside the diff; the
+        # commit title and PR title were the only short forms emitted.
+        # TIP is all one hex digit, so a substring check cannot tell the
+        # short form from a prefix of the full one; measure the token.
+        self.assertEqual(fp._commit_message(TIP),
+                         f"ci: advance pin to {TIP}")
+        self.assertEqual(fp._pr_title(TIP, "review-gate-reusable"),
+                         f"ci: advance pin to {TIP} (review-gate-reusable)")
+        for text in (fp._commit_message(TIP),
+                     fp._pr_title(TIP, "review-gate-reusable")):
+            token = text.split("advance pin to ")[1].split(" ")[0]
+            self.assertRegex(token, r"^[0-9a-f]{40}$",
+                             f"short sha leaked into {text!r}")
+
+
 class OneBranchPerConsumer(unittest.TestCase):
     """_open_pr keeps ONE PR per consumer and moves it forward.
 
@@ -217,7 +287,7 @@ class OneBranchPerConsumer(unittest.TestCase):
         self.assertFalse(any(c[:2] == ["pr", "create"] for c in calls), "no second PR")
         edit = next(c for c in calls if c[:2] == ["pr", "edit"])
         self.assertEqual(edit[2], "4")
-        self.assertIn(f"ci: advance pin to {TIP[:12]} (review-gate-reusable)", edit)
+        self.assertIn(f"ci: advance pin to {TIP} (review-gate-reusable)", edit)
 
     def test_legacy_per_sha_prs_are_closed_as_superseded(self):
         legacy = {"number": 2, "url": "https://github.com/maxi-tools/x/pull/2",
