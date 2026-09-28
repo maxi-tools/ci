@@ -36,11 +36,11 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-RUST_CI = '.github/workflows/rust-ci.yml'
-SIGN_PUBLISH_LANE = '.github/workflows/lane-sign-publish.yml'
-REVIEW_GATE = '.github/workflows/review-gate-reusable.yml'
-OWN_WRAPPER = '.github/workflows/review-gate.yml'
-DESIGN = ROOT / 'docs' / 'ci-design.md'
+RUST_CI = ".github/workflows/rust-ci.yml"
+SIGN_PUBLISH_LANE = ".github/workflows/lane-sign-publish.yml"
+REVIEW_GATE = ".github/workflows/review-gate-reusable.yml"
+OWN_WRAPPER = ".github/workflows/review-gate.yml"
+DESIGN = ROOT / "docs" / "ci-design.md"
 
 #: `uses:` values that name a WORKFLOW IN THIS TREE. Two shapes matter:
 #:
@@ -52,53 +52,85 @@ DESIGN = ROOT / 'docs' / 'ci-design.md'
 #: A reference to anything else (an action, or another repository's workflow)
 #: is not a workflow edge in this graph and is not resolved.
 SELF_WORKFLOW_REF = re.compile(
-    r'^(?:\./)?(?:maxi-tools/ci/)?(\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml)(?:@(.*))?$'
+    r"^(?:\./)?(?:maxi-tools/ci/)?(\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml)(?:@(.*))?$"
 )
 
 #: The scopes a caller of `rust-ci.yml` must grant, exactly. Named as a
 #: constant rather than derived so the expectation is readable in one place --
 #: and it is stated POSITIVELY (these three, nothing else) because a fourth
 #: read scope is as much a regression to notice as a write scope.
-RUST_CI_FLOOR = {'contents': 'read', 'pull-requests': 'read', 'actions': 'read'}
+RUST_CI_FLOOR = {"contents": "read", "pull-requests": "read", "actions": "read"}
 
 #: The scopes a caller of the review gate must grant, exactly. `pull-requests`
 #: is WRITE because of the `dedupe` leg, and `statuses` because of the
 #: publisher; both are job-level declarations inside the callee.
 REVIEW_GATE_FLOOR = {
-    'actions': 'read',
-    'contents': 'read',
-    'pull-requests': 'write',
-    'statuses': 'write',
+    "actions": "read",
+    "contents": "read",
+    "pull-requests": "write",
+    "statuses": "write",
 }
 
 
 def load_workflow(rel):
     path = ROOT / rel
     if not path.is_file():
-        raise AssertionError(rel + ' does not exist in this tree')
-    document = yaml.safe_load(path.read_text(encoding='utf-8'))
-    if not isinstance(document, dict) or not isinstance(document.get('jobs'), dict):
-        raise AssertionError(rel + ' has no jobs: mapping; this walker measured nothing')
+        raise AssertionError(rel + " does not exist in this tree")
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), dict):
+        raise AssertionError(
+            rel + " has no jobs: mapping; this walker measured nothing"
+        )
     return document
 
 
 def _fold(total, scopes):
     """Union a scope map into `total`, with `write` winning over `read`."""
     for scope, level in (scopes or {}).items():
-        if total.get(scope) != 'write':
+        if total.get(scope) != "write":
             total[scope] = level
+
+
+def _scopes_of(node):
+    """`node`'s `permissions:` map, or None when it declares none.
+
+    `permissions: {}` declares nothing and is returned as an empty map, which
+    folds to nothing -- the same contribution as an absent key. Both shapes
+    mean "no scope", and neither is a floor.
+    """
+    scopes = node.get("permissions")
+    return scopes if isinstance(scopes, dict) else None
+
+
+def _called_workflow(job, rel, job_name):
+    """The workflow in this tree `job` calls, or None for a non-workflow edge.
+
+    A `uses:` that names a workflow here but resolves to no file fails closed:
+    an unresolvable edge is a floor measured too low, which is a green test on
+    a call graph it never actually walked.
+    """
+    uses = job.get("uses") if isinstance(job.get("uses"), str) else None
+    if uses is None:
+        return None
+    match = SELF_WORKFLOW_REF.match(uses.strip())
+    if match is None:
+        return None
+    target = match.group(1)
+    if not (ROOT / target).is_file():
+        raise AssertionError(
+            rel + ": job " + job_name + " calls " + uses + ", which resolves to "
+            "no file in this tree -- the floor below would be measured without "
+            "it, so this fails closed instead"
+        )
+    return target
 
 
 def permission_floor(rel, seen=None):
     """Every scope a CALLER of `rel` has to grant, transitively.
 
-    Includes the callee's own workflow-level map when it declares one (an
-    empty `permissions: {}` declares nothing and contributes nothing), every
-    job-level map in it, and -- for each job that calls a workflow in this
-    tree -- the whole floor of that workflow. Cycles are cut by `seen`; a
-    reference to a workflow in this tree that does not resolve fails closed
-    rather than being skipped, because a skipped edge is a floor measured too
-    low, which is a green test on a broken call graph.
+    Includes the callee's own workflow-level map, every job-level map in it,
+    and -- for each job that calls a workflow in this tree -- the whole floor
+    of that workflow. Cycles are cut by `seen`.
     """
     seen = set() if seen is None else seen
     if rel in seen:
@@ -107,39 +139,52 @@ def permission_floor(rel, seen=None):
 
     document = load_workflow(rel)
     total = {}
-    _fold(total, document.get('permissions') if isinstance(document.get('permissions'), dict) else None)
+    _fold(total, _scopes_of(document))
 
-    for job_name, job in document['jobs'].items():
+    for job_name, job in document["jobs"].items():
         if not isinstance(job, dict):
-            raise AssertionError(rel + ': job ' + job_name + ' is not a mapping')
-        _fold(total, job.get('permissions') if isinstance(job.get('permissions'), dict) else None)
-
-        uses = job.get('uses') if isinstance(job.get('uses'), str) else None
-        if uses is None:
-            continue
-        match = SELF_WORKFLOW_REF.match(uses.strip())
-        if match is None:
-            continue
-        target = match.group(1)
-        if not (ROOT / target).is_file():
-            raise AssertionError(
-                rel + ': job ' + job_name + ' calls ' + uses + ', which resolves '
-                'to no file in this tree -- the floor below would be measured '
-                'without it, so this fails closed instead'
-            )
-        _fold(total, permission_floor(target, seen))
+            raise AssertionError(rel + ": job " + job_name + " is not a mapping")
+        _fold(total, _scopes_of(job))
+        target = _called_workflow(job, rel, job_name)
+        if target is not None:
+            _fold(total, permission_floor(target, seen))
     return total
 
 
 def job_permissions(rel, job_name):
     document = load_workflow(rel)
-    job = document['jobs'].get(job_name)
+    job = document["jobs"].get(job_name)
     if not isinstance(job, dict):
-        raise AssertionError(rel + ' has no job named ' + job_name)
-    scopes = job.get('permissions')
+        raise AssertionError(rel + " has no job named " + job_name)
+    scopes = job.get("permissions")
     if not isinstance(scopes, dict):
-        raise AssertionError(rel + ':' + job_name + ' declares no permissions map')
+        raise AssertionError(rel + ":" + job_name + " declares no permissions map")
     return scopes
+
+
+def _documented_callers_in(block):
+    """Caller examples in one ```yaml block, as (job, callee path, granted map)."""
+    document = yaml.safe_load(block)
+    if not isinstance(document, dict):
+        raise AssertionError("a ```yaml block in " + str(DESIGN) + " is not a mapping")
+    found = []
+    for job_name, job in (document.get("jobs") or {}).items():
+        uses = (
+            job.get("uses")
+            if isinstance(job, dict) and isinstance(job.get("uses"), str)
+            else None
+        )
+        if uses is None:
+            continue
+        match = SELF_WORKFLOW_REF.match(uses.strip())
+        if match is None:
+            raise AssertionError(
+                "the documented caller " + job_name + " uses " + uses + ", which is "
+                "not a workflow in this tree; its floor cannot be computed here, so "
+                "this fails closed rather than leaving it unmeasured"
+            )
+        found.append((job_name, match.group(1), job.get("permissions") or {}))
+    return found
 
 
 def documented_callers():
@@ -150,27 +195,14 @@ def documented_callers():
     map nobody was ever told to copy.
     """
     examples = []
-    for block in re.findall(r'```yaml\n(.*?)```', DESIGN.read_text(encoding='utf-8'), re.DOTALL):
-        document = yaml.safe_load(block)
-        if not isinstance(document, dict):
-            raise AssertionError('a ```yaml block in ' + str(DESIGN) + ' is not a mapping')
-        for job_name, job in (document.get('jobs') or {}).items():
-            uses = job.get('uses') if isinstance(job, dict) and isinstance(job.get('uses'), str) else None
-            if uses is None:
-                continue
-            match = SELF_WORKFLOW_REF.match(uses.strip())
-            if match is None:
-                raise AssertionError(
-                    'the documented caller ' + job_name + ' uses ' + uses + ', which '
-                    'is not a workflow in this tree; its floor cannot be computed '
-                    'here, so this fails closed rather than leaving it unmeasured'
-                )
-            examples.append((job_name, match.group(1), job.get('permissions') or {}))
+    for block in re.findall(
+        r"```yaml\n(.*?)```", DESIGN.read_text(encoding="utf-8"), re.DOTALL
+    ):
+        examples.extend(_documented_callers_in(block))
     return examples
 
 
 class CallerPermissionFloor(unittest.TestCase):
-
     def test_rust_ci_call_graph_requires_only_read_scopes(self):
         """The regression this lane exists for: nothing in the graph writes.
 
@@ -182,19 +214,21 @@ class CallerPermissionFloor(unittest.TestCase):
         """
         floor = permission_floor(RUST_CI)
         self.assertEqual(
-            floor, RUST_CI_FLOOR,
-            'the transitive floor of ' + RUST_CI + ' changed. Every consumer of '
-            'this workflow must grant exactly this map, on every event, before '
-            'any job `if:` is evaluated -- so a scope added here is a scope '
-            'added to ~48 repositories, and a write scope is the over-grant '
-            'this change removed'
+            floor,
+            RUST_CI_FLOOR,
+            "the transitive floor of " + RUST_CI + " changed. Every consumer of "
+            "this workflow must grant exactly this map, on every event, before "
+            "any job `if:` is evaluated -- so a scope added here is a scope "
+            "added to ~48 repositories, and a write scope is the over-grant "
+            "this change removed",
         )
         for scope, level in floor.items():
             self.assertEqual(
-                level, 'read',
-                'the graph declares ' + scope + ': ' + level + '; no step in it '
-                'needs a write scope, and a declaration here is a consumer-side '
-                'requirement (maxi-config#366)'
+                level,
+                "read",
+                "the graph declares " + scope + ": " + level + "; no step in it "
+                "needs a write scope, and a declaration here is a consumer-side "
+                "requirement (maxi-config#366)",
             )
 
     def test_sign_publish_declares_only_the_permissions_its_steps_use(self):
@@ -207,18 +241,18 @@ class CallerPermissionFloor(unittest.TestCase):
         forces the trio on every consumer.
         """
         self.assertEqual(
-            job_permissions(SIGN_PUBLISH_LANE, 'lane-sign-publish'),
-            {'contents': 'read'},
-            'lane-sign-publish declares more than contents: read; its steps are a '
-            'checkout with persist-credentials: false, an artifact download and '
-            'two echoes'
+            job_permissions(SIGN_PUBLISH_LANE, "lane-sign-publish"),
+            {"contents": "read"},
+            "lane-sign-publish declares more than contents: read; its steps are a "
+            "checkout with persist-credentials: false, an artifact download and "
+            "two echoes",
         )
         self.assertEqual(
-            job_permissions(RUST_CI, 'sign-publish'),
-            {'contents': 'read'},
-            'rust-ci.yml\'s sign-publish call site declares more than '
-            'contents: read; this map, not the lane\'s, is what a consumer\'s '
-            'caller grant is measured against'
+            job_permissions(RUST_CI, "sign-publish"),
+            {"contents": "read"},
+            "rust-ci.yml's sign-publish call site declares more than "
+            "contents: read; this map, not the lane's, is what a consumer's "
+            "caller grant is measured against",
         )
 
     def test_documented_caller_permissions_are_exactly_the_floor(self):
@@ -235,20 +269,25 @@ class CallerPermissionFloor(unittest.TestCase):
         # Non-vacuity. A doc whose examples stopped parsing, or a heading that
         # took them with it, must fail rather than measure an empty set.
         self.assertEqual(
-            sorted(by_callee), [REVIEW_GATE, RUST_CI],
-            'the design doc no longer documents exactly these two calling shapes: '
-            + repr(sorted(by_callee))
+            sorted(by_callee),
+            [REVIEW_GATE, RUST_CI],
+            "the design doc no longer documents exactly these two calling shapes: "
+            + repr(sorted(by_callee)),
         )
 
         for callee, (job_name, granted) in sorted(by_callee.items()):
             floor = permission_floor(callee)
-            self.assertTrue(floor, callee + ' has no permission floor at all; the walker measured nothing')
+            self.assertTrue(
+                floor,
+                callee + " has no permission floor at all; the walker measured nothing",
+            )
             self.assertEqual(
-                granted, floor,
-                'the documented permissions for ' + job_name + ' (' + callee + ') '
-                'are not the floor of that callee. Missing scopes break every '
-                'caller who copies the example at run creation; extra scopes are '
-                'the over-grant this change removed. Grant what the graph uses.'
+                granted,
+                floor,
+                "the documented permissions for " + job_name + " (" + callee + ") "
+                "are not the floor of that callee. Missing scopes break every "
+                "caller who copies the example at run creation; extra scopes are "
+                "the over-grant this change removed. Grant what the graph uses.",
             )
 
     def test_this_repositorys_own_wrapper_grants_the_gate_floor(self):
@@ -261,15 +300,17 @@ class CallerPermissionFloor(unittest.TestCase):
         this test exists to make impossible.
         """
         self.assertEqual(
-            permission_floor(OWN_WRAPPER), REVIEW_GATE_FLOOR,
-            'the floor of ' + OWN_WRAPPER + ' is not the gate\'s floor; it must '
-            'grant the union of what the callee\'s jobs declare'
+            permission_floor(OWN_WRAPPER),
+            REVIEW_GATE_FLOOR,
+            "the floor of " + OWN_WRAPPER + " is not the gate's floor; it must "
+            "grant the union of what the callee's jobs declare",
         )
         self.assertEqual(
-            job_permissions(OWN_WRAPPER, 'review-gate'), REVIEW_GATE_FLOOR,
-            'the wrapper\'s review-gate job must grant exactly the callee\'s floor'
+            job_permissions(OWN_WRAPPER, "review-gate"),
+            REVIEW_GATE_FLOOR,
+            "the wrapper's review-gate job must grant exactly the callee's floor",
         )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main(verbosity=2)
