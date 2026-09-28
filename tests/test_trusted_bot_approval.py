@@ -321,11 +321,13 @@ class TheAbsentRosterFallback(unittest.TestCase):
     """No roster status for this head: which accounts still count.
 
     The fallback used to credit ANY non-author review, and the accounts it
-    actually credited were mostly the org's own automation -- measured
-    2026-09-28, 8 of the 10 open pull requests relying on it were green on a
-    review from `maxi-tools-auth[bot]` or `github-actions[bot]`, neither of
-    which reviews anything. "Somebody other than the author reviewed this
-    change" is not answered by an account that never reviews changes.
+    actually credited included the org's own automation: measured 2026-09-28
+    over 101 open pull requests in six repositories, ten relied on the
+    fallback and three of them (`maxi-core#4792`, `maxi-ml#2660`,
+    `maxi-dist#368`) were green on nothing but a review from
+    `maxi-tools-auth[bot]`, the app identity that opens the pull request.
+    "Somebody other than the author reviewed this change" is not answered by
+    an account that never reviews changes.
     """
 
     def test_a_review_bot_still_satisfies_it(self):

@@ -728,10 +728,12 @@ def evaluate(doc, only=ONLY_ALL):
     # project board automation -- satisfied a condition whose stated question
     # is whether anyone reviewed the change. Measured 2026-09-28 over 101 open
     # pull requests in six repositories: ten were relying on the absent-roster
-    # fallback, and eight of those ten were credited to `maxi-tools-auth[bot]`,
-    # `github-actions[bot]` or another identity that reviews nothing. A human
-    # who reviewed in that window is not left out: their APPROVAL satisfies
-    # route A, which is the stronger statement the card asks for.
+    # fallback, and three of those ten (`maxi-core#4792`, `maxi-ml#2660`,
+    # `maxi-dist#368`) were green on nothing but a review from
+    # `maxi-tools-auth[bot]`, the app identity that opens the pull request. The
+    # other seven stay green here: their reviewer is a review bot. A human who
+    # reviewed in that window is not left out either -- their APPROVAL
+    # satisfies route A, which is the stronger statement the card asks for.
     #
     # `active_roster` is the roster dict that applies, or None. Computed
     # once and read by every branch below, so a typo in one branch does
