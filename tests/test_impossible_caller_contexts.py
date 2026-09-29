@@ -102,6 +102,31 @@ def load_jobs(path: pathlib.Path) -> dict:
     return doc["jobs"]
 
 
+# Per-caller reusable-workflow target. A caller job in rust-ci.yml that
+# stops calling its lane -- by losing its `uses:` directive and
+# becoming a `runs-on:` + `steps:` job -- no longer publishes the
+# nested check-run the ruleset requires by name. The job name still
+# matches the regression-class set, so the name-only assertion would
+# pass on the broken shape. Pin each caller's `uses:` target so a
+# caller converted to inline steps fails this test.
+#
+# `merge-gate` is intentionally absent -- it is the aggregate, not a
+# caller, and runs inline rather than calling a reusable workflow.
+CALLER_USES_TARGETS = frozenset(
+    {
+        f"./.github/workflows/lane-{name}.yml"
+        for name in (
+            "plan",
+            "check",
+            "test",
+            "package",
+            "sign-publish",
+            "release-verify",
+        )
+    }
+)
+
+
 class RustCiJobsContractTest(unittest.TestCase):
     """The set of caller job names in rust-ci.yml MUST match the
     documented set, otherwise the review above cannot recognise a new
@@ -121,34 +146,64 @@ class RustCiJobsContractTest(unittest.TestCase):
             "CANDIDATE_SENTINELS only with the reviewer's sign-off.",
         )
 
+    def test_every_caller_job_calls_its_lane_reusable(self):
+        """Pin the `uses:` target of each caller job so a caller
+        converted to inline `runs-on:` + `steps:` -- which would lose
+        the nested check-run the ruleset requires by name -- fails
+        this test rather than silently passing the name assertion."""
+        jobs = load_jobs(RUST_CI)
+        for caller in CANDIDATE_SENTINELS:
+            job = jobs[caller]
+            uses = job.get("uses")
+            self.assertIn(
+                uses,
+                CALLER_USES_TARGETS,
+                f"rust-ci.yml `{caller}:` does not call its lane "
+                f"reusable workflow. Got `uses: {uses!r}`; expected "
+                f"one of {sorted(CALLER_USES_TARGETS)}. The caller "
+                f"job MUST invoke `./.github/workflows/lane-{caller}.yml` "
+                f"so the nested check-run `merge-gate / {caller} / "
+                f"lane-{caller}` is published for the ruleset to read. "
+                f"An inline `runs-on:` + `steps:` job loses that "
+                f"check-run name even when its job name is unchanged, "
+                f"and the regression class returns. See the comment "
+                f"on `check:` and `test:` for the full account.",
+            )
+
     def test_no_caller_job_is_top_level_skipped_on_pull_request(self):
         """The bug that produces caller-level sentinels on ordinary PRs
         is a top-level skip on the caller job itself that fires when a
         pull-request IS open -- turning the caller job into a
         placeholder on the very PR class it is meant to gate.
 
-        Two distinct shapes use `if:` on caller jobs today:
+        Three patterns are PERMITTED on a caller `if:` today:
 
           a. POST-MERGE-ONLY. `sign-publish:` and `release-verify:`
              skip on `github.ref` (only run on `main`/`release/**`).
-             This is correct: those lanes are not supposed to run on a
-             PR at all, the caller-level skipped check-run is the
+             This is correct: those lanes are not supposed to run on
+             a PR at all, the caller-level skipped check-run is the
              intended shape, and the ruleset does NOT require these
              names.
 
-          b. PR-CLASS SKIP. `check:` and `test:` (in the broken
-             version) skip on `github.event_name == 'pull_request' &&
-             startsWith(..., 'maxi-config-sync/')` -- a class of PR
-             whose lanes SHOULD run. That is the regression class and
-             is exactly what the existing comment on `check:` warns
-             against. The fix is to move the skip INSIDE the lane
-             workflow the caller invokes, where it can produce a
-             skipped NESTED check-run (which a required_status rule
-             accepts) instead of a skipped CALLER check-run (which
-             only appears on the class it is meant to gate).
+          b. SAME-REPO GATE. `plan:` narrows the PR class to same-repo
+             PRs via `head.repo.full_name == github.repository`,
+             explicitly excluding fork PRs from the self-hosted
+             fleet. The caller still runs on every same-repo PR, so
+             the nested check-run `merge-gate / plan / lane-plan` is
+             published as success/failure on the class the ruleset
+             must gate.
 
-        This test catches shape (b). It must NOT catch shape (a) --
-        sign-publish and release-verify are post-merge-only by design.
+          c. LANE-RESULT DEPENDENCY. `package:` runs only when its
+             upstream lanes succeeded (`needs.plan.result == 'success'
+             && (needs.check.result in {success, skipped}) && ...`).
+             This is a topological guard, not a class guard, and does
+             not narrow the PR class.
+
+        Any other reference to `github.event_name` -- e.g.
+        `github.event_name == 'pull_request' && startsWith(..., ...)`,
+        or a fan-out guard, or a date guard, or a docs-only guard on
+        the caller -- is the regression class, because it narrows the
+        PR class in a way the ruleset does not understand.
         """
         jobs = load_jobs(RUST_CI)
         for caller in CANDIDATE_SENTINELS:
@@ -156,38 +211,82 @@ class RustCiJobsContractTest(unittest.TestCase):
             if_ = job.get("if")
             if if_ is None:
                 continue
-            # If the `if:` mentions pull_request as a class to skip,
-            # it is the regression class. The mechanism a sane shape
-            # (a) uses is github.ref (post-merge-only) and never fires
-            # on pull_request. The mechanism shape (b) uses is some
-            # variant of github.event_name == 'pull_request' AND
-            # <class-refinement> -- which is the regression class
-            # itself.
-            self.assertNotIn(
-                "github.event_name == 'pull_request'",
+            mentions_event_name = "github.event_name" in if_
+            if not mentions_event_name:
+                # Without `github.event_name`, two patterns are
+                # permitted: post-merge-only (a) and lane-result
+                # dependency (c). A pattern that references neither
+                # `github.ref` (post-merge-only) nor `needs.` (lane
+                # dependency) -- e.g. a fan-out guard, a docs-only
+                # guard, a date guard, a fork guard that does not
+                # mention the repo -- is the regression class.
+                self.assertTrue(
+                    "github.ref" in if_ or "needs." in if_,
+                    f"rust-ci.yml `{caller}:` carries an `if:` block "
+                    f"({if_!r}) that references neither "
+                    f"`github.event_name` (the regression class when "
+                    f"absent of the same-repo clause) nor "
+                    f"`github.ref` (the post-merge-only shape) nor "
+                    f"`needs.` (the lane-result dependency shape). "
+                    f"If a caller carries an `if:` at all, it must be "
+                    f"one of the three permitted shapes -- post-"
+                    f"merge-only, same-repo gate, or lane-result "
+                    f"dependency. Any other shape (a fan-out guard, "
+                    f"a fork guard, a docs-only guard, a date guard, "
+                    f"etc.) belongs INSIDE the lane workflow this "
+                    f"job calls, not on the caller.",
+                )
+                continue
+            # The `if:` references `github.event_name`. The only
+            # legitimate use on a caller is the same-repo gate (b):
+            # the literal phrase
+            # `head.repo.full_name == github.repository`
+            # distinguishes it from the regression class. Any other
+            # reference -- a fan-out guard, a docs-only guard, a
+            # date guard, a fork guard that does not name the repo --
+            # is the regression class.
+            self.assertIn(
+                "head.repo.full_name == github.repository",
                 if_,
                 f"rust-ci.yml `{caller}:` carries an `if:` block "
-                f"({if_!r}) whose branch fires on `github.event_name "
-                f"== 'pull_request'`. That is the regression class: "
-                f"the caller job is skipped on a pull-request class "
-                f"that the ruleset must still gate, the caller-level "
+                f"({if_!r}) that references `github.event_name` "
+                f"without gating on "
+                f"`github.event.pull_request.head.repo.full_name == "
+                f"github.repository`. That is the regression class: "
+                f"the caller is skipped on a pull-request class that "
+                f"the ruleset must still gate, the caller-level "
                 f"check-run `merge-gate / {caller}` is published as "
                 f"`skipped` instead of the lane's actual result, and a "
                 f"ruleset requiring it blocks every ordinary PR in "
-                f"that class. The skip MUST live INSIDE the lane "
-                f"workflow this job calls (lane-{caller}.yml), not on "
-                f"the caller -- so the nested check-run "
-                f"`merge-gate / {caller} / lane-{caller}` is "
-                f"published as `skipped` (which a required_status "
-                f"rule accepts) rather than absent. See the existing "
-                f"comment on `check:` for the full account.",
+                f"that class. The only legitimate use of "
+                f"`github.event_name` on a caller is the same-repo "
+                f"gate (above). Any other shape -- a fan-out guard, "
+                f"a docs-only guard, a date guard, a fork guard that "
+                f"does not name the repo -- belongs INSIDE the lane "
+                f"workflow this job calls (lane-{caller}.yml), not "
+                f"on the caller. See the existing comment on "
+                f"`check:` for the full account.",
             )
 
     def test_aggregate_has_always_on_same_repo_pr(self):
         """The aggregate is the context the ruleset is supposed to
-        require, so its `if:` must let it run on every ordinary PR
-        regardless of which lane failed -- a failing lane must not
-        skip the aggregate, which is exactly what `always()` enforces."""
+        require, so its `if:` must let it run on every same-repo PR
+        regardless of which lane failed.
+
+        The rule has two halves that BOTH have to hold:
+
+          a. `always()` -- a failing lane must not skip the aggregate.
+             Without `always()`, a red upstream lane cascades into a
+             skipped aggregate, which the ruleset reads as "no
+             verdict", which is read as not red; the regression class
+             then returns through a different path.
+
+          b. SAME-REPO PULL_REQUEST COVERAGE -- the aggregate must
+             actually fire when a same-repo PR is open. `always()`
+             alone does not satisfy this: an expression like
+             `always() && github.event_name == 'push'` has `always()`
+             but skips every PR class entirely. Pin both halves.
+        """
         jobs = load_jobs(RUST_CI)
         if_ = jobs["merge-gate"].get("if")
         self.assertIsNotNone(
@@ -204,6 +303,32 @@ class RustCiJobsContractTest(unittest.TestCase):
             f"the ruleset reads `merge-gate / merge-gate` to decide "
             f"whether to block, and a missing conclusion is read as "
             f"no verdict, not red.",
+        )
+        self.assertIn(
+            "github.event_name == 'pull_request'",
+            if_,
+            f"rust-ci.yml `merge-gate:` if: ({if_!r}) does not "
+            f"reference `github.event_name == 'pull_request'`. "
+            f"`always()` alone is not enough -- an expression like "
+            f"`always() && github.event_name == 'push'` skips every "
+            f"PR class entirely, the aggregate check-run is then "
+            f"absent on the PR class the ruleset is supposed to gate, "
+            f"and a ruleset requiring `merge-gate / merge-gate` "
+            f"blocks every same-repo PR. The aggregate must fire on "
+            f"`github.event_name == 'pull_request'` (and any further "
+            f"refinement -- same-repo head, fork bypass, etc. -- "
+            f"must still leave that class passing).",
+        )
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            if_,
+            f"rust-ci.yml `merge-gate:` if: ({if_!r}) does not gate "
+            f"on `github.event.pull_request.head.repo.full_name == "
+            f"github.repository`. The aggregate must run on same-repo "
+            f"PRs and skip on fork PRs (fork code must not reach the "
+            f"self-hosted fleet). A condition that lacks this clause "
+            f"either skips legitimate PRs or runs on forks, both of "
+            f"which are the regression class.",
         )
 
 
