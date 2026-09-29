@@ -331,7 +331,8 @@ def _open_fanout_prs(consumer: Consumer, *, token: str) -> list[dict]:
 
 
 def _retire_pin_pr(consumer: Consumer, pr: dict, *, token: str,
-                   reason: str, expected_path: str | None = None) -> None:
+                   reason: str, expected_paths: list[str],
+                   additional_allowed_paths: list[str] | None = None) -> None:
     '''Never close or delete a pin branch with human history or extra files.'''
     number = str(pr['number'])
     detail = json.loads(_gh(
@@ -341,34 +342,65 @@ def _retire_pin_pr(consumer: Consumer, pr: dict, *, token: str,
         ['api', '--paginate', '-X', 'GET',
          f'repos/{consumer.name}/pulls/{number}/commits',
          '-f', 'per_page=100',
-         '--jq', '.[] | {author: .commit.author, committer: .commit.committer} | @json'],
+         '--jq', '.[] | {author: .commit.author, committer: .commit.committer, message: .commit.message} | @json'],
         token=token).splitlines()]
+    # The fanout commits under the repo-required identity `Maxi Boch
+    # <874012+maxiboch@users.noreply.github.com>`, which humans and fleet
+    # agents also use, so identity alone cannot prove a commit is bot-made.
+    # The discriminator is the commit message: bot advances always read
+    # exactly `ci: advance pin to <12hex>`, which a human following the repo
+    # rules would never write for a fix commit.
+    bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
+    fanout_msg_re = re.compile(r'^ci: advance pin to [0-9a-f]{12}$')
+    allowed = set(expected_paths)
+    if additional_allowed_paths:
+        allowed.update(additional_allowed_paths)
+    paths = [f['path'] for f in detail['files']]
     problems = []
     if detail['author']['login'] != 'app/maxi-tools-auth':
         problems.append('PR author is not the bot')
     if detail['headRefName'] != pr['headRefName']:
         problems.append('head branch changed')
-    paths = [f['path'] for f in detail['files']]
-    if len(paths) != 1 or (expected_path is not None and paths != [expected_path]):
-        problems.append('PR does not change exactly the expected single file' if expected_path
-                        else 'PR does not change exactly one file')
-    bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
-    if not commits or any(any(commit[role].get(key) != value for key, value in bot.items())
-                          for commit in commits for role in ('author', 'committer')):
-        problems.append('not every commit is bot-authored and bot-committed')
-    if problems:
+    if set(paths) != allowed:
+        problems.append('PR does not change exactly the expected file set')
+    if not commits:
+        problems.append('no commits on PR')
+    else:
+        for commit in commits:
+            if not fanout_msg_re.match(commit['message'].splitlines()[0]):
+                problems.append('commit message does not match fan-out advance pattern')
+                break
+            if any(commit[role].get(key) != value for key, value in bot.items()
+                   for role in ('author', 'committer')):
+                problems.append('not every commit is bot-authored and bot-committed')
+                break
+    if problems and not _already_commented(consumer, number, token):
         _gh(['pr', 'comment', number, '--repo', consumer.name, '--body',
              'Leaving this pin PR and its branch open: ' + '; '.join(problems) + '.'], token=token)
-        return
-    _gh(['pr', 'close', number, '--repo', consumer.name,
-         '--delete-branch', '--comment', reason], token=token)
+    if not problems:
+        _gh(['pr', 'close', number, '--repo', consumer.name,
+             '--delete-branch', '--comment', reason], token=token)
+
+
+def _already_commented(consumer: Consumer, number: str, token: str) -> bool:
+    out = _gh(
+        ['api', '--paginate', '-X', 'GET',
+         f'repos/{consumer.name}/issues/{number}/comments',
+         '-f', 'per_page=100',
+         '--jq', '.[] | select(.body | startswith("Leaving this pin PR and its branch open:")) | .id'],
+        token=token,
+    ).strip()
+    return bool(out)
 
 
 def _retire_owned_pin_prs(consumer: Consumer, *, token: str) -> None:
-    '''Close only bot-owned single-file pin proposals; sync owns the advance.'''
+    '''Close only bot-owned pin proposals whose files are the expected set; sync owns the advance.'''
+    expected = ['.github/workflows/review-gate.yml']
+    additional = ['maxi-review/review-gate.yml'] if consumer.name == 'maxi-tools/maxi-config' else None
     for pr in _open_fanout_prs(consumer, token=token):
         _retire_pin_pr(
-            consumer, pr, token=token, expected_path='.github/workflows/review-gate.yml',
+            consumer, pr, token=token, expected_paths=expected,
+            additional_allowed_paths=additional,
             reason='Superseded by the maxi-config-owned review-gate.yml sync. '
                    'The ci pin now advances in maxi-config/maxi-review/review-gate.yml '
                    'and reaches this repo through its sync PR.')
@@ -494,6 +526,10 @@ def _open_pr(
     for p in legacy:
         _retire_pin_pr(
             consumer, p, token=token,
+            expected_paths=['.github/workflows/review-gate.yml'],
+            additional_allowed_paths=(
+                ['maxi-review/review-gate.yml']
+                if consumer.name == 'maxi-tools/maxi-config' else None),
             reason=f'Superseded by {url}: the fan-out now keeps one branch per '
                    f'consumer (`{HEAD_REF}`) and moves it forward on each tip.')
     _enable_automerge(consumer, url, token=token)

@@ -198,7 +198,8 @@ class OneBranchPerConsumer(unittest.TestCase):
             if args[:2] == ["api", "--paginate"] and '/commits' in args[4]:
                 bot = {'name': 'Maxi Boch',
                        'email': '874012+maxiboch@users.noreply.github.com'}
-                return json.dumps({'author': bot, 'committer': bot})
+                return json.dumps({'author': bot, 'committer': bot,
+                                   'message': 'ci: advance pin to ' + TIP[:12]})
             return ""
 
         pushes = []
@@ -320,13 +321,16 @@ class OwnedSyncRouting(unittest.TestCase):
             self.assertIn(TIP, src.read_text())
 
     def _retire(self, *, pr_author='app/maxi-tools-auth',
-                paths=('.github/workflows/review-gate.yml',), human_commit=False,
-                legacy=False):
+                paths=('.github/workflows/review-gate.yml',),
+                commits=None, already_commented=False, legacy=False,
+                consumer_name='maxi-tools/x'):
         pr = {'number': 12, 'headRefName': ('ci/fanout-660e29c41e4d'
                                             if legacy else fp.HEAD_REF)}
         calls = []
         bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
-        human = {'name': 'Human', 'email': 'human@example.com'}
+        if commits is None:
+            commits = [{'author': bot, 'committer': bot,
+                        'message': 'ci: advance pin to ' + TIP[:12]}]
         def gh(args, *, token):
             calls.append(args)
             if args[:2] == ['pr', 'view']:
@@ -334,24 +338,24 @@ class OwnedSyncRouting(unittest.TestCase):
                                    'headRefName': pr['headRefName'],
                                    'files': [{'path': p} for p in paths]})
             if args[:2] == ['api', '--paginate']:
-                self.assertIn('/pulls/12/commits', args[4])
-                return '\n'.join(json.dumps(c) for c in (
-                    {'author': bot, 'committer': bot},
-                    *([{'author': human, 'committer': bot}] if human_commit else [])))
+                if '/pulls/12/commits' in args[4]:
+                    return '\n'.join(json.dumps(c) for c in commits)
+                if '/issues/12/comments' in args[4]:
+                    return '"7"' if already_commented else ''
             return ''
         with mock.patch.object(fp, '_open_fanout_prs', return_value=[pr]), \
              mock.patch.object(fp, '_gh', gh):
             if legacy:
                 with mock.patch.object(fp, '_push_pin_branch'), \
                      mock.patch.object(fp, '_enable_automerge'):
-                    fp._open_pr(consumer=fp.Consumer('maxi-tools/x'),
+                    fp._open_pr(consumer=fp.Consumer(consumer_name),
                                 workflow_file='review-gate-reusable', old_ref=OLD,
                                 new_ref=TIP, tip_sha=TIP, token='t', dry_run=False)
             else:
-                fp._retire_owned_pin_prs(fp.Consumer('maxi-tools/x'), token='t')
+                fp._retire_owned_pin_prs(fp.Consumer(consumer_name), token='t')
         return calls
 
-    def test_only_bot_owned_single_file_pin_pr_is_retired(self):
+    def test_only_bot_owned_pin_pr_is_retired(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 calls = self._retire(legacy=legacy)
@@ -359,24 +363,59 @@ class OwnedSyncRouting(unittest.TestCase):
                 self.assertEqual(len(closes), 1)
                 self.assertIn('--delete-branch', closes[0])
 
+    def test_maxi_config_two_file_shape_is_retired(self):
+        paths = ('maxi-review/review-gate.yml', '.github/workflows/review-gate.yml')
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                calls = self._retire(legacy=legacy, paths=paths,
+                                     consumer_name='maxi-tools/maxi-config')
+                closes = [c for c in calls if c[:2] == ['pr', 'close']]
+                self.assertEqual(len(closes), 1)
+                self.assertIn('--delete-branch', closes[0])
+        # ...but the two-file shape is NOT acceptable on other consumers.
+        calls = self._retire(paths=paths)
+        self.assertFalse(any(c[:2] == ['pr', 'close'] for c in calls))
+
     def test_unsafe_pin_prs_are_left_open_with_their_branches(self):
+        bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
+        human_maxi = [{'author': bot, 'committer': bot,
+                       'message': 'fix(review-gate): tighten timeout'}]
+        other = {'name': 'Human', 'email': 'human@example.com'}
+        human_actor = [{'author': other, 'committer': other,
+                        'message': 'ci: advance pin to ' + TIP[:12]}]
+        mixed = [{'author': bot, 'committer': bot,
+                  'message': 'ci: advance pin to ' + TIP[:12]},
+                 {'author': other, 'committer': bot,
+                  'message': 'ci: advance pin to ' + TIP[:12]}]
         cases = (
-            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml',), True,
-             'not every commit'),
+            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml',),
+             human_maxi, 'commit message does not match'),
+            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml',),
+             human_actor, 'not every commit'),
+            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml',),
+             mixed, 'not every commit'),
             ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml', 'human.txt'),
-             False, 'file'),
-            ('human', ('.github/workflows/review-gate.yml',), False, 'PR author'),
+             None, 'file set'),
+            ('human', ('.github/workflows/review-gate.yml',), None, 'PR author'),
         )
         for legacy in (False, True):
-            for author, paths, human_commit, reason in cases:
+            for author, paths, commits, reason in cases:
                 with self.subTest(legacy=legacy, reason=reason):
                     calls = self._retire(legacy=legacy, pr_author=author,
-                                         paths=paths, human_commit=human_commit)
+                                         paths=paths, commits=commits)
                     self.assertFalse(any(c[:2] == ['pr', 'close'] for c in calls))
                     comments = [c for c in calls if c[:2] == ['pr', 'comment']]
                     self.assertEqual(len(comments), 1)
                     self.assertIn(reason, comments[0][-1])
                     self.assertFalse(any('--delete-branch' in c for c in calls))
+
+    def test_leave_open_comment_is_not_duplicated(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                calls = self._retire(legacy=legacy, pr_author='human',
+                                     already_commented=True)
+                self.assertFalse(any(c[:2] == ['pr', 'close'] for c in calls))
+                self.assertFalse(any(c[:2] == ['pr', 'comment'] for c in calls))
 
 
 if __name__ == "__main__":
