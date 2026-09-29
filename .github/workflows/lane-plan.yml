@@ -131,9 +131,12 @@ jobs:
       - name: Detect credentials
         id: credentials
         if: github.actor != 'dependabot[bot]'
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
         shell: bash
         run: |
-          if [ -n "${{ secrets.APP_ID }}" ] && [ -n "${{ secrets.APP_PRIVATE_KEY }}" ]; then
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
             echo "has_credentials=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_credentials=false" >> "$GITHUB_OUTPUT"

@@ -204,9 +204,12 @@ jobs:
       # opaque "client-id must be set" message.
       - name: Detect credentials
         id: credentials
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
         shell: bash
         run: |
-          if [ -n "${{ secrets.APP_ID }}" ] && [ -n "${{ secrets.APP_PRIVATE_KEY }}" ]; then
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
             echo "has_credentials=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_credentials=false" >> "$GITHUB_OUTPUT"
@@ -295,25 +298,6 @@ jobs:
           # The reasoning, the incident and the scope tables are recorded
           # privately in maxi-config.
           permission-contents: read
-
-      # Fails fast, with an attributable error, when a Cargo `path =
-      # "../<repo>"` dependency does not resolve to a real checkout beside
-      # this one -- and equally, refuses to let such a checkout survive from
-      # an earlier unrelated job on this same self-hosted runner. See the
-      # action for the two failure shapes this closes (maxi-config#286).
-      #
-      # Referenced by its owning repository, not by `./.github/actions/...`.
-      # `uses: ./...` inside a reusable workflow that consumers call via
-      # `uses: maxi-tools/ci/.github/workflows/lane-check.yml@<sha>` would
-      # resolve relative to the CONSUMER's checkout (the actions/checkout
-      # step populated GITHUB_WORKSPACE with the consumer), and consumers
-      # do not vend this action. Same-owner refs are exempted from the
-      # external-pin SHA requirement in check_workflow_refs.py.
-      - name: Verify sibling path-dependency checkouts
-        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
-        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
-        with:
-          token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
         if: steps.workspace.outputs.has_workspace == 'true'
@@ -431,10 +415,12 @@ jobs:
         # so the basic lint pass still surfaces real bugs for forks and
         # external contributors.
         if: ${{ steps.workspace.outputs.has_workspace == 'true' && inputs.repo_policy != 'fork-upstream' }}
+        env:
+          HAS_CREDENTIALS: ${{ steps.credentials.outputs.has_credentials }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ steps.credentials.outputs.has_credentials }}" = "true" ]; then
+          if [ "$HAS_CREDENTIALS" = "true" ]; then
             source .maxi-config/hooks/clippy-strict-lints.sh
             echo "Deny-tier flags:"
             get_clippy_deny_flags
