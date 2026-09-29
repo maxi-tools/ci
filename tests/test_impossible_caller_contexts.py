@@ -95,10 +95,16 @@ CANDIDATE_SENTINELS = frozenset(
 
 
 def load_jobs(path: pathlib.Path) -> dict:
+    """Load the `jobs:` section of a workflow file as a dict.
+
+    A helper for the contract tests; raises ValueError if the file
+    is not a workflow-shaped YAML mapping.
+    """
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert isinstance(doc, dict) and "jobs" in doc, (
-        f"{path.name}: expected a top-level mapping with a `jobs:` section"
-    )
+    if not isinstance(doc, dict) or "jobs" not in doc:
+        raise ValueError(
+            f"{path.name}: expected a top-level mapping with a `jobs:` section"
+        )
     return doc["jobs"]
 
 
