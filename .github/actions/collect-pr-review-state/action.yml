@@ -99,7 +99,7 @@ runs:
                 pullRequest(number:$pr){
                   reviews(first:100,after:$endCursor){
                     pageInfo{hasNextPage endCursor}
-                    # `__typename` and `commit{oid}` are what the gate's
+                    # `__typename` and `commit{oid}` are what the gate
                     # approval path reads: `Bot` versus `User` decides whether
                     # the reviewer had to be on the trusted allowlist, and the
                     # commit decides whether the approval is of the revision
@@ -186,7 +186,7 @@ runs:
             author:  ($t[0][0].data.repository.pullRequest.author.login // null),
             isDraft: ($t[0][0].data.repository.pullRequest.isDraft // false),
             # The revision an approval has to be OF to count. Read from the
-            # same REST call the roster lookup below uses, so the gate's
+            # same REST call the roster lookup below uses, so the gate
             # head-anchored comparison and this field cannot disagree about
             # which commit "the head" is. A missing value is not defaulted
             # to an empty string: the gate treats a non-string as "no head
@@ -210,7 +210,7 @@ runs:
                            path:   (.comments.nodes[0].path // null),
                            url:    (.comments.nodes[0].url // null) } ],
             # `isBot` is GraphQL __typename == "Bot" -- the actor TYPE, not
-            # the login's spelling. The two do not agree in this org
+            # the login spelling. The two do not agree in this org
             # (`maxi-reviewer` arrives bare over GraphQL and `maxi-reviewer[bot]`
             # over REST), and the allowlist is only meaningful if the gate can
             # tell a bot from an account. `null` when the type could not be
