@@ -61,6 +61,7 @@ fails this test before it can ship.
 Run directly: `python3 tests/test_impossible_caller_contexts.py`.
 Run in CI: `self-check.yml`'s "Run the test suites" step.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -81,14 +82,16 @@ RUST_CI = ROOT / ".github/workflows/rust-ci.yml"
 #
 # `merge-gate` itself is intentionally NOT in this set: the aggregate
 # is what the ruleset is supposed to require.
-CANDIDATE_SENTINELS = frozenset({
-    "plan",
-    "check",
-    "test",
-    "package",
-    "sign-publish",
-    "release-verify",
-})
+CANDIDATE_SENTINELS = frozenset(
+    {
+        "plan",
+        "check",
+        "test",
+        "package",
+        "sign-publish",
+        "release-verify",
+    }
+)
 
 
 def load_jobs(path: pathlib.Path) -> dict:
@@ -219,9 +222,7 @@ class CallerLevelContextsAreSentinelsTest(unittest.TestCase):
         refactor cannot quietly introduce a caller-level name that
         looks safe but is the regression in disguise."""
         jobs = load_jobs(RUST_CI)
-        caller_names = {
-            f"merge-gate / {job}" for job in jobs if job != "merge-gate"
-        }
+        caller_names = {f"merge-gate / {job}" for job in jobs if job != "merge-gate"}
         # The aggregate itself is what the ruleset is supposed to
         # require -- this test names the regression class, not the
         # designed state. Caller-level names that pair with an actual
@@ -245,7 +246,8 @@ class CallerLevelContextsAreSentinelsTest(unittest.TestCase):
         `test_every_caller_job_is_a_documented_sentinel` already fails
         first."""
         self.assertGreater(
-            len(CANDIDATE_SENTINELS), 0,
+            len(CANDIDATE_SENTINELS),
+            0,
             "CANDIDATE_SENTINELS is empty: rust-ci.yml has no caller "
             "jobs to be checked.",
         )
