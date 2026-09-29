@@ -41,9 +41,9 @@ on:
         default: full
     secrets:
       APP_ID:
-        required: true
+        required: false
       APP_PRIVATE_KEY:
-        required: true
+        required: false
 
 permissions: {}
 
@@ -142,6 +142,28 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Required by the optional-secret contract from maxi-config#368: callers
+      # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
+      # public-only lanes) must still run cargo test on a public-only
+      # toolchain. The credential-dependent steps below this point are gated
+      # on has_credentials; cargo test --workspace --all-targets and the
+      # repo-local hook are not.
+      - name: Detect credentials
+        id: credentials
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.APP_ID }}" ] && [ -n "${{ secrets.APP_PRIVATE_KEY }}" ]; then
+            echo "has_credentials=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_credentials=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-test in credential-free mode (cargo test only, no private policy fetch)."
+            {
+              echo "## lane-test summary"
+              echo "- Lane: lane-test"
+              echo "- Credentials: absent; credential-free mode (no App-token mint, no private policy fetch)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
       # feature) declare them in ci/apt-packages.txt — one package per line,
       # '#' comments allowed. Absent file means no extra packages.
@@ -183,6 +205,11 @@ jobs:
           "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
 
       - name: Generate org repo token
+        # Skipped entirely in credential-free mode (#368). Forks and external
+        # contributors who did not forward APP_ID / APP_PRIVATE_KEY have no
+        # credentials to mint a token with, and the action refuses an empty
+        # app-id.
+        if: steps.credentials.outputs.has_credentials == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -225,7 +252,7 @@ jobs:
       # do not vend this action. Same-owner refs are exempted from the
       # external-pin SHA requirement in check_workflow_refs.py.
       - name: Verify sibling path-dependency checkouts
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -237,7 +264,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Fetch maxi-config rust-lane policy
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         # One implementation, in .github/actions/fetch-policy. This block
         # existed in four near-identical copies until #462, which is how #460
         # fixed a live bug in a file nothing runs. Its reasoning -- the
@@ -255,26 +282,26 @@ jobs:
             scripts/emit-runner-paths.sh
           token: ${{ steps.app-token.outputs.token }}
       - name: Expose installed macOS native build tools
-        if: steps.workspace.outputs.has_workspace == 'true' && runner.os == 'macOS'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' && runner.os == 'macOS'
         shell: bash
         run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
       - name: Verify installed Rust toolchain before cache restore
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
       - name: Cache Rust dependencies
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           prefix-key: v1-rust-no-bin
           cache-bin: false
 
       - name: Verify installed Rust toolchain after cache restore
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
       - name: Configure git for private deps
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -299,7 +326,7 @@ jobs:
           # connection parks `git remote-https` at 0% CPU indefinitely.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked
