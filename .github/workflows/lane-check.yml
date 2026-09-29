@@ -193,43 +193,13 @@ jobs:
 
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
       # feature) declare them in ci/apt-packages.txt — one package per line,
-      # '#' comments allowed. Absent file means no extra packages.
+      # '#' comments allowed. Absent file means no extra packages. The
+      # install logic lives in .github/actions/install-apt-packages and is
+      # shared with lane-test.yml and lane-package.yml; one implementation
+      # in one place is the deduplication that closes maxi-config#174.
       - name: Install repo-declared system packages
         if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          list="ci/apt-packages.txt"
-          [ -f "$list" ] || exit 0
-          packages="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$list" | xargs)"
-          [ -n "$packages" ] || exit 0
-
-          # Not every self-hosted Linux runner is Debian-family with a sudoer
-          # build user. Some run a declaratively-configured distribution with
-          # neither apt-get nor sudo, taking system libraries from the machine's
-          # own configuration instead — so hard-coding `sudo apt-get` failed
-          # every lane at provisioning with `sudo: command not found`, seconds
-          # in, before compiling anything.
-          if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::notice::No apt-get on this runner; expecting its image to provide: $packages"
-            exit 0
-          fi
-
-          # Root needs no sudo, and a non-root user without it cannot install.
-          # Saying so beats failing the lane over packages the image may
-          # already have.
-          elevate=()
-          if [ "$(id -u)" -ne 0 ]; then
-            if ! command -v sudo >/dev/null 2>&1; then
-              echo "::warning::Cannot install system packages (not root, no sudo); expecting this runner's image to provide: $packages"
-              exit 0
-            fi
-            elevate=(sudo)
-          fi
-
-          "${elevate[@]}" apt-get update
-          # shellcheck disable=SC2086
-          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
+        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
 
       - name: Generate org repo token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -259,6 +229,25 @@ jobs:
           # The reasoning, the incident and the scope tables are recorded
           # privately in maxi-config.
           permission-contents: read
+
+      # Fails fast, with an attributable error, when a Cargo `path =
+      # "../<repo>"` dependency does not resolve to a real checkout beside
+      # this one -- and equally, refuses to let such a checkout survive from
+      # an earlier unrelated job on this same self-hosted runner. See the
+      # action for the two failure shapes this closes (maxi-config#286).
+      #
+      # Referenced by its owning repository, not by `./.github/actions/...`.
+      # `uses: ./...` inside a reusable workflow that consumers call via
+      # `uses: maxi-tools/ci/.github/workflows/lane-check.yml@<sha>` would
+      # resolve relative to the CONSUMER's checkout (the actions/checkout
+      # step populated GITHUB_WORKSPACE with the consumer), and consumers
+      # do not vend this action. Same-owner refs are exempted from the
+      # external-pin SHA requirement in check_workflow_refs.py.
+      - name: Verify sibling path-dependency checkouts
+        if: steps.workspace.outputs.has_workspace == 'true'
+        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
         if: steps.workspace.outputs.has_workspace == 'true'

@@ -3,7 +3,9 @@
 
 Two conditions, both required:
   1. ZERO unresolved review threads.
-  2. At least one review from somebody who is NOT the pull request author.
+  2. At least one reviewer that is not the pull request author: an APPROVAL of
+     the current head from a trusted review bot or from a non-bot account, or
+     a counted review from a reviewer the roster assigned.
 
 Either condition can be judged on its own via --only, so each can be reported
 as its OWN check whose name states the action it wants. One check covering both
@@ -17,6 +19,31 @@ Condition 2 is not the same as 「has reviews」. Every agent lane in this org
 authenticates as the same account, so a PR can accumulate a pile of reviews
 that are all self-review; counting reviews would be satisfied by the author
 reviewing their own work. Counting DISTINCT NON-AUTHOR reviewers is not.
+
+Condition 2 has TWO routes, and either one satisfies it:
+
+  A. AN APPROVAL OF THE CURRENT HEAD. An APPROVED review whose commit is the
+     pull request's head SHA, from either a review bot on the trusted
+     allowlist (TRUSTED_REVIEW_BOTS -- one list, see below) or from any
+     account that is not a bot and not the author. (Maxi decision 2026-09-28:
+     bots count if they approve.) Route A does not consult the roster, and
+     that is the point: the allowlist is the trust decision for a bot, so a
+     trusted reviewer is credited even when the selector spelled its login
+     differently.
+
+  B. THE ROSTER'S ASSIGNED REVIEWERS. Unchanged: when the selector published a
+     non-empty `asked` set, a counted review from one of them satisfies.
+
+Which review goes to which route is not a detail. An APPROVED review belongs to
+route A and ONLY to route A, which is what makes "an approval of a superseded
+revision does nothing" true even for a reviewer the roster asked for. Every
+other counted state belongs to route B, which is deliberately commit-blind --
+re-anchoring route B would red the entire org, because a comment is the only
+thing reviewers in this fleet post (measured 2026-09-28: 3001 COMMENTED, 5
+CHANGES_REQUESTED, 0 APPROVED across 604 open pull requests in 19
+repositories). That measurement is also why route B survives route A: a
+condition satisfied only by an approval would be red on every pull request in
+the fleet, which is the opposite of what the decision is for.
 
 Condition 2 has one escape hatch a human can reach for: the
 `review-infra-unavailable` label, for when no reviewer can be summoned at all.
@@ -40,6 +67,95 @@ import sys
 # A review in these states is not a review signal: PENDING has not been
 # submitted, and DISMISSED has been explicitly retracted.
 COUNTED_STATES = {'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'}
+
+#: The review bots whose APPROVAL satisfies condition 2, and the ONLY such list
+#: in the fleet. (Maxi decision, 2026-09-28: bots count if they approve.)
+#:
+#: ONE PLACE, deliberately. The trust decision used to be spread across
+#: whatever the roster happened to spell (`REVIEWER_TABLE` in maxi-config's
+#: maxi-review/select-roster.py, mapped through LABEL_TO_LOGIN below) plus each
+#: reviewer's own idea of its login. When those disagree the gate silently
+#: discards a real review: measured on maxi-core#4786 (2026-09-28), the roster
+#: asked for `qlty`, the review arrived as `qltysh[bot]`, and
+#: `review-gate/non-author-review` was red on a PR whose assigned reviewer had
+#: posted. A list here, consumed by the approval path, is what stops that class
+#: of mismatch from being a gate failure. Nothing else may carry a second copy;
+#: a caller that needs "is this reviewer trusted" imports this.
+#:
+#: Entries are bare slugs -- the spelling GraphQL returns for a Bot actor,
+#: which is what the collector reads. `is_trusted_review_bot` strips the
+#: `[bot]` suffix on both sides, so the REST spelling matches the same row.
+#:
+#: What is NOT here matters as much: `github-actions`, `github-advanced-security` and
+#: `maxi-tools-auth` are automation that posts to review threads, not reviewers
+#: that read a diff. `github-actions[bot]` in particular submits EMPTY
+#: COMMENTED reviews on this org's PRs, and teaching the gate to credit those
+#: as a look is the one thing the quiet-PR design notes rule out by name.
+TRUSTED_REVIEW_BOTS = frozenset({
+    # The roster's reviewers, via LABEL_TO_LOGIN below.
+    'maxi-reviewer',
+    'coderabbitai',
+    'copilot-pull-request-reviewer',
+    'claude-review',
+    'cubic-dev-ai',
+    'codacy-production',
+    'qodana',
+    'gemini-review',
+    # qlty, under BOTH spellings: the roster's label is `qlty` and the table
+    # maps it to `qlty[bot]`, while the reviews in this fleet arrive as
+    # `qltysh[bot]` (maxi-core#4786, above). ci#64 fixes the roster-side
+    # mapping; the approval path must not depend on which spelling an
+    # operator's roster happens to carry in the meantime.
+    'qlty',
+    'qltysh',
+    # The local coder-model reviewer (qwen-coder-review) and the Codex
+    # connector (chatgpt-codex-connector) both submit real reviews on this
+    # org's pull requests; neither is in the roster table yet.
+    'qwen-coder-review',
+    'chatgpt-codex-connector',
+})
+
+
+#: GitHub's REST spellings for Bot actors carry the suffix `[bot]`, while
+#: GraphQL returns the bare slug. Both spellings must reach the same answer
+#: on either side of the trust check, so every strip / endswith goes through
+#: this single constant.
+BOT_SUFFIX = '[bot]'
+
+
+def _strip_bot_suffix(login):
+    """Login without the `[bot]` suffix, or the login unchanged if it lacks one."""
+    return login.removesuffix(BOT_SUFFIX) if isinstance(login, str) else login
+
+
+def is_trusted_review_bot(login):
+    """Is this login a review bot the gate credits without the roster?
+
+    Bracketed and bare spellings both answer yes for the same bot: the
+    collector reads GraphQL, which returns a Bot actor's bare slug, while a
+    REST port would return `login[bot]`.
+    """
+    return isinstance(login, str) and _strip_bot_suffix(login) in TRUSTED_REVIEW_BOTS
+
+
+def is_bot_actor(login, declared):
+    """Is the author of this review a bot? True, False, or None for unknown.
+
+    `declared` is the collector's own reading -- GraphQL's `__typename`, i.e.
+    `Bot` versus `User`/`Organization` -- and is authoritative when present.
+
+    When it is absent the login's spelling decides, and only in ONE direction:
+    a bracketed `[bot]` login is a bot, and a bare slug is UNKNOWN, not human.
+    The unknown case must not fall through to "a human approved this": the
+    allowlist is what makes a bot's approval trustworthy, and an unreadable
+    actor type read as a human would hand every non-allowlisted automation the
+    path the allowlist exists to gate.
+    """
+    if isinstance(declared, bool):
+        return declared
+    if isinstance(login, str) and login.endswith(BOT_SUFFIX):
+        return True
+    return None
 
 # Head-branch prefix the maxi-config fan-out opens its pull requests on --
 # $sync_branch_prefix in maxi-config's scripts/sync-maxi-review.sh, which names
@@ -170,6 +286,14 @@ REVIEW_INFRA_LABEL = 'review-infra-unavailable'
 WAIVED_PREFIX = 'WAIVED:'
 
 
+#: The second route to condition 2, said once so the two FAIL branches cannot
+#: describe it differently. Both a human reading the log and a triage worker
+#: reading an `::error::` annotation get the same sentence.
+_APPROVAL_HELP = ('  An APPROVED review of this head SHA also satisfies this check:'
+                  ' from a review bot on the trusted allowlist, or from a human'
+                  ' account that is not the author.')
+
+
 #: The roster the maxi-review selector publishes for every pull request, as a
 #: commit status with context `review-roster`. The selector is the
 #: generalisation of the fan-out bypass da0941c landed: instead of one
@@ -286,7 +410,7 @@ def roster_logins(asked):
     """
     logins = set()
     for label in asked:
-        bare = label.removesuffix('[bot]')
+        bare = _strip_bot_suffix(label)
         login = LABEL_TO_LOGIN.get(bare)
         if login is None:
             # A label that already IS a login still resolves: the roster
@@ -294,14 +418,14 @@ def roster_logins(asked):
             # publisher could spell the login, and refusing a name the
             # table itself uses would fail the gate on a roster that
             # named its reviewer correctly.
-            if bare in {value.removesuffix('[bot]') for value in LABEL_TO_LOGIN.values()}:
+            if bare in {_strip_bot_suffix(value) for value in LABEL_TO_LOGIN.values()}:
                 login = bare
             else:
                 raise Malformed(
                     'review-roster asked for ' + repr(label)
                     + ', which is not a known reviewer label'
                 )
-        logins.add(login.removesuffix('[bot]'))
+        logins.add(_strip_bot_suffix(login))
     return logins
 
 
@@ -531,7 +655,26 @@ def evaluate(doc, only=ONLY_ALL):
             unresolved.append(th)
 
     # --- condition 2: a non-author reviewer -------------------------------
+    # Two routes satisfy it, and a review belongs to exactly ONE of them:
+    #
+    #   route A (an APPROVAL) is per-reviewer and is a claim about a
+    #     REVISION, so it is only credited when the commit it names is the
+    #     pull request's current head;
+    #   route B (a reviewer LOOKED) is an assignment, and is credited from
+    #     the roster exactly as before -- commit-blind, because a comment is
+    #     what every reviewer in this fleet posts and re-anchoring it would
+    #     red the whole org (measured 2026-09-28: 3001 COMMENTED, 5
+    #     CHANGES_REQUESTED, 0 APPROVED across 604 open pull requests).
+    #
+    # Keeping the two apart is what makes "an approval at a stale head does
+    # nothing" true even for a reviewer the roster asked for: an APPROVED
+    # review is route A's business, so it is never credited by route B, and
+    # an approval that is not of the current head satisfies neither.
     reviewers = []
+    approvals = []
+    head_sha = doc.get('headSha')
+    head_known = isinstance(head_sha, str) and bool(head_sha.strip())
+
     for i, rv in enumerate(reviews):
         _require(isinstance(rv, dict), 'review ' + str(i) + ' is not an object')
         state = rv.get('state')
@@ -545,19 +688,65 @@ def evaluate(doc, only=ONLY_ALL):
             continue
         if who == author:
             continue
-        if who not in reviewers:
-            reviewers.append(who)
 
-    # Roster narrows condition 2 to the selectors asked set, when one is
-    # present AND non-empty. An absent roster or an empty asked list both fall
-    # back to the pre-roster rule: any non-author review suffices. A `skipped`
-    # reviewer that happens to run (e.g. a dashboard-only bot whose lane is
-    # not gated by the roster) STILL appears in `reviewers` -- the listing is
-    # who actually reviewed, not the gate's required set -- but it does NOT
-    # end up in `covered`, because the asked set is what the gate waits for.
-    # That is the difference between "this bot was deliberately skipped" and
-    # "this bot silently failed": the roster says the first, the absence of
-    # a status says the second, and the gate honours whichever signal it sees.
+        if state.upper() != 'APPROVED':
+            # Route B: this reviewer LOOKED. Unchanged from before route A
+            # existed, and deliberately commit-blind -- see the note above.
+            if who not in reviewers:
+                reviewers.append(who)
+            continue
+
+        # --- route A: this reviewer APPROVED ------------------------------
+        if not head_known:
+            # No head SHA in the payload, so an approval cannot be PLACED on
+            # the commit that would merge. Not credited: "approve, and we
+            # hope it was the current code" is the reading that lets an
+            # approval of a superseded revision carry a merge.
+            continue
+        commit = rv.get('commit')
+        if not isinstance(commit, str) or commit != head_sha:
+            # An approval of an older commit is an approval of code that is
+            # no longer in the pull request. This is the case that used to
+            # pass silently: the state was counted and the commit ignored.
+            # Route B does not pick it up either, precisely so that a stale
+            # approval cannot be credited as "the asked reviewer looked".
+            continue
+        if is_trusted_review_bot(who):
+            kind = 'trusted review bot'
+        elif is_bot_actor(who, rv.get('isBot')) is False:
+            kind = 'non-author account'
+        else:
+            # A bot the allowlist does not carry, or a reviewer whose actor
+            # type could not be read. Neither is ours to credit: the
+            # allowlist IS the trust decision for a bot.
+            continue
+        if (who, kind) not in approvals:
+            approvals.append((who, kind))
+
+    # Route B narrows to the selector's asked set when a roster is present AND
+    # non-empty. A `skipped` reviewer that happens to run (e.g. a
+    # dashboard-only bot whose lane is not gated by the roster) STILL appears
+    # in `reviewers` -- the listing is who actually reviewed, not the gate's
+    # required set -- but it does NOT end up in `covered`, because the asked
+    # set is what the gate waits for. That is the difference between "this bot
+    # was deliberately skipped" and "this bot silently failed": the roster
+    # says the first, the absence of a status says the second, and the gate
+    # honours whichever signal it sees.
+    #
+    # With NO roster the fallback used to be "any non-author review". It is
+    # now "a review from one of the review bots", because the two cases it
+    # actually decided were decided wrongly: a review from an account that is
+    # not a reviewer at all -- the org's own app identities, `github-actions`,
+    # project board automation -- satisfied a condition whose stated question
+    # is whether anyone reviewed the change. Measured 2026-09-28 over 101 open
+    # pull requests in six repositories: ten were relying on the absent-roster
+    # fallback, and three of those ten (`maxi-core#4792`, `maxi-ml#2660`,
+    # `maxi-dist#368`) were green on nothing but a review from
+    # `maxi-tools-auth[bot]`, the app identity that opens the pull request. The
+    # other seven stay green here: their reviewer is a review bot. A human who
+    # reviewed in that window is not left out either -- their APPROVAL
+    # satisfies route A, which is the stronger statement the card asks for.
+    #
     # `active_roster` is the roster dict that applies, or None. Computed
     # once and read by every branch below, so a typo in one branch does
     # not silently desync from the others.
@@ -571,11 +760,14 @@ def evaluate(doc, only=ONLY_ALL):
         # naming the label, rather than matching nothing.
         asked_logins = roster_logins(active_roster['asked'])
         covered = [name for name in reviewers
-                   if name.removesuffix('[bot]') in asked_logins]
+                   if _strip_bot_suffix(name) in asked_logins]
     else:
         active_roster = None
         asked_logins = None
-        covered = list(reviewers)
+        # The absent-roster fallback: the review bots only. See the note above
+        # the branch -- the accounts this used to credit included the org's own
+        # app identities, which never review anything.
+        covered = [name for name in reviewers if is_trusted_review_bot(name)]
 
     ok = True
 
@@ -597,7 +789,7 @@ def evaluate(doc, only=ONLY_ALL):
         lines.append('ok: no unresolved review threads (' + str(len(threads)) + ' total)')
 
     if (only in (ONLY_ALL, ONLY_REVIEWER)
-            and not covered and not dependabot and not infra_waiver):
+            and not covered and not approvals and not dependabot and not infra_waiver):
         ok = False
         self_reviews = sum(
             1 for rv in reviews
@@ -617,26 +809,37 @@ def evaluate(doc, only=ONLY_ALL):
             lines.append('FAIL: roster asked for ' +
                          ', '.join(sorted(active_roster['asked'])) +
                          ' but none of them has reviewed.')
-            lines.append('  No human approval is wanted; a COMMENTED review from any')
-            lines.append('  reviewer on the asked list satisfies this. Pushing a')
-            lines.append('  commit is usually enough to summon them.')
+            lines.append('  A COMMENTED review from any reviewer on the asked list')
+            lines.append('  satisfies this; pushing a commit is usually enough to')
+            lines.append('  summon them.')
+            lines.append(_APPROVAL_HELP)
         else:
             lines.append('FAIL: no review from anyone other than the author (' + author + ').')
             if self_reviews:
                 lines.append('  ' + str(self_reviews) + ' review(s) found, but all are by the author.')
                 lines.append('  Self-review is not review. Every agent lane in this org')
                 lines.append('  authenticates as the same account, so this is the common case.')
+            elif reviewers:
+                # Reviews exist, but none from an account that reviews. The
+                # accounts that land here are the org's own automation -- the
+                # app identity that opens the pull request, the project board
+                # bot -- whose review says nothing about the change.
+                lines.append('  ' + str(len(reviewers)) + ' non-author review(s) found (' +
+                             ', '.join(sorted(reviewers)) + '), but none is from a')
+                lines.append('  review bot: a review from an account that does not review')
+                lines.append('  changes is not a review of this change.')
             else:
                 lines.append('  No reviews at all. This does NOT need a human approval:')
                 lines.append('  a COMMENTED review from any review bot satisfies it. Pushing')
                 lines.append('  a commit is usually enough to summon them.')
-    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered and dependabot:
+            lines.append(_APPROVAL_HELP)
+    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered and not approvals and dependabot:
         # Dependabot is checked before the label so a Dependabot PR that also
         # carries the label is still reported by its structural reason, which
         # is the true one and needs no human to have asserted anything.
         lines.append('ok: dependabot pull request - the review lanes cannot run '
                      'without Dependabot secrets, so no reviewer can be summoned')
-    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered:
+    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered and not approvals:
         # Reached only under the infrastructure waiver -- the branches above own
         # every other reviewer-less case.
         lines.append(WAIVED_PREFIX + ' ' + REVIEW_INFRA_LABEL
@@ -649,9 +852,21 @@ def evaluate(doc, only=ONLY_ALL):
         # confuse a reader who reads "X reviewed" without the roster context
         # and assumes X was required. The roster context goes on the line
         # below.
-        listed = sorted(covered) if asked_logins is not None else sorted(reviewers)
-        lines.append('ok: reviewed by ' + str(len(listed)) + ' non-author reviewer(s): '
-                     + ', '.join(listed))
+        if covered:
+            listed = sorted(covered) if asked_logins is not None else sorted(reviewers)
+            lines.append('ok: reviewed by ' + str(len(listed)) + ' non-author reviewer(s): '
+                         + ', '.join(listed))
+        else:
+            # Satisfied by the approval path alone. Naming the reviewer and
+            # WHY it was trusted is the difference between a reader who can
+            # re-derive the verdict and one who has to trust it: a bot that
+            # says "I reviewed this" is not the same evidence as a human
+            # account that approved, and the log should not blur the two.
+            lines.append('ok: approved at this head by '
+                         + ', '.join(sorted(who for who, _ in approvals)))
+        for who, kind in sorted(approvals):
+            lines.append('  ' + who + ' approved commit ' + str(head_sha)[:12]
+                         + ' (' + kind + ')')
         if asked_logins is not None:
             # Surface the roster shape on every passing line: a reader of the
             # log who can see CodeRabbit skipped it knows the gate was not
