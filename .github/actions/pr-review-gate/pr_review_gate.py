@@ -116,6 +116,18 @@ TRUSTED_REVIEW_BOTS = frozenset({
 })
 
 
+#: GitHub's REST spellings for Bot actors carry the suffix `[bot]`, while
+#: GraphQL returns the bare slug. Both spellings must reach the same answer
+#: on either side of the trust check, so every strip / endswith goes through
+#: this single constant.
+BOT_SUFFIX = '[bot]'
+
+
+def _strip_bot_suffix(login):
+    """Login without the `[bot]` suffix, or the login unchanged if it lacks one."""
+    return login.removesuffix(BOT_SUFFIX) if isinstance(login, str) else login
+
+
 def is_trusted_review_bot(login):
     """Is this login a review bot the gate credits without the roster?
 
@@ -123,7 +135,7 @@ def is_trusted_review_bot(login):
     collector reads GraphQL, which returns a Bot actor's bare slug, while a
     REST port would return `login[bot]`.
     """
-    return isinstance(login, str) and login.removesuffix('[bot]') in TRUSTED_REVIEW_BOTS
+    return isinstance(login, str) and _strip_bot_suffix(login) in TRUSTED_REVIEW_BOTS
 
 
 def is_bot_actor(login, declared):
@@ -141,7 +153,7 @@ def is_bot_actor(login, declared):
     """
     if isinstance(declared, bool):
         return declared
-    if isinstance(login, str) and login.endswith('[bot]'):
+    if isinstance(login, str) and login.endswith(BOT_SUFFIX):
         return True
     return None
 
@@ -398,7 +410,7 @@ def roster_logins(asked):
     """
     logins = set()
     for label in asked:
-        bare = label.removesuffix('[bot]')
+        bare = _strip_bot_suffix(label)
         login = LABEL_TO_LOGIN.get(bare)
         if login is None:
             # A label that already IS a login still resolves: the roster
@@ -406,14 +418,14 @@ def roster_logins(asked):
             # publisher could spell the login, and refusing a name the
             # table itself uses would fail the gate on a roster that
             # named its reviewer correctly.
-            if bare in {value.removesuffix('[bot]') for value in LABEL_TO_LOGIN.values()}:
+            if bare in {_strip_bot_suffix(value) for value in LABEL_TO_LOGIN.values()}:
                 login = bare
             else:
                 raise Malformed(
                     'review-roster asked for ' + repr(label)
                     + ', which is not a known reviewer label'
                 )
-        logins.add(login.removesuffix('[bot]'))
+        logins.add(_strip_bot_suffix(login))
     return logins
 
 
@@ -748,7 +760,7 @@ def evaluate(doc, only=ONLY_ALL):
         # naming the label, rather than matching nothing.
         asked_logins = roster_logins(active_roster['asked'])
         covered = [name for name in reviewers
-                   if name.removesuffix('[bot]') in asked_logins]
+                   if _strip_bot_suffix(name) in asked_logins]
     else:
         active_roster = None
         asked_logins = None

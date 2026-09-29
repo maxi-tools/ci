@@ -37,6 +37,7 @@ the roster path, which is the assignment, not an approval.
 
 Run directly: `python3 tests/test_trusted_bot_approval.py`.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -110,10 +111,12 @@ class TheDecisionCases(unittest.TestCase):
         # comes from cubic. It counts anyway: the allowlist is the trust
         # decision for a bot, so the gate does not depend on the selector
         # having spelled this reviewer's name.
-        ok, text = verdict(payload(
-            [review("cubic-dev-ai", "APPROVED", is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("cubic-dev-ai", "APPROVED", is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertTrue(ok, text)
         self.assertIn("cubic-dev-ai", text)
         self.assertIn("trusted review bot", text)
@@ -127,19 +130,23 @@ class TheDecisionCases(unittest.TestCase):
         # for it, which is the case this decision is about: a bot commenting
         # is not a bot approving, and being a trusted reviewer does not by
         # itself entitle it to satisfy a condition it was not assigned.
-        ok, text = verdict(payload(
-            [review("cubic-dev-ai", "COMMENTED", is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("cubic-dev-ai", "COMMENTED", is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertFalse(ok, text)
         self.assertIn("FAIL", text)
 
     def test_the_authors_own_approval_does_not_satisfy_the_gate(self):
         # Every agent lane in this org authenticates as the same account, so
         # self-review is the common case rather than an edge one.
-        ok, text = verdict(payload(
-            [review(AUTHOR, "APPROVED", is_bot=False)],
-        ))
+        ok, text = verdict(
+            payload(
+                [review(AUTHOR, "APPROVED", is_bot=False)],
+            )
+        )
         self.assertFalse(ok, text)
         self.assertIn("no review from anyone other than the author", text)
 
@@ -152,10 +159,12 @@ class TheDecisionCases(unittest.TestCase):
         # roster route, so being assigned does not rescue it: the roster
         # route answers "did an assigned reviewer look", and an approval
         # that names another revision is not an answer to that either.
-        ok, text = verdict(payload(
-            [review("maxi-reviewer", "APPROVED", commit=OTHER_HEAD, is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("maxi-reviewer", "APPROVED", commit=OTHER_HEAD, is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertFalse(ok, text)
         self.assertIn("FAIL", text)
 
@@ -164,19 +173,23 @@ class TheDecisionCases(unittest.TestCase):
         # payload shape, only the commit differs. Without this pair the
         # stale-head test could pass because the reviewer is not credited
         # for some unrelated reason.
-        ok, text = verdict(payload(
-            [review("maxi-reviewer", "APPROVED", commit=HEAD, is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("maxi-reviewer", "APPROVED", commit=HEAD, is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertTrue(ok, text)
 
     def test_a_human_approval_at_head_satisfies_a_rostered_pull_request(self):
         # The roster only ever names bots, so before this path a human
         # approval could not satisfy a rostered pull request at all.
-        ok, text = verdict(payload(
-            [review("some-human", "APPROVED", is_bot=False)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("some-human", "APPROVED", is_bot=False)],
+                roster=roster(),
+            )
+        )
         self.assertTrue(ok, text)
         self.assertIn("non-author account", text)
 
@@ -184,9 +197,11 @@ class TheDecisionCases(unittest.TestCase):
         # A roster status is published per head SHA and is absent in the
         # window before the selector runs. The approval path is not a
         # function of it.
-        ok, text = verdict(payload(
-            [review("codacy-production", "APPROVED", is_bot=True)],
-        ))
+        ok, text = verdict(
+            payload(
+                [review("codacy-production", "APPROVED", is_bot=True)],
+            )
+        )
         self.assertTrue(ok, text)
 
 
@@ -197,10 +212,12 @@ class TheAllowlistIsDecisive(unittest.TestCase):
         # `some-other-review-bot` reads diffs as well as any of them, and
         # the list is what says so. An allowlist that credited anything
         # that looked like a bot would not be an allowlist.
-        ok, text = verdict(payload(
-            [review("some-other-review-bot", "APPROVED", is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("some-other-review-bot", "APPROVED", is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertFalse(ok, text)
 
     def test_an_unreadable_actor_type_is_not_read_as_a_human(self):
@@ -209,16 +226,24 @@ class TheAllowlistIsDecisive(unittest.TestCase):
         # bare slug is UNKNOWN -- and unknown must not fall through to "a
         # human approved this". Otherwise every non-allowlisted automation
         # reaches the path the allowlist exists to gate.
-        doc = payload([{"author": "some-other-review-bot",
-                        "state": "APPROVED",
-                        "commit": HEAD}], roster=roster())
+        doc = payload(
+            [{"author": "some-other-review-bot", "state": "APPROVED", "commit": HEAD}],
+            roster=roster(),
+        )
         ok, text = verdict(doc)
         self.assertFalse(ok, text)
 
     def test_a_bracketed_bot_login_is_still_a_bot_without_the_field(self):
-        doc = payload([{"author": "some-other-review-bot[bot]",
-                        "state": "APPROVED",
-                        "commit": HEAD}], roster=roster())
+        doc = payload(
+            [
+                {
+                    "author": "some-other-review-bot[bot]",
+                    "state": "APPROVED",
+                    "commit": HEAD,
+                }
+            ],
+            roster=roster(),
+        )
         ok, text = verdict(doc)
         self.assertFalse(ok, text)
 
@@ -226,9 +251,10 @@ class TheAllowlistIsDecisive(unittest.TestCase):
         # A port of the collector to REST would spell the same actor
         # `maxi-reviewer[bot]`, and it must not read as a human approval
         # for a reason nobody can see.
-        doc = payload([{"author": "maxi-reviewer[bot]",
-                        "state": "APPROVED",
-                        "commit": HEAD}], roster=roster())
+        doc = payload(
+            [{"author": "maxi-reviewer[bot]", "state": "APPROVED", "commit": HEAD}],
+            roster=roster(),
+        )
         ok, text = verdict(doc)
         self.assertTrue(ok, text)
         self.assertIn("trusted review bot", text)
@@ -246,7 +272,8 @@ class TheAllowlistIsDecisive(unittest.TestCase):
                     gate.is_trusted_review_bot(login),
                     label + " maps to " + login + ", which TRUSTED_REVIEW_BOTS"
                     " does not carry; a review from it could be asked for and"
-                    " never credited")
+                    " never credited",
+                )
 
     def test_the_allowlist_is_defined_in_exactly_one_place(self):
         # "Keep the allowlist in one place" is only true while there is one
@@ -264,8 +291,8 @@ class TheAllowlistIsDecisive(unittest.TestCase):
         self.assertEqual(
             carriers,
             [".github/actions/pr-review-gate/pr_review_gate.py"],
-            "something other than the gate defines the trusted-review-bot"
-            " allowlist")
+            "something other than the gate defines the trusted-review-bot allowlist",
+        )
 
 
 class TheRosterPathIsUnchanged(unittest.TestCase):
@@ -278,10 +305,12 @@ class TheRosterPathIsUnchanged(unittest.TestCase):
         # route is the only one that passes today. Removing it would red
         # `review-gate/non-author-review` fleet-wide, which is not what a
         # decision about bots' approvals is for.
-        ok, text = verdict(payload(
-            [review("maxi-reviewer", "COMMENTED", is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("maxi-reviewer", "COMMENTED", is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertTrue(ok, text)
         self.assertIn("reviewed by 1 non-author reviewer(s)", text)
         self.assertIn("roster=present", text)
@@ -289,10 +318,12 @@ class TheRosterPathIsUnchanged(unittest.TestCase):
     def test_a_reviewer_the_roster_did_not_ask_for_still_does_not_satisfy_it(self):
         # The other half of the same rule: the roster narrows the set, and
         # `cubic` was skipped on this pull request.
-        ok, text = verdict(payload(
-            [review("cubic-dev-ai", "COMMENTED", is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("cubic-dev-ai", "COMMENTED", is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertFalse(ok, text)
         self.assertIn("roster asked for", text)
 
@@ -300,18 +331,25 @@ class TheRosterPathIsUnchanged(unittest.TestCase):
         # Both routes can hold at once. The verdict says who approved AND
         # keeps the roster line, so a reader sees the case it actually was
         # rather than whichever branch was checked first.
-        ok, text = verdict(payload(
-            [review("maxi-reviewer", "APPROVED", is_bot=True)],
-            roster=roster(),
-        ))
+        ok, text = verdict(
+            payload(
+                [review("maxi-reviewer", "APPROVED", is_bot=True)],
+                roster=roster(),
+            )
+        )
         self.assertTrue(ok, text)
         self.assertIn("maxi-reviewer approved commit", text)
 
     def test_the_threads_verdict_is_untouched_by_an_approval(self):
         doc = payload([review("maxi-reviewer", "APPROVED", is_bot=True)])
-        doc["threads"] = [{"isResolved": False, "path": "a.rs",
-                           "url": "https://example.invalid/1",
-                           "author": "coderabbitai"}]
+        doc["threads"] = [
+            {
+                "isResolved": False,
+                "path": "a.rs",
+                "url": "https://example.invalid/1",
+                "author": "coderabbitai",
+            }
+        ]
         ok, lines = gate.evaluate(doc, only=gate.ONLY_THREADS)
         self.assertFalse(ok)
         self.assertIn("unresolved review thread", "\n".join(lines))
@@ -331,15 +369,19 @@ class TheAbsentRosterFallback(unittest.TestCase):
     """
 
     def test_a_review_bot_still_satisfies_it(self):
-        ok, text = verdict(payload(
-            [review("maxi-reviewer", "COMMENTED", is_bot=True)],
-        ))
+        ok, text = verdict(
+            payload(
+                [review("maxi-reviewer", "COMMENTED", is_bot=True)],
+            )
+        )
         self.assertTrue(ok, text)
 
     def test_an_app_identity_does_not(self):
-        ok, text = verdict(payload(
-            [review("maxi-tools-auth[bot]", "COMMENTED", is_bot=True)],
-        ))
+        ok, text = verdict(
+            payload(
+                [review("maxi-tools-auth[bot]", "COMMENTED", is_bot=True)],
+            )
+        )
         self.assertFalse(ok, text)
         self.assertIn("none is from a", text)
         self.assertIn("maxi-tools-auth[bot]", text)
@@ -348,15 +390,19 @@ class TheAbsentRosterFallback(unittest.TestCase):
         # The org's own policy for this bot, stated elsewhere in the fleet:
         # an empty `github-actions` review must not be taught to the gate as
         # a look. This is where that policy is enforced.
-        ok, text = verdict(payload(
-            [review("github-actions[bot]", "COMMENTED", is_bot=True)],
-        ))
+        ok, text = verdict(
+            payload(
+                [review("github-actions[bot]", "COMMENTED", is_bot=True)],
+            )
+        )
         self.assertFalse(ok, text)
 
     def test_a_human_approval_still_satisfies_it(self):
-        ok, text = verdict(payload(
-            [review("some-human", "APPROVED", is_bot=False)],
-        ))
+        ok, text = verdict(
+            payload(
+                [review("some-human", "APPROVED", is_bot=False)],
+            )
+        )
         self.assertTrue(ok, text)
 
 
@@ -370,15 +416,18 @@ class FailureSaysHowToFixIt(unittest.TestCase):
         # No head to compare against is not a licence to assume the
         # approval was of the current revision. The condition stays
         # unsatisfied, which is the safe direction.
-        doc = payload([review("maxi-reviewer", "APPROVED", is_bot=True)],
-                      roster=roster())
+        doc = payload(
+            [review("maxi-reviewer", "APPROVED", is_bot=True)], roster=roster()
+        )
         del doc["headSha"]
         ok, text = verdict(doc)
         self.assertFalse(ok, text)
 
     def test_a_review_with_no_commit_credits_no_approval(self):
-        doc = payload([{"author": "maxi-reviewer", "state": "APPROVED",
-                        "isBot": True}], roster=roster())
+        doc = payload(
+            [{"author": "maxi-reviewer", "state": "APPROVED", "isBot": True}],
+            roster=roster(),
+        )
         ok, text = verdict(doc)
         self.assertFalse(ok, text)
 
@@ -391,7 +440,7 @@ def _payload_program():
     # follows `--arg head_sha "$HEAD_SHA"`.
     open_quote = text.index("'", text.index('"$HEAD_SHA"', start))
     end = text.index("' > payload.json", start)
-    return text[open_quote + 1:end]
+    return text[open_quote + 1 : end]
 
 
 class TheCollectorCarriesTheEvidence(unittest.TestCase):
@@ -404,19 +453,60 @@ class TheCollectorCarriesTheEvidence(unittest.TestCase):
 
     def test_the_payload_program_emits_head_sha_commit_and_is_bot(self):
         if shutil.which("jq") is None:
-            self.skipTest("jq is not on PATH; the program is run, not read,"
-                          " and reading it is what this test refuses to do")
-        threads = [{"data": {"repository": {"pullRequest": {
-            "author": {"login": AUTHOR}, "isDraft": False,
-            "headRefName": "wt/x", "labels": {"nodes": []},
-            "reviewThreads": {"nodes": []}}}}}]
-        reviews = [{"data": {"repository": {"pullRequest": {"reviews": {"nodes": [
-            {"author": {"login": "maxi-reviewer", "__typename": "Bot"},
-             "state": "APPROVED", "commit": {"oid": HEAD}},
-            {"author": {"login": AUTHOR, "__typename": "User"},
-             "state": "COMMENTED", "commit": {"oid": HEAD}},
-            {"author": None, "state": "PENDING", "commit": None},
-        ]}}}}}]
+            self.skipTest(
+                "jq is not on PATH; the program is run, not read,"
+                " and reading it is what this test refuses to do"
+            )
+        threads = [
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "author": {"login": AUTHOR},
+                            "isDraft": False,
+                            "headRefName": "wt/x",
+                            "labels": {"nodes": []},
+                            "reviewThreads": {"nodes": []},
+                        }
+                    }
+                }
+            }
+        ]
+        reviews = [
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviews": {
+                                "nodes": [
+                                    {
+                                        "author": {
+                                            "login": "maxi-reviewer",
+                                            "__typename": "Bot",
+                                        },
+                                        "state": "APPROVED",
+                                        "commit": {"oid": HEAD},
+                                    },
+                                    {
+                                        "author": {
+                                            "login": AUTHOR,
+                                            "__typename": "User",
+                                        },
+                                        "state": "COMMENTED",
+                                        "commit": {"oid": HEAD},
+                                    },
+                                    {
+                                        "author": None,
+                                        "state": "PENDING",
+                                        "commit": None,
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        ]
         # The collector reads these with `--slurpfile`, which takes paths and
         # not stdin: two slurpfiles cannot share one stream.
         with tempfile.TemporaryDirectory() as tmp:
@@ -425,16 +515,35 @@ class TheCollectorCarriesTheEvidence(unittest.TestCase):
             threads_path.write_text(json.dumps(threads), encoding="utf-8")
             reviews_path.write_text(json.dumps(reviews), encoding="utf-8")
             proc = subprocess.run(
-                ["jq", "-n", "--slurpfile", "t", str(threads_path),
-                 "--slurpfile", "r", str(reviews_path),
-                 "--arg", "head_sha", HEAD, _payload_program()],
-                capture_output=True, text=True)
+                [
+                    "jq",
+                    "-n",
+                    "--slurpfile",
+                    "t",
+                    str(threads_path),
+                    "--slurpfile",
+                    "r",
+                    str(reviews_path),
+                    "--arg",
+                    "head_sha",
+                    HEAD,
+                    _payload_program(),
+                ],
+                capture_output=True,
+                text=True,
+            )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         doc = json.loads(proc.stdout)
         self.assertEqual(doc["headSha"], HEAD)
-        self.assertEqual(doc["reviews"][0], {
-            "author": "maxi-reviewer", "state": "APPROVED",
-            "commit": HEAD, "isBot": True})
+        self.assertEqual(
+            doc["reviews"][0],
+            {
+                "author": "maxi-reviewer",
+                "state": "APPROVED",
+                "commit": HEAD,
+                "isBot": True,
+            },
+        )
         # A human account reads as NOT a bot, which is what lets the
         # non-author-account route exist at all.
         self.assertIs(doc["reviews"][1]["isBot"], False)
@@ -454,8 +563,14 @@ class TheCollectorCarriesTheEvidence(unittest.TestCase):
             "labels": [],
             "headSha": HEAD,
             "threads": [],
-            "reviews": [{"author": "coderabbitai", "state": "APPROVED",
-                         "commit": HEAD, "isBot": True}],
+            "reviews": [
+                {
+                    "author": "coderabbitai",
+                    "state": "APPROVED",
+                    "commit": HEAD,
+                    "isBot": True,
+                }
+            ],
         }
         ok, lines = gate.evaluate(collected, only=gate.ONLY_REVIEWER)
         self.assertTrue(ok, "\n".join(lines))
@@ -475,29 +590,51 @@ class TheGateAsTheWorkflowRunsIt(unittest.TestCase):
             path = pathlib.Path(tmp) / "payload.json"
             path.write_text(json.dumps(doc), encoding="utf-8")
             return subprocess.run(
-                ["python3", str(GATE), str(path),
-                 "--only", "non-author-review"],
-                capture_output=True, text=True)
+                ["python3", str(GATE), str(path), "--only", "non-author-review"],
+                capture_output=True,
+                text=True,
+            )
 
     def test_exit_codes_for_the_four_decision_cases(self):
         cases = [
-            ("an allowlisted bot approved this head",
-             payload([review("cubic-dev-ai", "APPROVED", is_bot=True)],
-                     roster=roster()), 0),
-            ("a bot commented, and the roster asked for someone else",
-             payload([review("cubic-dev-ai", "COMMENTED", is_bot=True)],
-                     roster=roster()), 1),
-            ("the author approved",
-             payload([review(AUTHOR, "APPROVED", is_bot=False)]), 1),
-            ("an approval of a stale head",
-             payload([review("maxi-reviewer", "APPROVED", commit=OTHER_HEAD,
-                             is_bot=True)], roster=roster()), 1),
+            (
+                "an allowlisted bot approved this head",
+                payload(
+                    [review("cubic-dev-ai", "APPROVED", is_bot=True)], roster=roster()
+                ),
+                0,
+            ),
+            (
+                "a bot commented, and the roster asked for someone else",
+                payload(
+                    [review("cubic-dev-ai", "COMMENTED", is_bot=True)], roster=roster()
+                ),
+                1,
+            ),
+            (
+                "the author approved",
+                payload([review(AUTHOR, "APPROVED", is_bot=False)]),
+                1,
+            ),
+            (
+                "an approval of a stale head",
+                payload(
+                    [
+                        review(
+                            "maxi-reviewer", "APPROVED", commit=OTHER_HEAD, is_bot=True
+                        )
+                    ],
+                    roster=roster(),
+                ),
+                1,
+            ),
         ]
         for what, doc, want in cases:
             with self.subTest(what=what):
                 proc = self._run(doc)
-                self.assertEqual(proc.returncode, want,
-                                 what + ": " + proc.stdout + proc.stderr)
+                self.assertEqual(
+                    proc.returncode, want, what + ": " + proc.stdout + proc.stderr
+                )
 
     def test_a_failure_annotates_a_single_line(self):
         # `::error::` annotations render as PR annotations; a multi-line one
@@ -505,8 +642,7 @@ class TheGateAsTheWorkflowRunsIt(unittest.TestCase):
         # visible reason.
         proc = self._run(payload([], roster=roster()))
         self.assertEqual(proc.returncode, 1)
-        annotations = [l for l in proc.stdout.splitlines()
-                       if l.startswith("::error::")]
+        annotations = [l for l in proc.stdout.splitlines() if l.startswith("::error::")]
         self.assertTrue(annotations)
         for line in annotations:
             self.assertNotIn("\n", line)
