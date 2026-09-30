@@ -1,0 +1,26 @@
+.coderabbit.yaml
+  h_cebe5b6d461c32 212-223
+.github/workflows/lane-sign-publish.yml
+  h_cebe5b6d461c32 29
+.github/workflows/review-gate.yml
+  h_cebe5b6d461c32 1-104
+.github/workflows/rust-ci.yml
+  h_cebe5b6d461c32 299
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 116,125
+docs/ci-design.md
+  h_cebe5b6d461c32 74,84-105,119,123-140
+tests/test_ci_design_permissions.py
+  h_cebe5b6d461c32 1-316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b3dc3fd301467cd7a93f24eb220c51c3d0804c1c",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
