@@ -296,9 +296,7 @@ jobs:
     needs: [plan, package]
     uses: ./.github/workflows/lane-sign-publish.yml
     permissions:
-      contents: write
-      id-token: write
-      pages: write
+      contents: read
     with:
       runs_on: ${{ needs.plan.outputs.runs_on }}
       should_run: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
