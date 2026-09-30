@@ -213,7 +213,7 @@ jobs:
             echo "has_credentials=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_credentials=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-check in credential-free mode (cargo fmt / clippy / test only, no private policy fetch)."
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-check in credential-free mode (public Rust checks only, no private policy fetch)."
             {
               echo "## lane-check summary"
               echo "- Lane: lane-check"

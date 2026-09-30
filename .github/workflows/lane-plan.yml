@@ -84,12 +84,12 @@ jobs:
     # wedged router from stalling the whole lane chain behind it.
     timeout-minutes: 15
     outputs:
-      runs_on: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on }}
-      provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}
-      packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}
-      packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}
-      scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope }}
-      scope_reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason }}
+      runs_on: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on || steps.credentials-fallback.outputs.runs-on }}
+      provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider || steps.credentials-fallback.outputs.provider }}
+      packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact || steps.credentials-fallback.outputs.packaging_impact }}
+      packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason || steps.credentials-fallback.outputs.packaging_reason }}
+      scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope || steps.credentials-fallback.outputs.scope }}
+      scope_reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason || steps.credentials-fallback.outputs.scope_reason }}
     permissions:
       contents: read
       pull-requests: read
@@ -402,13 +402,20 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Lane summary
+        env:
+          RUNNER_LABEL: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on || steps.credentials-fallback.outputs.runs-on }}
+          PROVIDER: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider || steps.credentials-fallback.outputs.provider }}
+          PACKAGING_IMPACT: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact || steps.credentials-fallback.outputs.packaging_impact }}
+          PACKAGING_REASON: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason || steps.credentials-fallback.outputs.packaging_reason }}
+          SCOPE: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope || steps.credentials-fallback.outputs.scope }}
+          SCOPE_REASON: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason || steps.credentials-fallback.outputs.scope_reason }}
         run: |
           {
             echo "## lane-plan summary"
-            echo "- Runner: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on || steps.credentials-fallback.outputs.runs-on }}"
-            echo "- Provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider || steps.credentials-fallback.outputs.provider }}"
-            echo "- Packaging impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact || steps.credentials-fallback.outputs.packaging_impact }}"
-            echo "- Packaging reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason || steps.credentials-fallback.outputs.packaging_reason }}"
-            echo "- Scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope || steps.credentials-fallback.outputs.scope }}"
-            echo "- Scope reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason || steps.credentials-fallback.outputs.scope_reason }}"
+            echo "- Runner: $RUNNER_LABEL"
+            echo "- Provider: $PROVIDER"
+            echo "- Packaging impact: $PACKAGING_IMPACT"
+            echo "- Packaging reason: $PACKAGING_REASON"
+            echo "- Scope: $SCOPE"
+            echo "- Scope reason: $SCOPE_REASON"
           } >> "$GITHUB_STEP_SUMMARY"
