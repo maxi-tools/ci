@@ -1,0 +1,104 @@
+# This repository's OWN call site for its own review gate.
+#
+# `review-gate-reusable.yml` is the one lane here that is shipped to ~48
+# consumers and was never run on this repository itself: every other file
+# here is a `workflow_call` reusable, so a pull request to `maxi-tools/ci`
+# carried CodeRabbit, cubic and qlty and nothing that read its review state --
+# `review-gate/threads` and `review-gate/non-author-review` did not exist on a
+# pull request here at all. `self-check.yml` closed the same hole on the
+# YAML/lint side; this file closes it on the review side.
+#
+# WHY THE PIN IS A SHA AND NOT `./.github/workflows/review-gate-reusable.yml`
+#
+# A relative call resolves from the pull request's own tree, so any PR here
+# could supply the gate that judges it -- in the repository whose gate exists
+# to stop exactly that shape of change. The sha pin makes the callee the
+# revision already on `main`, which no pull request can supply. (The composite
+# actions the callee uses are still resolved at `@main` from inside it; that is
+# the callee's contract, not this call site's.) The pin is advanced by hand
+# when the gate changes: this repository is not in the fan-out's consumer list
+# (`.github/scripts/fanout_ci_pin.py`), which enumerates OTHER repositories'
+# wrappers, so nothing automated moves these bytes.
+#
+# WHY HOSTED, NOT THE CALLEE'S SELF-HOSTED DEFAULT
+#
+# `review-gate-reusable.yml` defaults `runs_on` to `["self-hosted", "Linux"]`
+# because the org's hosted allowance is spent, and because a private consumer
+# that cannot allocate reads as "this pull request has unresolved threads" --
+# the worst possible misreport for this check. Neither argument holds here:
+# this repository is public, so its hosted minutes are its own rather than the
+# fleet's, and it takes FORK pull requests, which must not reach the org's
+# self-hosted fleet. `self-check.yml` makes the same trade for the same
+# reason. The gate is two API calls and a python script, and `gh`, `jq` and
+# `python3` all ship with `ubuntu-latest`.
+#
+# FORK PULL REQUESTS
+#
+# Whatever the callee decides for a fork pull request, it decides on hosted
+# capacity, never on the fleet's boxes -- the callee's own jobs carry
+# same-repository guards, and a fork that reaches none of them gets no verdict
+# published, which leaves both contexts pending and blocks a merge rather than
+# permitting one.
+
+name: Review gate
+
+on:
+  # `labeled`/`unlabeled` are here for ONE reason: `review-infra-unavailable`
+  # waives the non-author-review condition, and a label-dependent verdict that
+  # is not recomputed when the label moves is worse than no waiver at all.
+  # Applying it during an outage would change nothing, and REMOVING it would
+  # leave the waived green standing and merge a pull request nobody reviewed.
+  #
+  # `pull_request_review_comment` covers the gap nothing else can: resolving a
+  # conversation emits no Actions event at all, and a comment created straight
+  # through the review-comment API opens a NEW thread while emitting no
+  # `pull_request_review` event. It is also the highest-volume trigger by a
+  # wide margin, which is why the concurrency group below is keyed by event.
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, deleted]
+
+# Keyed on the EVENT as well as the pull request: without the second key all
+# three triggers above share one lane, and a review comment cancels the
+# in-flight `pull_request` run -- the one whose check runs the merge tool
+# scores -- with nothing left to re-trigger it.
+#
+# Cancelling within a lane is safe, and deliberately not the same thing as
+# leaving verdicts pending: a cancelled run is terminal, the authoritative
+# signal is the commit status, and statuses are last-write-wins per context,
+# so the newest surviving run is the one that writes it. A pending-and-never-
+# completed run would not be neutral in a rollup that aggregates across suites.
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+# Nothing at the workflow level. The job below grants exactly the union of what
+# the callee's jobs declare, and nothing else.
+permissions: {}
+
+jobs:
+  review-gate:
+    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@14f387b4144a783899e91c5f4a2da83b315560bb  # maxi-tools/ci main
+    # A reusable workflow cannot elevate the token its caller hands it, and the
+    # whole nested graph is validated when the run is CREATED -- before any job
+    # `if:` is evaluated. So this map is the union of what EVERY job in the
+    # callee declares, not just what the job a reader is thinking about spends,
+    # and granting less than this fails the run at creation rather than at the
+    # job that needed the scope.
+    #
+    #   actions: read         the run listings that supersede stale verdicts
+    #   contents: read        nothing here checks out; the callee declares it
+    #   pull-requests: write  the `dedupe` leg replies to and resolves
+    #                         duplicate bot threads on the same lines
+    #   statuses: write       the two `review-gate/*` commit statuses
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      statuses: write
+    with:
+      # See the header. Public repository, fork pull requests, hosted minutes.
+      runs_on: '["ubuntu-latest"]'

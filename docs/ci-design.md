@@ -71,17 +71,37 @@ jobs:
   merge-gate:
     uses: maxi-tools/ci/.github/workflows/rust-ci.yml@<sha>
     permissions:
-      contents: write
+      contents: read
       pull-requests: read
       actions: read
-      id-token: write
-      pages: write
     with:
       repo_policy: standard-rust
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 ```
+
+**A permissions map here is a FLOOR, not a request.** GitHub validates the
+permissions of the whole nested call graph when it creates the run — before
+any job `if:` is evaluated — so a scope declared inside a lane is a scope
+every caller has to grant on every event, including the events where that lane
+is skipped, and no caller-side change can lower it. A caller that grants less
+gets `startup_failure`: zero jobs, no log, and a check-run annotation about a
+workflow file issue.
+
+The three scopes above are exactly what the graph uses, and nothing here
+writes: `contents: read` is what the checkout needs, and `lane-plan` adds
+`pull-requests: read` and `actions: read`. This example used to carry
+`contents: write`, `id-token: write` and `pages: write` on top, because
+`lane-sign-publish` declared them — while its steps are a checkout with
+`persist-credentials: false`, an artifact download and two `echo`es, none of
+which touches a write scope. Every consumer of `rust-ci.yml` therefore had to
+grant the trio on every event. A write scope returns to the lane with the step
+that needs it (`contents: write` for a release asset, `id-token: write` for
+keyless signing) and to this example with it.
+
+`tests/test_ci_design_permissions.py` computes the floor from the call graph
+and fails if these examples and the lanes disagree, in either direction.
 
 **Name the secrets; do not use `secrets: inherit`.** `inherit` forwards every
 organization secret the calling repository can see to a workflow whose source is
@@ -96,12 +116,28 @@ jobs:
     permissions:
       actions: read
       contents: read
-      pull-requests: read
+      pull-requests: write
       statuses: write
 ```
 
-`statuses: write` has to be granted by the caller. A reusable workflow cannot
-elevate the token it is handed.
+The same floor rule, and the same reason the map is not `read`: the gate's
+`dedupe` leg resolves duplicate bot threads, so it declares
+`pull-requests: write`, and a caller that grants `pull-requests: read` fails
+the run at creation rather than at that leg. `statuses: write` has to be
+granted by the caller too — a reusable workflow cannot elevate the token it is
+handed, and the two `review-gate/*` verdicts are commit statuses.
+
+### This repository runs the gate on itself
+
+`.github/workflows/review-gate.yml` calls `review-gate-reusable.yml` at a
+pinned sha, so `review-gate/threads` and `review-gate/non-author-review` are
+published on this repository's own pull requests and not only on the ones that
+consume it. It passes `runs_on: '["ubuntu-latest"]'` instead of taking the
+callee's self-hosted default: this repository is public and takes fork pull
+requests, and fork-reachable runs do not belong on the org's self-hosted fleet
+— the trade `self-check.yml` documents for its own lane. The pin is a sha
+rather than a relative `./`, so that a pull request cannot supply the gate that
+judges it.
 
 ### How a fix reaches you
 

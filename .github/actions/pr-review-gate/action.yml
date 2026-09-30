@@ -7,7 +7,8 @@ inputs:
   condition:
     description: >
       Which condition to judge: `threads` (no unresolved review threads),
-      `non-author-review` (someone other than the author has reviewed), or
+      `non-author-review` (someone other than the author has approved this
+      head, or one of the reviewers the roster asked for has reviewed), or
       `all` (both). Callers report the two separately so each check's NAME can
       state the action it wants; a single check covering both can only be named
       for its passing state, which readers negate into the wrong half.

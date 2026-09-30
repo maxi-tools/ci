@@ -99,7 +99,14 @@ runs:
                 pullRequest(number:$pr){
                   reviews(first:100,after:$endCursor){
                     pageInfo{hasNextPage endCursor}
-                    nodes{ author{login} state }
+                    # `__typename` and `commit{oid}` are what the gate
+                    # approval path reads: `Bot` versus `User` decides whether
+                    # the reviewer had to be on the trusted allowlist, and the
+                    # commit decides whether the approval is of the revision
+                    # that would merge. Both are ADDITIVE -- a payload without
+                    # them still evaluates, and simply cannot credit an
+                    # approval (see HeadAnchoredApprovals in pr_review_gate.py).
+                    nodes{ author{login __typename} state commit{oid} }
                   }
                 }
               }
@@ -173,11 +180,20 @@ runs:
           )"
         fi
 
-        jq -n --slurpfile t threads.json --slurpfile r reviews.json '
+        jq -n --slurpfile t threads.json --slurpfile r reviews.json \
+              --arg head_sha "$HEAD_SHA" '
           {
             author:  ($t[0][0].data.repository.pullRequest.author.login // null),
             isDraft: ($t[0][0].data.repository.pullRequest.isDraft // false),
-            # The gate bypasses maxi-config fan-out branches, whose reviewers
+            # The revision an approval has to be OF to count. Read from the
+            # same REST call the roster lookup below uses, so the gate
+            # head-anchored comparison and this field cannot disagree about
+            # which commit "the head" is. A missing value is not defaulted
+            # to an empty string: the gate treats a non-string as "no head
+            # known" and declines to credit an approval, which is the safe
+            # direction (see HeadAnchoredApprovals in pr_review_gate.py).
+            headSha: $head_sha,
+            # The fan-out bypasses maxi-config fan-out branches, whose reviewers
             # are deliberately suppressed at source. `// null` rather than
             # `// ""`: a branch name we could not read must not become a value
             # that could be prefix-matched, and the gate treats a non-string as
@@ -193,8 +209,19 @@ runs:
                            author: (.comments.nodes[0].author.login // null),
                            path:   (.comments.nodes[0].path // null),
                            url:    (.comments.nodes[0].url // null) } ],
+            # `isBot` is GraphQL __typename == "Bot" -- the actor TYPE, not
+            # the login spelling. The two do not agree in this org
+            # (`maxi-reviewer` arrives bare over GraphQL and `maxi-reviewer[bot]`
+            # over REST), and the allowlist is only meaningful if the gate can
+            # tell a bot from an account. `null` when the type could not be
+            # read, which the gate treats as "not a human" rather than
+            # defaulting the other way.
             reviews: [ $r[0][] | .data.repository.pullRequest.reviews.nodes[]
-                       | { author: (.author.login // null), state } ]
+                       | { author: (.author.login // null),
+                           state,
+                           commit: (.commit.oid // null),
+                           isBot: (if (.author.__typename? // null) == null then null
+                                   else (.author.__typename == "Bot") end) } ]
           }' > payload.json
 
         # Embed the parsed roster (or the absence of one) into the payload

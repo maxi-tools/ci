@@ -1,28 +1,43 @@
 name: Install repo-declared system packages
 description: >
-  Install the apt packages a repo declares in ci/apt-packages.txt -- one
-  package per line, '#' comments allowed. Absent file means no extra
-  packages; on a runner without apt-get (or without sudo for a non-root
-  build user), skip with a notice rather than failing the lane.
+  Install the apt packages declared by a repository in ci/apt-packages.txt,
+  one per line, with '#' comments allowed. An absent file means no extra
+  packages; an empty (after-comment) list is the same. Runs on Linux only;
+  exits 0 with a `::notice::` when the runner image does not provide
+  apt-get (some self-hosted runners do not), and the same when the runner
+  is not root and has no sudo (a non-sudoer build user cannot install).
+  Then no-op on the assumption that the runner's image already covers the
+  declared packages.
 
-  This block previously existed in three near-identical copies in
-  lane-check.yml, lane-test.yml and lane-package.yml, and that is how a
-  real fix in one copy was silently shipped as a no-op: nothing in the
-  tree marked which copies were live, so grepping, editing and confirming
-  the fix all behaved identically against a file nothing executes.
-  This action is the collapse (maxi-tools/maxi-config#174).
+  This block previously existed as three near-identical copies -- in
+  lane-check.yml, lane-test.yml and lane-package.yml. That is how a real
+  bug came to be fixed in one copy alone, where it reached no consumer
+  (#460, #461), and how #459-style divergence would have stayed hidden:
+  nothing in the tree marked which copies were live. This action is the
+  collapse (#174).
 
+  Referenced by its full owner/repo path (maxi-tools/<repo>/...@main).
+  `./.github/actions/...` would resolve against the CALLER's workspace,
+  which in a consumer repo does not contain this action at all. The cost
+  is that the calling lane runs the copy on main rather than the one
+  under review -- a change here is exercised by vendored-action-drift's
+  byte-identity mirror check and by main, not by the PR's lanes.
+inputs:
+  list-path:
+    description: >
+      Repo-relative path to the package list file. Defaults to
+      ci/apt-packages.txt, the convention lane-check/lane-test/lane-package
+      have always read.
+    required: false
+    default: ci/apt-packages.txt
 runs:
   using: composite
   steps:
-    # Repos with native system-library deps (e.g. alsa-sys behind a midi
-    # feature) declare them in ci/apt-packages.txt — one package per line,
-    # '#' comments allowed. Absent file means no extra packages.
     - name: Install repo-declared system packages
       shell: bash
       run: |
         set -euo pipefail
-        list="ci/apt-packages.txt"
+        list="${{ inputs.list-path }}"
         [ -f "$list" ] || exit 0
         packages="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$list" | xargs)"
         [ -n "$packages" ] || exit 0
@@ -30,7 +45,7 @@ runs:
         # Not every self-hosted Linux runner is Debian-family with a sudoer
         # build user. Some run a declaratively-configured distribution with
         # neither apt-get nor sudo, taking system libraries from the machine's
-        # own configuration instead — so hard-coding `sudo apt-get` failed
+        # own configuration instead -- so hard-coding `sudo apt-get` failed
         # every lane at provisioning with `sudo: command not found`, seconds
         # in, before compiling anything.
         if ! command -v apt-get >/dev/null 2>&1; then
