@@ -1,0 +1,16 @@
+.github/actions/verify-sibling-checkouts/action.yml
+  h_cebe5b6d461c32 50-56,62-73,83-114,127-142,144-153,265-272
+.github/workflows/lane-package.yml
+  h_cebe5b6d461c32 208-231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8dbbb3ba95d6052fa941adeef40fb9f0080b5980",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
