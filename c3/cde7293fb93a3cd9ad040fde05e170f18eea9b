@@ -1,0 +1,40 @@
+.coderabbit.yaml
+  h_cebe5b6d461c32 212-223
+.github/actions/collect-pr-review-state/action.yml
+  h_cebe5b6d461c32 102-109,183-184,188-196,212-218,220-224
+.github/actions/install-apt-packages/action.yml
+  h_cebe5b6d461c32 3-10,12-17,19-32,40,48
+.github/actions/pr-review-gate/action.yml
+  h_cebe5b6d461c32 10-11
+.github/actions/pr-review-gate/pr_review_gate.py
+  h_cebe5b6d461c32 6-8,23-47,71-159,289-296,413,421,428,658-672,674-677,691-749,763,767-770,792,812-815,822-830,835-836,842,855-869
+.github/workflows/lane-sign-publish.yml
+  h_cebe5b6d461c32 29
+.github/workflows/review-gate-reusable.yml
+  h_cebe5b6d461c32 15-34,474-476,512
+.github/workflows/review-gate.yml
+  h_cebe5b6d461c32 1-104
+.github/workflows/rust-ci.yml
+  h_cebe5b6d461c32 299
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 131-132,141-142
+docs/ci-design.md
+  h_cebe5b6d461c32 74,84-105,119,123-140
+tests/test_ci_design_permissions.py
+  h_cebe5b6d461c32 1-316
+tests/test_impossible_caller_contexts.py
+  h_cebe5b6d461c32 1-394
+tests/test_trusted_bot_approval.py
+  h_cebe5b6d461c32 1-652
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c3cde7293fb93a3cd9ad040fde05e170f18eea9b",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
