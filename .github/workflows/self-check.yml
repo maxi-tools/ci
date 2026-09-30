@@ -52,6 +52,21 @@ jobs:
         with:
           files: ".github/workflows/*.yml"
           fail-on-error: true
+          # `$/` is GitHub's self-repository `uses:` syntax
+          # (https://github.blog/changelog/2026-07-30-reference-same-repository-actions-with-self-repository-syntax).
+          # It resolves to the workflow's own repository at the running
+          # commit, which is the only correct form for a `workflow_call`
+          # reusable to reference its own composite action -- a `./` form
+          # would resolve inside each CALLER's workspace, and ~48 consumers
+          # do not vendor this action. actionlint 1.7.12 (latest at the
+          # time of writing) does not yet recognise `$/` (rhysd/actionlint
+          # issue #711, PR #732); this ignore suppresses only the one
+          # known message and leaves every other actionlint check in force.
+          # Remove this ignore once the project ships a release with the
+          # `$/` parser. The regex uses '.' rather than spaces because the
+          # raven-actions wrapper tokenises the `flags:` value on
+          # whitespace, splitting a quoted phrase into multiple flags.
+          flags: '-ignore invalid.format.because.ref.is.missing'
 
       - name: Check `uses:` references
         # Two properties actionlint does not cover: that a relative call
@@ -113,7 +128,8 @@ jobs:
           . "$RUNNER_TEMP/moments-python/bin/activate"
           python3 -m pip install PyYAML==6.0.3
           failed=0
-          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_moments_gallery.py tests/test_moments_png_filters.py; do
+          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_install_apt_packages_action.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_moments_gallery.py tests/test_moments_png_filters.py; do
+
             echo "== $t"
             if ! python3 "$t"; then
               echo "::error file=$t::$t failed"
@@ -122,7 +138,8 @@ jobs:
           done
           # Non-vacuity: every tests/test_*.py must be in the list above.
           for f in tests/test_*.py; do
-            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_moments_gallery.py tests/test_moments_png_filters.py " in
+            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_install_apt_packages_action.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_moments_gallery.py tests/test_moments_png_filters.py " in
+
               *" $f "*) ;;
               *) echo "::error file=$f::$f exists but is not run by this lane; add it to the list"; failed=1 ;;
             esac
