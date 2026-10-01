@@ -65,6 +65,9 @@ env:
 
 jobs:
   lane-test:
+    # Use the org pin even if another job changes the runner's global default.
+    env:
+      RUSTUP_TOOLCHAIN: '1.98.1'
     # Same as lane-check.yml, including WHY the guard lives on this job rather
     # than on the caller: a skipped caller job never creates the nested check
     # run, and `merge-gate / test / lane-test` is a REQUIRED context in many
@@ -234,6 +237,7 @@ jobs:
         if: steps.workspace.outputs.has_workspace == 'true'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: '1.98.1'
           components: rustfmt, clippy
 
       - name: Fetch maxi-config rust-lane policy
