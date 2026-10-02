@@ -31,6 +31,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import types
 import unittest
 
 import yaml
@@ -150,6 +151,118 @@ class AggregateLaneResults(unittest.TestCase):
         rc, log, _ = self.aggregate({})
         self.assertEqual(rc, 0, log)
         self.assertIn("skipped=[]", log)
+
+
+# `merge-gate` is the SOLE required context under the post-merge-gate ruleset.
+# The job's `if:` decides whether the rule even exists on a given event --
+# skip it on the wrong event and the ruleset is structurally weaker than the
+# lanes it is supposed to replace. actionlint checks expression syntax, not
+# what it evaluates against. (codacy on maxi-config#790; the same reasoning
+# made this file ship its first two tests.)
+#
+# `always()` is the force-run-on-upstream-failure override, not a boolean
+# value: with it, the job runs even when its needs failed, as long as the
+# rest of the expression is true. Treat it as True in the boolean evaluation
+# so the test reads the EVENT filter, not the failure override -- the
+# override is asserted separately.
+class MergeGateEventFilter(unittest.TestCase):
+    @staticmethod
+    def _if_expr() -> str:
+        doc = yaml.safe_load(RUST_CI.read_text(encoding="utf-8"))
+        expr = doc["jobs"]["merge-gate"]["if"]
+        assert isinstance(expr, str), f"merge-gate `if:` is not a string: {expr!r}"
+        return expr
+
+    @staticmethod
+    def _evaluates(expr: str, event_name: str, event_obj: object) -> bool:
+        # GitHub Actions uses `&&` / `||`. Python uses `and` / `or`.
+        py = (expr.replace("&&", " and ")
+                  .replace("||", " or ")
+                  # `always()` is the upstream-failure override; for the event
+                  # filter it is a no-op -- evaluate the boolean condition
+                  # the rule would evaluate against.
+                  .replace("always()", "True"))
+        # Recursively wrap dicts in SimpleNamespace so attribute-style
+        # property access (`github.event.pull_request.head.repo.full_name`)
+        # works in the eval'd expression. The wrapper also tolerates missing
+        # attributes -- GitHub Actions returns null on `event.<missing>` and
+        # compares false against any string; Python's SimpleNamespace raises
+        # AttributeError, which would mask the very case the test is checking.
+        class _NullSafe(types.SimpleNamespace):
+            def __getattr__(self, name: str) -> object:
+                try:
+                    return object.__getattribute__(self, name)
+                except AttributeError:
+                    return None
+        def wrap(value: object) -> object:
+            if isinstance(value, dict):
+                return _NullSafe(**{k: wrap(v) for k, v in value.items()})
+            return value
+        ns = {
+            "__builtins__": {},
+            "True": True, "False": False, "None": None,
+            "github": wrap({
+                "event_name": event_name,
+                "event": event_obj,
+                "repository": "maxi-tools/ci",
+            }),
+        }
+        return bool(eval(py, ns))
+
+    def gate_should_run(self, event_name: str, event_obj: object) -> bool:
+        return self._evaluates(self._if_expr(), event_name, event_obj)
+
+    def test_pull_request_same_repo_runs(self):
+        """Existing fork-tripwire arm still passes a same-repo PR."""
+        event = {"pull_request": {"head": {"repo": {"full_name": "maxi-tools/ci"}}}}
+        self.assertTrue(self.gate_should_run("pull_request", event))
+
+    def test_pull_request_fork_does_not_run(self):
+        """The fork tripwire still filters a fork PR -- the new merge_group
+        arm must not widen this."""
+        event = {"pull_request": {"head": {"repo": {"full_name": "maxi-tools/attacker"}}}}
+        self.assertFalse(self.gate_should_run("pull_request", event))
+
+    def test_merge_group_checks_requested_runs(self):
+        """The merge-queue caller asks this workflow to emit the required
+        `merge-gate / merge-gate` context on `merge_group` with action
+        `checks_requested`. Without this arm the job is skipped and the
+        ruleset sees no verdict."""
+        event = {"action": "checks_requested"}
+        self.assertTrue(self.gate_should_run("merge_group", event))
+
+    def test_merge_group_other_actions_do_not_run(self):
+        """`merge_group` actions besides `checks_requested` are merge-queue
+        lifecycle events. The aggregate check run must not be created for
+        them: it would be a required-context check run with no upstream
+        lane results to aggregate, and it would block the queue."""
+        for action in ("created", "merged", "pushed", "removed", "deleted"):
+            with self.subTest(action=action):
+                event = {"action": action}
+                self.assertFalse(self.gate_should_run("merge_group", event),
+                                 f"merge_group action={action!r} must not run merge-gate")
+
+    def test_merge_group_with_no_action_does_not_run(self):
+        """Defensive: a malformed merge_group payload without `action` must
+        not mint the required check run."""
+        event = {}
+        self.assertFalse(self.gate_should_run("merge_group", event))
+
+    def test_unrelated_event_names_do_not_run(self):
+        """A `push` or `workflow_dispatch` event must not run merge-gate.
+        The merge-gate is the PR/merge-group aggregate, not a push-triggered one."""
+        for event_name in ("push", "workflow_dispatch", "schedule", "release"):
+            with self.subTest(event_name=event_name):
+                event = {"action": "checks_requested"}  # even with a matching action
+                self.assertFalse(self.gate_should_run(event_name, event))
+
+    def test_if_expression_uses_always_override(self):
+        """The upstream-failure override must still be present in the
+        expression. Without it, a failing `check`/`test` skips merge-gate
+        and the required context vanishes -- which is the failure mode
+        this whole job exists to fix. actionlint cannot catch a deleted
+        `always()`; this test does."""
+        self.assertIn("always()", self._if_expr())
 
 
 if __name__ == "__main__":
