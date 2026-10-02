@@ -170,21 +170,24 @@ class MergeGateEventFilter(unittest.TestCase):
     def _if_expr() -> str:
         doc = yaml.safe_load(RUST_CI.read_text(encoding="utf-8"))
         expr = doc["jobs"]["merge-gate"]["if"]
-        assert isinstance(expr, str), f"merge-gate `if:` is not a string: {expr!r}"
+        if not isinstance(expr, str):
+            raise ValueError(f"merge-gate `if:` is not a string: {expr!r}")
         return expr
 
     @staticmethod
     def _evaluates(expr: str, event_name: str, event_obj: object) -> bool:
-        # GitHub Actions uses `&&` / `||`. Python uses `and` / `or`.
+        # Translate the GitHub Actions expression into Python. `&&` -> `and`,
+        # `||` -> `or`, `always()` -> True. The result is a small expression
+        # over the supported operators, not arbitrary user input -- the
+        # test loader reads the bytes straight from the workflow file and
+        # the test corpus is the workflow itself.
         py = (expr.replace("&&", " and ")
                   .replace("||", " or ")
-                  # `always()` is the upstream-failure override; for the event
-                  # filter it is a no-op -- evaluate the boolean condition
-                  # the rule would evaluate against.
                   .replace("always()", "True"))
+
         # Recursively wrap dicts in SimpleNamespace so attribute-style
         # property access (`github.event.pull_request.head.repo.full_name`)
-        # works in the eval'd expression. The wrapper also tolerates missing
+        # works in the expression. The wrapper also tolerates missing
         # attributes -- GitHub Actions returns null on `event.<missing>` and
         # compares false against any string; Python's SimpleNamespace raises
         # AttributeError, which would mask the very case the test is checking.
@@ -194,20 +197,62 @@ class MergeGateEventFilter(unittest.TestCase):
                     return object.__getattribute__(self, name)
                 except AttributeError:
                     return None
+
         def wrap(value: object) -> object:
             if isinstance(value, dict):
                 return _NullSafe(**{k: wrap(v) for k, v in value.items()})
             return value
+
         ns = {
-            "__builtins__": {},
-            "True": True, "False": False, "None": None,
             "github": wrap({
                 "event_name": event_name,
                 "event": event_obj,
                 "repository": "maxi-tools/ci",
             }),
         }
-        return bool(eval(py, ns))
+
+        # Walk the AST manually rather than `eval()`. The expression grammar
+        # is bounded (BoolOp, Compare, BoolOp of Compare, Name/Attribute
+        # leaves, Constant on the right-hand side), and an explicit walker
+        # avoids handing `eval` the bytes -- which bandit B307 rejects and
+        # which is the right call: the test is not a sandbox, only a
+        # contract check.
+        import ast
+
+        def evaluate(node: ast.AST) -> object:
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body)
+            if isinstance(node, ast.BoolOp):
+                values = [evaluate(v) for v in node.values]
+                if isinstance(node.op, ast.And):
+                    return all(values)
+                if isinstance(node.op, ast.Or):
+                    return any(values)
+                raise ValueError(f"unsupported BoolOp: {type(node.op).__name__}")
+            if isinstance(node, ast.Compare):
+                left = evaluate(node.left)
+                for op, right_node in zip(node.ops, node.comparators):
+                    right = evaluate(right_node)
+                    if isinstance(op, ast.Eq) and left != right:
+                        return False
+                    if isinstance(op, ast.NotEq) and left == right:
+                        return False
+                    left = right
+                return True
+            if isinstance(node, ast.Name):
+                if node.id == "github":
+                    return ns["github"]
+                if node.id in ("True", "False", "None"):
+                    return {"True": True, "False": False, "None": None}[node.id]
+                raise ValueError(f"unknown name: {node.id!r}")
+            if isinstance(node, ast.Attribute):
+                value = evaluate(node.value)
+                return getattr(value, node.attr, None)
+            if isinstance(node, ast.Constant):
+                return node.value
+            raise ValueError(f"unsupported node: {type(node).__name__}")
+
+        return bool(evaluate(ast.parse(py, mode="eval")))
 
     def gate_should_run(self, event_name: str, event_obj: object) -> bool:
         return self._evaluates(self._if_expr(), event_name, event_obj)
