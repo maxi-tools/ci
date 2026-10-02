@@ -29,10 +29,10 @@ on:
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
-        required: true
+        required: false
       APP_PRIVATE_KEY:
         description: GitHub App private key paired with APP_ID.
-        required: true
+        required: false
 
 # workflow_call ONLY, unlike the copy this was moved from.
 #
@@ -296,9 +296,7 @@ jobs:
     needs: [plan, package]
     uses: ./.github/workflows/lane-sign-publish.yml
     permissions:
-      contents: write
-      id-token: write
-      pages: write
+      contents: read
     with:
       runs_on: ${{ needs.plan.outputs.runs_on }}
       should_run: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}

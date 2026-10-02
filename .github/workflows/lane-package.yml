@@ -34,9 +34,9 @@ on:
 
     secrets:
       APP_ID:
-        required: true
+        required: false
       APP_PRIVATE_KEY:
-        required: true
+        required: false
 
 permissions: {}
 
@@ -80,46 +80,47 @@ jobs:
 
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
       # feature) declare them in ci/apt-packages.txt — one package per line,
-      # '#' comments allowed. Absent file means no extra packages.
+      # '#' comments allowed. Absent file means no extra packages. The
+      # install logic lives in .github/actions/install-apt-packages and is
+      # shared with lane-check.yml and lane-test.yml; one implementation
+      # in one place is the deduplication that closes maxi-config#174.
       - name: Install repo-declared system packages
         if: ${{ inputs.should_run && runner.os == 'Linux' }}
+        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
+
+      # Required by the optional-secret contract from maxi-config#368: callers
+      # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
+      # public-only lanes) must still produce release artifacts when
+      # packaging_impact is true, even without an App-token. The
+      # credential-dependent steps below this point are gated on
+      # has_credentials; cargo build --release still runs on the runner's
+      # default toolchain.
+      - name: Detect credentials
+        id: credentials
+        if: ${{ inputs.should_run }}
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
         shell: bash
         run: |
-          set -euo pipefail
-          list="ci/apt-packages.txt"
-          [ -f "$list" ] || exit 0
-          packages="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$list" | xargs)"
-          [ -n "$packages" ] || exit 0
-
-          # Not every self-hosted Linux runner is Debian-family with a sudoer
-          # build user. Some run a declaratively-configured distribution with
-          # neither apt-get nor sudo, taking system libraries from the machine's
-          # own configuration instead — so hard-coding `sudo apt-get` failed
-          # every lane at provisioning with `sudo: command not found`, seconds
-          # in, before compiling anything.
-          if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::notice::No apt-get on this runner; expecting its image to provide: $packages"
-            exit 0
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
+            echo "has_credentials=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_credentials=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-package in credential-free mode (public release build only, no App-token mint, no private dependency fetch)."
+            {
+              echo "## lane-package summary"
+              echo "- Lane: lane-package"
+              echo "- Credentials: absent; credential-free mode (no App-token mint, no private policy fetch)"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
-
-          # Root needs no sudo, and a non-root user without it cannot install.
-          # Saying so beats failing the lane over packages the image may
-          # already have.
-          elevate=()
-          if [ "$(id -u)" -ne 0 ]; then
-            if ! command -v sudo >/dev/null 2>&1; then
-              echo "::warning::Cannot install system packages (not root, no sudo); expecting this runner's image to provide: $packages"
-              exit 0
-            fi
-            elevate=(sudo)
-          fi
-
-          "${elevate[@]}" apt-get update
-          # shellcheck disable=SC2086
-          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
 
       - name: Generate org repo token
-        if: ${{ inputs.should_run }}
+        # Skipped entirely in credential-free mode (#368). Forks and external
+        # contributors who did not forward APP_ID / APP_PRIVATE_KEY have no
+        # credentials to mint a token with, and the action refuses an empty
+        # app-id.
+        if: ${{ inputs.should_run && steps.credentials.outputs.has_credentials == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -148,22 +149,25 @@ jobs:
           # privately in maxi-config.
           permission-contents: read
 
-      # Checkout comes after the token mint on purpose: the submodules are
-      # public today, so an unauthenticated fetch would reach them, but the
-      # app token is passed the same way lane-check's private-dep rewrite
-      # uses it, so a private submodule authenticates instead of failing the
-      # lane. Passing `token` makes the action persist credentials, which is
-      # exactly what `persist-credentials: false` exists to prevent, so the
-      # token is handed to git for the fetch and the credentials are scrubbed
-      # immediately after -- the same scrub lane-check does before it hands
-      # the tree to anything that runs code.
+      # Checkout comes after the token mint so a submodule fetch could use the
+      # app token, but the action's `token` input is `required: true` -- when
+      # it is expression-conditioned on `checkout_submodules` (falling back to
+      # `''` for ordinary non-submodule PRs), a false `checkout_submodules`
+      # hands the action an explicit empty string, which the action treats as
+      # "input not supplied" and fails before the build even starts (maxi-mux
+      # #384 run 36271068585 attempt 1, job 108499800720; all prior lanes
+      # green). Submodules here are public today, so an unauthenticated fetch
+      # reaches them fine, and the action's own default (falling back to the
+      # workflow's ambient GITHUB_TOKEN) already satisfies the required
+      # input -- exactly the same as lane-check.yml and lane-test.yml, which
+      # never pass `token` at all. Omit it here too instead of re-deriving a
+      # conditional that can produce an empty string again.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         timeout-minutes: 10
         if: ${{ inputs.should_run }}
         with:
           persist-credentials: false
           submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
-          token: ${{ inputs.checkout_submodules && steps.app-token.outputs.token || '' }}
 
       - name: Scrub checkout credentials
         if: ${{ inputs.should_run && inputs.checkout_submodules }}
@@ -198,12 +202,37 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+
       - name: Install Rust toolchain
         if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
 
+      # Fails fast, with an attributable error, when a Cargo `path =
+      # "../<repo>"` dependency does not resolve to a real checkout beside
+      # this one -- and equally, refuses to let such a checkout survive from
+      # an earlier unrelated job on this same self-hosted runner. See the
+      # action for the two failure shapes this closes (maxi-config#286).
+      #
+      # Referenced by its owning repository, not by `./.github/actions/...`.
+      # `uses: ./...` inside a reusable workflow that consumers call via
+      # `uses: maxi-tools/ci/.github/workflows/lane-package.yml@<sha>` would
+      # resolve relative to the CONSUMER's checkout (the actions/checkout
+      # step populated GITHUB_WORKSPACE with the consumer), and consumers
+      # do not vend this action. Same-owner refs are exempted from the
+      # external-pin SHA requirement in check_workflow_refs.py.
+      #
+      # The lane-package lane runs `cargo build --release --workspace`
+      # separately from lane-check/lane-test (a different job, possibly a
+      # different runner), so it must do its own sibling verify rather than
+      # rely on lane-check having already done it.
+      - name: Verify sibling path-dependency checkouts
+        if: ${{ inputs.should_run && steps.credentials.outputs.has_credentials == 'true' }}
+        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
       - name: Fetch maxi-config rust-lane policy
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         # One implementation, in .github/actions/fetch-policy. This block
         # existed in four near-identical copies until #462, which is how #460
         # fixed a live bug in a file nothing runs. Its reasoning -- the
@@ -217,26 +246,26 @@ jobs:
             scripts/emit-runner-paths.sh
           token: ${{ steps.app-token.outputs.token }}
       - name: Expose installed macOS native build tools
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && runner.os == 'macOS' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' && runner.os == 'macOS' }}
         shell: bash
         run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
       - name: Verify installed Rust toolchain before cache restore
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
       - name: Cache Rust dependencies
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           prefix-key: v1-rust-no-bin
           cache-bin: false
 
       - name: Verify installed Rust toolchain after cache restore
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
       - name: Configure git for private deps
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -261,7 +290,7 @@ jobs:
           # connection parks `git remote-https` at 0% CPU indefinitely.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked
