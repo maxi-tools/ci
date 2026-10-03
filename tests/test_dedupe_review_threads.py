@@ -459,26 +459,83 @@ class Plan(unittest.TestCase):
         self.assertEqual(to_resolve, [])
         self.assertEqual(already, [])
 
-    def test_rerun_with_existing_marker_is_a_noop(self):
-        # First run: cluster decides to resolve the duplicate.
-        # Second run (re-run, no GraphQL changes yet): the bodies
-        # fetch sees our sentinel in the duplicate's body and moves
-        # the thread from `to_resolve` to `already_processed`.
+    def test_rerun_with_marker_and_unresolved_thread_retries_resolve(self):
+        # ci#60: first run posted the reply (sentinel in the body) but
+        # the resolve mutation failed. The re-run must NOT park the
+        # duplicate in already_processed forever -- it routes it back
+        # into to_resolve so the resolve is retried. reply_and_resolve
+        # gets `already_replied=True` from the apply path and skips the
+        # reply mutation (pinned in ReplyResolveRetry), so the retry is
+        # resolve-only.
         keeper = thread(tid="k", author=BOT_A, path="src/x.rs", line=10)
         dup = thread(tid="d", author=BOT_B, path="src/x.rs", line=14)
 
-        # No bodies fetcher -> treat as "not yet processed".
-        kept, to_resolve, _ = dedupe.plan([keeper, dup], self.BOTS)
-        self.assertEqual([d["id"] for d, _k in to_resolve], ["d"])
-
-        # With a bodies fetcher that reports the sentinel present:
-        # the duplicate moves from to_resolve to already_processed.
         def fetcher(ids):
             return {tid: dedupe.SENTINEL for tid in ids}
 
         kept, to_resolve, already = dedupe.plan(
             [keeper, dup], self.BOTS, fetch_bodies=fetcher,
         )
+        self.assertEqual([t["id"] for t in kept], ["k"])
+        self.assertEqual(
+            [(d["id"], k["id"]) for d, k in to_resolve], [("d", "k")]
+        )
+        self.assertEqual(already, [])
+
+    def test_rerun_with_marker_and_resolved_thread_is_skipped(self):
+        # The settled half of the split-brain: sentinel present AND the
+        # thread resolved. cluster() filters isResolved threads before
+        # plan() sees them, so reaching this branch means a hand-built
+        # fixture or a race put a resolved duplicate in front of the
+        # loop; it must NOT be retried, and no duplicate sentinel reply
+        # may be posted for it.
+        keeper = thread(tid="k", author=BOT_A, path="src/x.rs", line=10,
+                        is_resolved=True)
+        dup = thread(tid="d", author=BOT_B, path="src/x.rs", line=14,
+                     is_resolved=True)
+
+        def fetcher(ids):
+            return {tid: dedupe.SENTINEL for tid in ids}
+
+        kept, to_resolve, already = dedupe.plan(
+            [keeper, dup], self.BOTS, fetch_bodies=fetcher,
+        )
+        # Both threads are resolved, so cluster() drops them entirely:
+        # nothing kept, nothing to resolve, nothing settled-late.
+        self.assertEqual(kept, [])
+        self.assertEqual(to_resolve, [])
+        self.assertEqual(already, [])
+
+    def test_resolved_duplicate_with_marker_is_already_processed(self):
+        # The defensive branch: a duplicate that carries the sentinel
+        # AND is already resolved must land in already_processed, never
+        # in to_resolve -- re-resolving is a wasted mutation and a
+        # misleading report count, and the apply path must not post a
+        # second sentinel reply for it. cluster() normally drops
+        # resolved threads before plan()'s routing loop, so the branch
+        # is only reachable via a race (thread resolved between the
+        # thread fetch and the bodies fetch) or a fixture without the
+        # field; the test reaches it by stubbing cluster(), which is
+        # the same seam fetch_bodies already uses.
+        keeper = thread(tid="k", author=BOT_A, path="src/x.rs", line=10)
+        dup = thread(tid="d", author=BOT_B, path="src/x.rs", line=14,
+                     is_resolved=True)
+
+        def fetcher(ids):
+            return {tid: dedupe.SENTINEL for tid in ids}
+
+        original_cluster = dedupe.cluster
+
+        def fake_cluster(threads, bot_logins, *, window=4):
+            return [[keeper, dup]]
+
+        dedupe.cluster = fake_cluster
+        try:
+            kept, to_resolve, already = dedupe.plan(
+                [], self.BOTS, fetch_bodies=fetcher,
+            )
+        finally:
+            dedupe.cluster = original_cluster
         self.assertEqual([t["id"] for t in kept], ["k"])
         self.assertEqual(to_resolve, [])
         self.assertEqual([t["id"] for t in already], ["d"])
@@ -838,8 +895,12 @@ class ScriptInvocation(unittest.TestCase):
         # REPORT, not the network call, so we use a stub.
         calls = []
 
-        def fake_reply(owner, repo, pr, thread_, keeper):
-            calls.append((thread_["id"], keeper["id"]))
+        def fake_reply(owner, repo, pr, thread_, keeper, **kwargs):
+            # **kwargs absorbs already_replied, which the ci#60 fix
+            # added so a sentinel-carrying duplicate retries resolve-
+            # only. On the --payload fixture path the bodies cache is
+            # empty, so the flag arrives False here.
+            calls.append((thread_["id"], keeper["id"], kwargs))
 
         original = dedupe.reply_and_resolve
         dedupe.reply_and_resolve = fake_reply
@@ -1031,6 +1092,63 @@ class ThreadQueryMatchesTheSchema(unittest.TestCase):
             DEDUPE_PATH.read_text(encoding="utf-8"), self._COMMENT_NODES
         )
         self.assertIn("createdAt", comment_block)
+
+
+class ReplyResolveRetry(unittest.TestCase):
+    """`already_replied=True` retries the resolve and skips the reply.
+
+    ci#60: reply and resolve are two separate GraphQL mutations, and
+    "reply posted, resolve failed" left a duplicate with our sentinel
+    in its body and an unresolved thread. Before the fix the re-run
+    plan() parked that duplicate in already_processed forever (the
+    sentinel check never consulted the resolved state), so the resolve
+    was never retried. After the fix plan() routes it back into
+    to_resolve and the apply path calls reply_and_resolve with
+    already_replied=True: exactly one mutation -- the resolve -- and
+    no second duplicate-of reply under the first.
+
+    These tests capture what _gh_graphql actually received, which is
+    the cheapest thing that could have failed: the pre-fix function
+    signature had no way to express "skip the reply" at all.
+    """
+
+    def _capture(self, **kwargs):
+        sent = []
+        original = dedupe._gh_graphql
+        dedupe._gh_graphql = lambda q, **f: sent.append((q, f)) or {}
+        try:
+            dedupe.reply_and_resolve(
+                "maxi-tools", "ci", 208,
+                thread(tid="d", author=BOT_B, path="src/x.rs", line=14),
+                thread(tid="k", author=BOT_A, path="src/x.rs", line=10,
+                       url="https://gh/k"),
+                **kwargs,
+            )
+        finally:
+            dedupe._gh_graphql = original
+        return sent
+
+    def test_already_replied_skips_the_reply_mutation(self):
+        # Acceptance 1 of ci#60: the retry is resolve-only. With the
+        # sentinel already in the thread body, sending the reply
+        # mutation again would post a second duplicate-of comment.
+        sent = self._capture(already_replied=True)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("resolveReviewThread", sent[0][0])
+        self.assertNotIn("addPullRequestReviewThreadReply", sent[0][0])
+
+    def test_default_still_sends_both_mutations(self):
+        # The first-visit path is unchanged: reply, then resolve.
+        sent = self._capture()
+        self.assertEqual(len(sent), 2)
+        self.assertIn("addPullRequestReviewThreadReply", sent[0][0])
+        self.assertIn("resolveReviewThread", sent[1][0])
+
+    def test_already_replied_resolves_the_same_thread_id(self):
+        # The retry targets the duplicate's own thread ID -- the same
+        # variable the two-mutation path resolves with.
+        sent = self._capture(already_replied=True)
+        self.assertEqual(sent[0][1], {"threadId": "d"})
 
 
 class ActionSummaryLines(unittest.TestCase):

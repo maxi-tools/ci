@@ -12,7 +12,26 @@
 # authenticates as the same account, so a PR can carry several reviews that are
 # all self-review, and a count of reviews would be satisfied by the author
 # reviewing their own work.
-
+#
+# It has two routes, and either one satisfies it:
+#
+#   A. an APPROVED review of the CURRENT head SHA, from a review bot on the
+#      trusted allowlist (`TRUSTED_REVIEW_BOTS` in the gate -- one list, in one
+#      place) or from a human account that is not the author.
+#      (Maxi decision, 2026-09-28: bots count if they approve.)
+#   B. a counted review from one of the reviewers the roster selector published
+#      in `asked` -- unchanged from before route A existed. It is kept because
+#      nothing in this fleet submits an approval today: measured 2026-09-28
+#      across 604 open PRs in 19 repositories, the review states are COMMENTED
+#      3001, CHANGES_REQUESTED 5, DISMISSED 4, APPROVED 0. A condition that
+#      accepted route A alone would be unsatisfiable on every PR in the org.
+#
+# An APPROVED review is route A's business and route A's only, so an approval
+# of a superseded revision satisfies neither route -- including for a reviewer
+# the roster asked for. Route B stays commit-blind, because a comment is what
+# the reviewers in this fleet post and re-anchoring it would red the org; with
+# no roster published yet it credits a review bot rather than any account.
+#
 # The decision logic is .github/actions/pr-review-gate and its truth table is
 # pinned in tests/test_pr_review_gate.py, which unittest discovery runs.
 
@@ -177,7 +196,9 @@ jobs:
           [ -n "$runs" ] || exit 0
           freshest="$(printf '%s\n' "$runs" | sort -k1,1 -k2,2n | tail -n 1 | awk '{ print $2 }')"
           if [ -n "$freshest" ] && [ "$freshest" != "$GITHUB_RUN_ID" ]; then
-            echo "run $freshest started later than $GITHUB_RUN_ID for $EVENT_NAME on $HEAD_SHA; this run is superseded and will be skipped"
+            note="superseded by run $freshest; run $GITHUB_RUN_ID for $EVENT_NAME on $HEAD_SHA will be skipped"
+            echo "$note"
+            echo "$note" >> "$GITHUB_STEP_SUMMARY"
             echo "superseded=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -450,7 +471,9 @@ jobs:
     #
     # "review gate" told a reader nothing, so both humans and review bots read
     # it as "needs an approving human" -- it does not; it needs resolved threads
-    # and one non-author review, which the bots themselves satisfy.
+    # and one non-author review, which the bots themselves satisfy, either by
+    # approving the current head from the trusted allowlist or by being the
+    # reviewer the roster asked for.
     #
     # Three attempts to fix that with WORDING all failed in practice, including
     # on readers who had just been told what the gate meant. The reason is
@@ -486,7 +509,7 @@ jobs:
             check: 'per-run: awaiting-non-author-review-bots-included'
             status_context: review-gate/non-author-review
             ok_description: reviewed by a non-author
-            fail_description: no non-author review yet - resolves itself when any review bot posts; no human action needed
+            fail_description: no non-author review yet - resolves itself when an allowlisted review bot approves this head, or any review bot the roster asked for posts
     # `per-run:` is load-bearing, not decoration.
     #
     # This gate judges the PR's CURRENT review state, so it re-runs on every
