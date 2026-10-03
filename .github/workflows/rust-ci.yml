@@ -29,10 +29,10 @@ on:
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
-        required: true
+        required: false
       APP_PRIVATE_KEY:
         description: GitHub App private key paired with APP_ID.
-        required: true
+        required: false
 
 # workflow_call ONLY, unlike the copy this was moved from.
 #

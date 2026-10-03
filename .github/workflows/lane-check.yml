@@ -46,9 +46,9 @@ on:
         default: full
     secrets:
       APP_ID:
-        required: true
+        required: false
       APP_PRIVATE_KEY:
-        required: true
+        required: false
 
 permissions: {}
 
@@ -200,6 +200,36 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Required by the optional-secret contract from maxi-config#368: callers
+      # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
+      # public-only lanes) must still run cargo fmt / clippy / test on a
+      # public-only toolchain. The credential-dependent steps below this
+      # point are gated on has_credentials; the basic cargo steps are not.
+      #
+      # Sees only the secrets the CALLER forwards, which for a fork is none.
+      # When the wrapper forwards nothing both expressions evaluate to empty
+      # strings and `secrets.APP_ID != ''` is false, so the gated steps are
+      # skipped and the lane does not fail at the App-token mint with an
+      # opaque "client-id must be set" message.
+      - name: Detect credentials
+        id: credentials
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
+        shell: bash
+        run: |
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
+            echo "has_credentials=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_credentials=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-check in credential-free mode (public Rust checks only, no private policy fetch)."
+            {
+              echo "## lane-check summary"
+              echo "- Lane: lane-check"
+              echo "- Credentials: absent; credential-free mode (no App-token mint, no private policy fetch)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
       # feature) declare them in ci/apt-packages.txt — one package per line,
       # '#' comments allowed. Absent file means no extra packages. The
@@ -211,6 +241,15 @@ jobs:
         uses: maxi-tools/ci/.github/actions/install-apt-packages@main
 
       - name: Generate org repo token
+        # Skipped entirely in credential-free mode (#368). Forks and external
+        # contributors who did not forward APP_ID / APP_PRIVATE_KEY have no
+        # credentials to mint a token with, and the action refuses an empty
+        # app-id with "The 'client-id' (or deprecated 'app-id') input must
+        # be set to a non-empty string". Skipping here is the load-bearing
+        # half of the optional-secret contract: declaring the secrets
+        # optional on workflow_call without this gate would still fail every
+        # downstream step the moment the action ran.
+        if: steps.credentials.outputs.has_credentials == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -253,7 +292,7 @@ jobs:
       # do not vend this action. Same-owner refs are exempted from the
       # external-pin SHA requirement in check_workflow_refs.py.
       - name: Verify sibling path-dependency checkouts
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -265,7 +304,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Fetch maxi-config rust-lane policy
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         # One implementation, in .github/actions/fetch-policy. This block
         # existed in four near-identical copies until #462, which is how #460
         # fixed a live bug in a file nothing runs. Its reasoning -- the
@@ -284,26 +323,26 @@ jobs:
             hooks/clippy-strict-lints.sh
           token: ${{ steps.app-token.outputs.token }}
       - name: Expose installed macOS native build tools
-        if: steps.workspace.outputs.has_workspace == 'true' && runner.os == 'macOS'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' && runner.os == 'macOS'
         shell: bash
         run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
       - name: Verify installed Rust toolchain before cache restore
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
       - name: Cache Rust dependencies
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           prefix-key: v1-rust-no-bin
           cache-bin: false
 
       - name: Verify installed Rust toolchain after cache restore
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
       - name: Configure git for private deps
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -332,7 +371,7 @@ jobs:
           # fetches, so this only fires on a genuinely dead connection.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
-        if: steps.workspace.outputs.has_workspace == 'true'
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked
@@ -368,13 +407,21 @@ jobs:
 
       - name: Lint workspace
         # Same conjunction as Check formatting.
+        # Credential-free mode: the deny tier is sourced from the private
+        # clippy-strict-lints.sh fetched above, so it cannot run without
+        # credentials. Fall back to the default clippy tier (-D warnings)
+        # so the basic lint pass still surfaces real bugs for forks and
+        # external contributors.
         if: ${{ steps.workspace.outputs.has_workspace == 'true' && inputs.repo_policy != 'fork-upstream' }}
+        env:
+          HAS_CREDENTIALS: ${{ steps.credentials.outputs.has_credentials }}
         shell: bash
         run: |
           set -euo pipefail
-          source .maxi-config/hooks/clippy-strict-lints.sh
-          echo "Deny-tier flags:"
-          get_clippy_deny_flags
+          if [ "$HAS_CREDENTIALS" = "true" ]; then
+            source .maxi-config/hooks/clippy-strict-lints.sh
+            echo "Deny-tier flags:"
+            get_clippy_deny_flags
           # Two passes, because the panic-safety denial belongs to shipping
           # code and the lane had no way to say so.
           #
@@ -413,6 +460,10 @@ jobs:
           #
           # Word-splitting of the trusted flag list is intentional.
           # shellcheck disable=SC2046
-          cargo clippy --workspace --all-targets -- $(get_clippy_deny_flags) -A clippy::unwrap_used
-          # shellcheck disable=SC2046
-          cargo clippy --workspace --lib --bins -- $(get_clippy_deny_flags)
+            cargo clippy --workspace --all-targets -- $(get_clippy_deny_flags) -A clippy::unwrap_used
+            # shellcheck disable=SC2046
+            cargo clippy --workspace --lib --bins -- $(get_clippy_deny_flags)
+          else
+            echo "::notice::Credential-free mode: skipping maxi-config deny tier (clippy-strict-lints.sh is private). Running default clippy tier only."
+            cargo clippy --workspace --all-targets -- -D warnings
+          fi
