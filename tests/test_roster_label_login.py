@@ -87,6 +87,15 @@ class RosterLabelCoversItsLogin(unittest.TestCase):
             self.assertTrue(ok, text)
             self.assertIn(who, text)
 
+    def test_qlty_label_covers_actual_review_identity(self):
+        for who in ("qltysh", "qltysh[bot]"):
+            ok, text = self._reviewed_by([who], asked=["qlty"])
+            self.assertTrue(ok, text)
+            self.assertIn(who, text)
+        ok, text = self._reviewed_by(["qlty[bot]"], asked=["qlty"])
+        self.assertFalse(ok, text)
+        self.assertEqual(gate.roster_logins(["qlty"]), {"qltysh"})
+
     def test_maxi_reviewer_label_covers_its_own_login(self):
         # The one reviewer whose label equals its login. It has to keep
         # matching, bare and bracketed, or the mapping regressed the
