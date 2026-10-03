@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_swift_build:
+        description: Skip repository Swift build scripts in Rust-only lanes.
+        required: false
+        type: boolean
+        default: false
     outputs:
       artifact_name:
         description: Cargo release artifact uploaded by the package lane.
@@ -73,6 +78,15 @@ jobs:
     permissions:
       contents: read
     steps:
+      # maxi-tray#460: maximoji-apple honours MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+      # and requires unset or exactly `1`. The GHA `cond && '1' || ''` OFF
+      # spelling writes an empty string, which that crate treats as a hard
+      # error, not "don't skip". A skipped step leaves the variable unset.
+      - name: Map skip_swift_build onto MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+        if: ${{ inputs.skip_swift_build }}
+        shell: bash
+        run: echo "MAXIMOJI_APPLE_SKIP_SWIFT_BUILD=1" >> "$GITHUB_ENV"
+
       - name: Report skipped lane
         if: ${{ !inputs.should_run }}
         run: |

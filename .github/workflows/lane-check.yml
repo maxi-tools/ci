@@ -146,6 +146,15 @@ jobs:
     permissions:
       contents: read
     steps:
+      # maxi-tray#460: maximoji-apple honours MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+      # and requires unset or exactly `1`. The GHA `cond && '1' || ''` OFF
+      # spelling writes an empty string, which that crate treats as a hard
+      # error, not "don't skip". A skipped step leaves the variable unset.
+      - name: Map skip_swift_build onto MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+        if: ${{ inputs.skip_swift_build }}
+        shell: bash
+        run: echo "MAXIMOJI_APPLE_SKIP_SWIFT_BUILD=1" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         # Checkout is where jobs actually wedge: git has no default stall
         # timeout, so a dead HTTPS fetch parks `git remote-https` at 0% CPU
