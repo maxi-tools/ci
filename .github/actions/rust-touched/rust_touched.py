@@ -332,6 +332,23 @@ def _lane_script_rule(
     return None
 
 
+def _crate_dir(current: pathlib.Path, root: pathlib.Path) -> str:
+    """The crate subtree `current` sits in, "" when it is the root crate.
+
+    Shared by the unresolved-site walk and the invoker scan. The
+    repository root counts as a crate boundary when a root Cargo.toml
+    exists (single-crate layout): `relative_to(root)` yields "." there,
+    which no changed path ever equals, so recording it verbatim would
+    make the widening rules never fire for root crates -- exactly the
+    false skip they exist to prevent.
+    """
+    rel = current.relative_to(root).as_posix()
+    # "." (the root crate) prefixes nothing; "" prefixes everything,
+    # which is the honest meaning for a crate whose manifest sits at
+    # the repository root.
+    return "" if rel == "." else rel
+
+
 def _unresolved_crates(unresolved: list[str], root: pathlib.Path) -> list[str]:
     """Crate directories containing the unresolvable include sites.
 
@@ -358,11 +375,7 @@ def _unresolved_crates(unresolved: list[str], root: pathlib.Path) -> list[str]:
         current = probe.parent
         while True:
             if (current / "Cargo.toml").is_file():
-                rel = current.relative_to(root).as_posix()
-                # "." (the root crate) prefixes nothing; "" prefixes
-                # everything, which is the honest meaning for a crate
-                # whose manifest sits at the repository root.
-                crates.add("" if rel == "." else rel)
+                crates.add(_crate_dir(current, root))
                 break
             if current == root or current.parent == current:
                 whole_tree = True
@@ -397,7 +410,7 @@ def _macro_name_at(site: pathlib.Path, line_no: int) -> str | None:
         return None
     prefix = "\n".join(text.split("\n")[: max(line_no, 1)])
     found = None
-    for match in re.finditer(r"macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)", prefix):
+    for match in re.finditer(r"macro_rules!\s*(\w+)", prefix):
         found = match.group(1)
     return found
 
@@ -422,8 +435,7 @@ def _invoker_crates(root: pathlib.Path, macro: str) -> set[str]:
                 current = path.parent
                 while True:
                     if (current / "Cargo.toml").is_file():
-                        rel = current.relative_to(root).as_posix()
-                        crates.add("" if rel == "." else rel)
+                        crates.add(_crate_dir(current, root))
                         break
                     if current == root or current.parent == current:
                         crates.add("")
