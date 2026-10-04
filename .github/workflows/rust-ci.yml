@@ -26,6 +26,37 @@ on:
         required: false
         type: boolean
         default: false
+      mac_lanes:
+        # Opt-in declaration that this consumer keeps heavy macOS jobs in its
+        # own standalone workflow(s), and that those workflows wait on THIS
+        # template's Linux gate before claiming a Mac runner. Non-empty means
+        # the consumer has (or is adopting) a completion-triggered Mac lane;
+        # the output below is what the standalone workflow reads. Empty (the
+        # default) changes nothing for the 57 wrappers that do not use it.
+        description: Declared standalone macOS lane(s) that gate on this workflow's linux_gate output.
+        required: false
+        type: string
+        default: ''
+    outputs:
+      linux_gate:
+        # The fail-fast handoff for standalone macOS lanes. `needs.merge-gate`
+        # has `always()` in its `if:` (the fork-tripwire shape, above), so the
+        # job is present -- and this output is published -- even when a lane
+        # failed: the value is the job's RESULT, not a boolean, precisely so
+        # the consumer can distinguish "still running" (no event) from
+        # "concluded" (completed webhook) from "concluded red" (failure).
+        # `skipped` is a passing value by the same rule the Aggregate step
+        # uses: fan-out and docs-only PRs skip lanes deliberately, and those
+        # PRs must not wedge the consumer's Mac lane forever.
+        description: Result of this workflow's merge-gate aggregate (success, skipped, failure, or cancelled).
+        # Routed through a job-level output rather than read directly as
+        # `jobs.merge-gate.result` on purpose. The direct form is valid per
+        # GitHub's contexts reference, but actionlint types a job that CALLS
+        # a reusable workflow as {outputs: {}} and flags `.result` on it
+        # (rhysd/actionlint#343) -- and self-check.yml runs actionlint with
+        # fail-on-error. `job.status` in the final always() step IS the job
+        # conclusion, so the published value is identical.
+        value: ${{ jobs.merge-gate.outputs.gate_result }}
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
@@ -98,6 +129,12 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       always()
     needs: [plan, check, test, package, sign-publish, release-verify]
+    outputs:
+      # Consumed by on.workflow_call.outputs.linux_gate. Kept as a job-level
+      # output instead of a direct `jobs.merge-gate.result` read so
+      # actionlint's reusable-call typing (rhysd/actionlint#343) does not
+      # fail self-check on a valid expression.
+      gate_result: ${{ steps.gate-result.outputs.result }}
     # Deliberately self-hosted rather than a hosted runner: when hosted
     # capacity is unavailable a job is rejected before a runner is assigned --
     # zero steps, no log, seconds to "failure" -- so this sentinel reported the
@@ -181,6 +218,18 @@ jobs:
                      if info.get("result") == "skipped"]
           print(f"All required lanes passed (or were skipped). skipped={skipped}")
           PY
+
+      # Published for the linux_gate workflow output (see on.workflow_call
+      # above): standalone macOS lanes in wrapper repositories read this as
+      # their fail-fast handoff. Always runs, for the same reason Aggregate
+      # does -- a failed lane must still produce a published conclusion.
+      - name: Publish gate result
+        id: gate-result
+        if: always()
+        env:
+          GATE_RESULT: ${{ job.status }}
+        shell: bash
+        run: echo "result=$GATE_RESULT" >> "$GITHUB_OUTPUT"
 
   plan:
     # The gate for the WHOLE lane chain. `check`, `test`, `package`,
