@@ -395,7 +395,7 @@ def _macro_name_at(site: pathlib.Path, line_no: int) -> str | None:
         text = site.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    prefix = "\n".join(text.split("\n")[:max(line_no, 1)])
+    prefix = "\n".join(text.split("\n")[: max(line_no, 1)])
     found = None
     for match in re.finditer(r"macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)", prefix):
         found = match.group(1)
