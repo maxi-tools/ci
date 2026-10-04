@@ -65,7 +65,8 @@ def consumer_repo(root: pathlib.Path) -> pathlib.Path:
     # Heavy lanes, freya's names.
     (wf / "rust_test.yml").write_text(
         "jobs:\n  build:\n    steps:\n"
-        "    - uses: dtolnay/rust-toolchain@1.94\n"
+        "    - uses: dtolnay/rust-toolchain@"
+        "1.94\n"
         "    - run: just t\n",
         encoding="utf-8",
     )
@@ -220,7 +221,8 @@ class BuildDefiningWidens(unittest.TestCase):
     def test_script_a_heavy_workflow_runs_widens(self):
         (self.root / ".github/workflows/rust_test.yml").write_text(
             "jobs:\n  build:\n    steps:\n"
-            "    - uses: dtolnay/rust-toolchain@1.94\n"
+            "    - uses: dtolnay/rust-toolchain@"
+            "1.94\n"
             "    - run: python3 .github/scripts/check_something.py\n",
             encoding="utf-8",
         )
