@@ -58,8 +58,7 @@ def consumer_repo(root: pathlib.Path) -> pathlib.Path:
     # The fan-out target: a pin bump in a workflow with no Rust content.
     (wf / "review-gate.yml").write_text(
         "jobs:\n  review-gate:\n    uses: maxi-tools/ci/.github/workflows/"
-        "review-gate-reusable.yml@2d93"
-        "da95eb16\n",
+        "review-gate-reusable.yml@fake-pin-ref\n",
         encoding="utf-8",
     )
     # Heavy lanes, freya's names.
@@ -181,8 +180,7 @@ class BuildDefiningWidens(unittest.TestCase):
         """The thin `uses: .../rust-ci.yml@sha` wrapper is the lanes."""
         (self.root / ".github/workflows/ci.yml").write_text(
             "jobs:\n  merge-gate:\n    uses: maxi-tools/ci/.github/workflows/"
-            "rust-ci.yml@e8a4"
-            "eec2da9c\n",
+            "rust-ci.yml@fake-pin-ref\n",
             encoding="utf-8",
         )
         needed, why = self.decide([".github/workflows/ci.yml"], self.root)
