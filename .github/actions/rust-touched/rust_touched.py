@@ -81,6 +81,27 @@ RUST_EXACT = {
     "Justfile",
 }
 RUST_PREFIX = (".cargo/", ".github/actions/")
+# Subtrees whose contents are read at BUILD or TEST time by conventions
+# this action cannot see statically. A build script consuming
+# proto/api.proto (tonic_build) changes generated Rust when the proto
+# changes; a test reading tests/fixtures/case.json changes its verdict
+# when the fixture changes. Neither matches a name rule or an
+# include_* site, so the SUBTREE widens -- over-inclusive in the
+# direction that costs minutes, not premise. `ci/` because the shared
+# lanes read consumer-side files there (apt-packages.txt et al).
+RUST_SUBTREE_WIDEN = (
+    "proto/",
+    "protos/",
+    "tests/fixtures/",
+    "test_fixtures/",
+    "ci/",
+)
+# Basename tokens marking a workflow as a build or test lane even when
+# the post-change tree no longer classifies it as build-defining (the
+# rust usage was just removed from it, or it was deleted). Paired with
+# the .github/workflows/ rule in build_defining so defanging or
+# deleting a heavy workflow widens instead of silently narrowing.
+HEAVY_WORKFLOW_TOKENS = ("build", "test", "lint", "android")
 # A manifest or build script under any member, not just the root.
 # `clippy.toml` changes the `cargo clippy` contract wherever in the tree
 # it sits, so it is matched by basename like a manifest.
@@ -240,6 +261,23 @@ def build_defining(
         return f"{path} is a submodule of this repository"
     if path.startswith(RUST_PREFIX):
         return f"{path} defines the build"
+    if path.startswith(RUST_SUBTREE_WIDEN):
+        return (
+            f"{path} is build or test input read by convention "
+            "(proto source, fixture, or consumer-side CI file)"
+        )
+    if path.startswith(".github/workflows/"):
+        # A heavy workflow EDITED OFF the build-defining set (its rust
+        # usage removed, or the file deleted outright) is not in
+        # `workflows` -- computed from the post-change tree -- so the
+        # set-based rules above stay silent exactly when the workflow
+        # that runs the lanes is the thing being weakened. Match the
+        # basename: orchestration files (review-gate, spelling,
+        # release-drafter) stay skippable, anything named like a build
+        # or test lane widens.
+        base = pathlib.PurePosixPath(path).name
+        if any(token in base.lower() for token in HEAVY_WORKFLOW_TOKENS):
+            return f"{path} is a build or test lane workflow"
     if pathlib.PurePosixPath(path).name in RUST_BASENAME:
         return f"{path} is a manifest or build script"
     target = root / path
@@ -300,10 +338,14 @@ def _unresolved_crates(unresolved: list[str], root: pathlib.Path) -> list[str]:
     Each entry of `unresolved` is `path:line: note` or `path: note`,
     repo-relative. The crate is found by walking up from the site to
     the nearest ancestor holding a Cargo.toml -- the same boundary
-    cargo uses. Sites with no crate ancestor (a build script at the
-    repo root, say) widen the whole tree: their `external/` asset
-    directory could be anywhere, and the failure direction of this
-    module is run-the-lane.
+    cargo uses. The REPOSITORY ROOT counts as a crate boundary when a
+    root Cargo.toml exists (single-crate layout): `relative_to(root)`
+    yields "." there, which no changed path ever equals, so recording
+    it verbatim would make this rule never fire for root crates --
+    exactly the false skip it exists to prevent. Sites with no crate
+    ancestor at all widen the whole tree: their asset directory could
+    be anywhere, and the failure direction of this module is
+    run-the-lane.
     """
     crates: set[str] = set()
     whole_tree = False
@@ -316,7 +358,11 @@ def _unresolved_crates(unresolved: list[str], root: pathlib.Path) -> list[str]:
         current = probe.parent
         while True:
             if (current / "Cargo.toml").is_file():
-                crates.add(str(current.relative_to(root)))
+                rel = current.relative_to(root).as_posix()
+                # "." (the root crate) prefixes nothing; "" prefixes
+                # everything, which is the honest meaning for a crate
+                # whose manifest sits at the repository root.
+                crates.add("" if rel == "." else rel)
                 break
             if current == root or current.parent == current:
                 whole_tree = True
@@ -334,6 +380,58 @@ def _in_crates(path: str, crates: list[str]) -> str | None:
         if not crate or path == crate or path.startswith(crate + "/"):
             return crate or "(the whole tree)"
     return None
+
+
+def _macro_name_at(site: pathlib.Path, line_no: int) -> str | None:
+    """The macro_rules! a site sits inside, or None.
+
+    `line_no` is 1-based, matching the notes' format. The innermost
+    definition BEFORE the site on the same file wins; a site outside
+    any macro returns None. Comment-only matches are harmless here:
+    a phantom name just widens whatever crates invoke a macro of that
+    name, and widening is the safe direction.
+    """
+    try:
+        text = site.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    prefix = "\n".join(text.split("\n")[:max(line_no, 1)])
+    found = None
+    for match in re.finditer(r"macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)", prefix):
+        found = match.group(1)
+    return found
+
+
+def _invoker_crates(root: pathlib.Path, macro: str) -> set[str]:
+    """Crates whose Rust invokes `macro` -- asset paths may live there.
+
+    A `macro_rules!` body with `include_bytes!($path)` resolves its
+    argument at each INVOCATION, so the asset can sit beside any
+    caller, not inside the defining crate. The invocation sites name
+    their crates; those subtrees widen too.
+    """
+    pattern = re.compile(rf"\b{re.escape(macro)}\s*!")
+    crates: set[str] = set()
+    for path in root.rglob("*.rs"):
+        # Vendored/external trees are not part of the build's source.
+        parts = path.relative_to(root).parts
+        if any(p in ("target", "external") for p in parts[:-1]):
+            continue
+        try:
+            if pattern.search(path.read_text(encoding="utf-8", errors="replace")):
+                current = path.parent
+                while True:
+                    if (current / "Cargo.toml").is_file():
+                        rel = current.relative_to(root).as_posix()
+                        crates.add("" if rel == "." else rel)
+                        break
+                    if current == root or current.parent == current:
+                        crates.add("")
+                        break
+                    current = current.parent
+        except OSError:
+            crates.add("")
+    return crates
 
 
 def _compiled_input_rule(
@@ -366,6 +464,15 @@ def _compiled_input_rule(
         # so the subtree is what widens. A diff OUTSIDE every such
         # crate still skips; a diff inside one runs every lane.
         crates = _unresolved_crates(unresolved, root)
+        # Invokers of the macros those sites sit in widen too: a
+        # macro's include resolves at each call site, so the asset can
+        # live beside a caller outside the defining crate.
+        for note in unresolved:
+            parts = note.split(":", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                macro = _macro_name_at(root / parts[0], int(parts[1]))
+                if macro:
+                    crates = sorted(set(crates) | _invoker_crates(root, macro))
         for path in changed:
             crate = _in_crates(path, crates)
             if crate:

@@ -267,6 +267,92 @@ class CompiledInputsStillGuard(unittest.TestCase):
         needed, _ = self.decide(["src/main.rs"])
         self.assertTrue(needed)
 
+    def test_a_macro_include_widens_the_invoking_crate_too(self):
+        # The defining crate: macro body's include cannot be resolved
+        # statically ($path is a macro parameter).
+        (self.root / "crates/defining").mkdir(parents=True)
+        (self.root / "crates/defining/Cargo.toml").write_text(
+            "[package]\n", encoding="utf-8"
+        )
+        (self.root / "crates/defining/src").mkdir(parents=True)
+        (self.root / "crates/defining/src/lib.rs").write_text(
+            "macro_rules! embed {\n"
+            "    ($path:expr) => {\n"
+            "        const ASSET: &[u8] = include_bytes!($path);\n"
+            "    };\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        # The caller, in a DIFFERENT crate, beside its own asset.
+        (self.root / "crates/caller").mkdir(parents=True)
+        (self.root / "crates/caller/Cargo.toml").write_text(
+            "[package]\n", encoding="utf-8"
+        )
+        (self.root / "crates/caller/assets").mkdir(parents=True)
+        (self.root / "crates/caller/assets/logo.png").write_bytes(b"png")
+        (self.root / "crates/caller/src").mkdir(parents=True)
+        (self.root / "crates/caller/src/lib.rs").write_text(
+            'defining::embed!("../assets/logo.png");\n', encoding="utf-8"
+        )
+        # The asset lives in the CALLER's subtree, outside the crate
+        # the unresolvable site is defined in: the invocation-text scan
+        # must widen the caller's subtree, not just the defining one.
+        needed, why = self.decide(["crates/caller/assets/logo.png"])
+        self.assertTrue(needed, why)
+
+    def test_a_proto_widens(self):
+        needed, why = self.decide(["proto/api.proto"])
+        self.assertTrue(needed)
+        self.assertIn("build or test input", why)
+
+    def test_a_fixture_widens(self):
+        needed, why = self.decide(["tests/fixtures/case.json"])
+        self.assertTrue(needed)
+        self.assertIn("build or test input", why)
+
+    def test_the_ci_subtree_widens(self):
+        # Consumer-side files the shared lanes read (apt-packages.txt)
+        # sit under ci/ in the consumer repo.
+        needed, why = self.decide(["ci/apt-packages.txt"])
+        self.assertTrue(needed)
+        self.assertIn("build or test input", why)
+
+    def test_a_defanged_build_workflow_still_widens(self):
+        # The heavy workflow with every rust token stripped from it is
+        # no longer in the build-defining set -- the basename rule must
+        # still catch the edit that weakened it.
+        (self.root / ".github/workflows/rust_build.yml").write_text(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - run: echo hi\n",
+            encoding="utf-8",
+        )
+        needed, why = self.decide([".github/workflows/rust_build.yml"])
+        self.assertTrue(needed, why)
+        self.assertIn("build or test lane workflow", why)
+
+    def test_a_deleted_build_workflow_name_widens(self):
+        # A deleted workflow leaves only its old path in the list.
+        needed, why = self.decide([".github/workflows/rust_test.yml"])
+        self.assertTrue(needed, why)
+
+    def test_a_renamed_included_file_widens_via_previous_name(self):
+        (self.root / "src").mkdir()
+        (self.root / "src/main.rs").write_text(
+            'const G: &str = include_str!("../docs/EMOJI_GUIDE.md");\n',
+            encoding="utf-8",
+        )
+        # The collector emits previous_filename for renames; the new
+        # name alone points nowhere, the old name still compiles-in.
+        needed, _ = self.decide(["docs/GUIDE_RENAMED.md", "docs/EMOJI_GUIDE.md"])
+        self.assertTrue(needed)
+
+    def test_orchestration_workflows_still_skip(self):
+        # The conservative workflow rule must not eat the skip this
+        # action exists to deliver: orchestration-only files keep
+        # skipping.
+        needed, why = self.decide([".github/workflows/review-gate.yml"])
+        self.assertFalse(needed, why)
+
 
 class RealRepositorySmoke(unittest.TestCase):
     """Run the classifier against THIS repository's own tree.

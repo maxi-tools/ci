@@ -269,7 +269,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            files="$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')"
+            # `previous_filename` as well as `filename`: a rename emits
+            # only the new name, and the classifier (and the docs-only
+            # and packaging classifiers below) must see the old path a
+            # rename abandoned -- an include_str! may still point at it.
+            # The action's own API fallback already emits both; this
+            # list is what reaches it here, so it must not be narrower.
+            files="$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --jq '.[] | .filename, (.previous_filename // empty)')"
           else
             before="$BASE_REF"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
