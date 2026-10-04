@@ -206,7 +206,7 @@ class BuildDefiningWidens(unittest.TestCase):
         self.assertIn("submodule", why)
 
     def test_editing_the_submodule_map_widens(self):
-        needed, why = self.decide([".gitmodules"], self.root)
+        needed, _ = self.decide([".gitmodules"], self.root)
         self.assertTrue(needed)
 
     def test_github_actions_dir_widens(self):
