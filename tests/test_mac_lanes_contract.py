@@ -16,8 +16,11 @@ are about to fail. The fix has two halves, and this file pins both:
      by a path taken from an input, and a relative `./` path resolves in the
      CALLEE's checkout (maxi-tools/ci), never the consumer's. The input
      exists so the wrapper fan-out (scripts/rust_ci_render.py in
-     maxi-config) can carry the consumer's declaration the way it carries
-     `allow_unwrap_used`, and so `grep mac_lanes .github/workflows/ci.yml`
+     maxi-config) can carry the consumer's declaration -- the renderer
+     special-cases a NON-EMPTY consumer mac_lanes the way it special-cases
+     a fork's repo_policy, because the template declares the key and the
+     ordinary template-wins rule would reset the declaration to '' on
+     every tick -- and so `grep mac_lanes .github/workflows/ci.yml`
      is a true statement about which repos adopted the chain.
 
   2. The consumer's standalone workflow reads the gate through the
@@ -161,7 +164,8 @@ class MacLanesContractTest(unittest.TestCase):
             "mac_lanes", text.split("jobs:", 1)[1],
             "rust-ci.yml's jobs section must not reference mac_lanes. The "
             "input is a declaration for the consumer's own standalone "
-            "workflows (and for the wrapper fan-out to preserve), not a "
+            "workflows (and the wrapper fan-out preserves a non-empty "
+            "value via rust_ci_render.py's mac_lanes special-case), not a "
             "value the template can act on: `uses:` takes no expressions, "
             "and a relative path would resolve inside maxi-tools/ci rather "
             "than the consumer. If GitHub ever ships dynamic `uses:`, "
