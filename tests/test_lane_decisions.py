@@ -107,6 +107,43 @@ class ClassifyChangeScope(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.scope(path)[0], "full")
 
+    def test_a_classifier_skip_classifies_merge_gate_only(self):
+        """The rust-touched verdict widens the skip beyond docs.
+
+        A review-gate pin bump is not documentation, so the docs-only
+        arm would run every lane for it. The classifier's positive
+        `false` must take the same merge-gate-only path the docs arm
+        takes, or the saving this gate exists for never arrives.
+        """
+        body = step_run(LANE_PLAN, "lane-plan", "Classify change scope")
+        rc, log, outputs = run_bash(body, {
+            "CHANGED_FILES": ".github/workflows/review-gate.yml",
+            "RUST_TOUCHED": "false",
+            "RUST_TOUCHED_REASON": "none of 1 changed file(s) can reach rustc",
+        })
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(outputs.get("scope"), "merge-gate-only")
+        self.assertIn("can reach rustc", outputs.get("scope_reason", ""))
+
+    def test_a_missing_classifier_verdict_runs_every_lane(self):
+        """No verdict is not a skip: the default direction is full."""
+        body = step_run(LANE_PLAN, "lane-plan", "Classify change scope")
+        rc, log, outputs = run_bash(body, {
+            "CHANGED_FILES": ".github/workflows/review-gate.yml",
+        })
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(outputs.get("scope"), "full")
+
+    def test_a_true_classifier_verdict_runs_every_lane(self):
+        body = step_run(LANE_PLAN, "lane-plan", "Classify change scope")
+        rc, log, outputs = run_bash(body, {
+            "CHANGED_FILES": ".github/workflows/rust_test.yml",
+            "RUST_TOUCHED": "true",
+            "RUST_TOUCHED_REASON": "defines the build",
+        })
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(outputs.get("scope"), "full")
+
 
 class AggregateLaneResults(unittest.TestCase):
     def aggregate(self, needs: dict):

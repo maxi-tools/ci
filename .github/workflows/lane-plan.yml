@@ -288,11 +288,41 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
+      # The compiled-inputs classifier maxi-core uses (measured there:
+      # 12 of the last 25 merged PRs touched no Rust and still spent
+      # 352 runner-minutes in compile lanes), published here as an
+      # action so PUBLIC consumers resolve it -- maxi-config's copy of
+      # this step cannot serve them, which is the split this repository
+      # exists for. Referenced by its full owner/repo path, not
+      # `./.github/actions/...`, which would resolve against the
+      # CALLER's workspace and find nothing.
+      #
+      # Fail direction: the action's outputs default to
+      # `rust-touched=true` on every internal failure (unread diff,
+      # unread index, unreadable repository), so a lane is skipped only
+      # on a POSITIVE verdict that nothing in the diff can reach rustc.
+      # The skip it produces is the `merge-gate-only` scope the lanes
+      # already understand: a skipped lane's check run stays present as
+      # `skipped`, which required-status-check evaluation accepts.
+      - name: Decide whether the Rust lanes must run
+        id: rust-touched
+        uses: maxi-tools/ci/.github/actions/rust-touched@main
+        with:
+          changed-files: ${{ steps.files.outputs.changed_files }}
+
       - name: Classify change scope
         id: scope
         shell: bash
         env:
           CHANGED_FILES: ${{ steps.files.outputs.changed_files }}
+          # `${{-}}` interpolation of a failed step's outputs yields an
+          # empty string, and the body below is also driven directly by
+          # tests/test_lane_decisions.py with CHANGED_FILES alone -- so
+          # the default lives in the BODY (`${RUST_TOUCHED:-true}`), not
+          # only in the interpolation: the direction of a missing
+          # verdict is ALWAYS run the lanes.
+          RUST_TOUCHED: ${{ steps.rust-touched.outputs.rust-touched || 'true' }}
+          RUST_TOUCHED_REASON: ${{ steps.rust-touched.outputs.rust-touched-reason || 'classifier did not report a verdict' }}
         run: |
           set -euo pipefail
           docs_only=true
@@ -326,6 +356,15 @@ jobs:
           if [ "$seen" -eq 0 ]; then
             echo "scope=full" >> "$GITHUB_OUTPUT"
             echo "scope_reason=changed-file lookup returned nothing; refusing to skip lanes on an unread diff" >> "$GITHUB_OUTPUT"
+          elif [ "${RUST_TOUCHED:-true}" = "false" ]; then
+            # The classifier's POSITIVE verdict that no changed path can
+            # reach rustc: not documentation (a review-gate pin bump is
+            # not a doc), but provably outside the build. Same skip the
+            # docs-only path takes, and the same guarantee -- the check
+            # runs stay present as `skipped`, so a required context is
+            # satisfied rather than absent.
+            echo "scope=merge-gate-only" >> "$GITHUB_OUTPUT"
+            echo "scope_reason=no changed path can reach rustc: ${RUST_TOUCHED_REASON}" >> "$GITHUB_OUTPUT"
           elif [ "$docs_only" = "true" ]; then
             echo "scope=merge-gate-only" >> "$GITHUB_OUTPUT"
             echo "scope_reason=all changed paths are documentation or metadata" >> "$GITHUB_OUTPUT"
