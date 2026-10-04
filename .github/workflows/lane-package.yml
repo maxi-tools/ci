@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_swift_build:
+        description: Skip repository Swift build scripts in Rust-only lanes.
+        required: false
+        type: boolean
+        default: false
     outputs:
       artifact_name:
         description: Cargo release artifact uploaded by the package lane.
@@ -34,9 +39,9 @@ on:
 
     secrets:
       APP_ID:
-        required: true
+        required: false
       APP_PRIVATE_KEY:
-        required: true
+        required: false
 
 permissions: {}
 
@@ -70,6 +75,15 @@ jobs:
     permissions:
       contents: read
     steps:
+      # maxi-tray#460: maximoji-apple honours MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+      # and requires unset or exactly `1`. The GHA `cond && '1' || ''` OFF
+      # spelling writes an empty string, which that crate treats as a hard
+      # error, not "don't skip". A skipped step leaves the variable unset.
+      - name: Map skip_swift_build onto MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+        if: ${{ inputs.skip_swift_build }}
+        shell: bash
+        run: echo "MAXIMOJI_APPLE_SKIP_SWIFT_BUILD=1" >> "$GITHUB_ENV"
+
       - name: Report skipped lane
         if: ${{ !inputs.should_run }}
         run: |
@@ -95,8 +109,39 @@ jobs:
         if: ${{ inputs.should_run && runner.os == 'Linux' }}
         uses: $/.github/actions/install-apt-packages
 
-      - name: Generate org repo token
+      # Required by the optional-secret contract from maxi-config#368: callers
+      # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
+      # public-only lanes) must still produce release artifacts when
+      # packaging_impact is true, even without an App-token. The
+      # credential-dependent steps below this point are gated on
+      # has_credentials; cargo build --release still runs on the runner's
+      # default toolchain.
+      - name: Detect credentials
+        id: credentials
         if: ${{ inputs.should_run }}
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
+        shell: bash
+        run: |
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
+            echo "has_credentials=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_credentials=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-package in credential-free mode (public release build only, no App-token mint, no private dependency fetch)."
+            {
+              echo "## lane-package summary"
+              echo "- Lane: lane-package"
+              echo "- Credentials: absent; credential-free mode (no App-token mint, no private policy fetch)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Generate org repo token
+        # Skipped entirely in credential-free mode (#368). Forks and external
+        # contributors who did not forward APP_ID / APP_PRIVATE_KEY have no
+        # credentials to mint a token with, and the action refuses an empty
+        # app-id.
+        if: ${{ inputs.should_run && steps.credentials.outputs.has_credentials == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -178,9 +223,10 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+
       - name: Install Rust toolchain
         if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
 
       # Fails fast, with an attributable error, when a Cargo `path =
       # "../<repo>"` dependency does not resolve to a real checkout beside
@@ -201,13 +247,13 @@ jobs:
       # different runner), so it must do its own sibling verify rather than
       # rely on lane-check having already done it.
       - name: Verify sibling path-dependency checkouts
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.credentials.outputs.has_credentials == 'true' }}
         uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
         with:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Fetch maxi-config rust-lane policy
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         # One implementation, in .github/actions/fetch-policy. This block
         # existed in four near-identical copies until #462, which is how #460
         # fixed a live bug in a file nothing runs. Its reasoning -- the
@@ -221,26 +267,26 @@ jobs:
             scripts/emit-runner-paths.sh
           token: ${{ steps.app-token.outputs.token }}
       - name: Expose installed macOS native build tools
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && runner.os == 'macOS' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' && runner.os == 'macOS' }}
         shell: bash
         run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
       - name: Verify installed Rust toolchain before cache restore
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
       - name: Cache Rust dependencies
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           prefix-key: v1-rust-no-bin
           cache-bin: false
 
       - name: Verify installed Rust toolchain after cache restore
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         shell: bash
         run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
       - name: Configure git for private deps
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -265,7 +311,7 @@ jobs:
           # connection parks `git remote-https` at 0% CPU indefinitely.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked

@@ -14,7 +14,7 @@ description: >
   bug came to be fixed in one copy alone, where it reached no consumer
   (#460, #461), and how #459-style divergence would have stayed hidden:
   nothing in the tree marked which copies were live. This action is the
-  collapse (#174).
+  collapse (maxi-tools/maxi-config#174).
 
   Referenced by its full owner/repo path (maxi-tools/<repo>/...@main).
   `./.github/actions/...` would resolve against the CALLER's workspace,

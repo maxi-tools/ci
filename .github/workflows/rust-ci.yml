@@ -29,10 +29,10 @@ on:
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
-        required: true
+        required: false
       APP_PRIVATE_KEY:
         description: GitHub App private key paired with APP_ID.
-        required: true
+        required: false
 
 # workflow_call ONLY, unlike the copy this was moved from.
 #
@@ -287,6 +287,7 @@ jobs:
       should_run: ${{ needs.plan.outputs.packaging_impact == 'true' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
       skip_reason: no packaging impact on an ordinary PR
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
+      skip_swift_build: ${{ inputs.skip_swift_build == true }}
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}

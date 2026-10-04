@@ -52,9 +52,9 @@ on:
 
     secrets:
       APP_ID:
-        required: true
+        required: false
       APP_PRIVATE_KEY:
-        required: true
+        required: false
 
 permissions: {}
 
@@ -84,12 +84,12 @@ jobs:
     # wedged router from stalling the whole lane chain behind it.
     timeout-minutes: 15
     outputs:
-      runs_on: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on }}
-      provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}
-      packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}
-      packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}
-      scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope }}
-      scope_reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason }}
+      runs_on: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on || steps.credentials-fallback.outputs.runs-on }}
+      provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider || steps.credentials-fallback.outputs.provider }}
+      packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact || steps.credentials-fallback.outputs.packaging_impact }}
+      packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason || steps.credentials-fallback.outputs.packaging_reason }}
+      scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope || steps.credentials-fallback.outputs.scope }}
+      scope_reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason || steps.credentials-fallback.outputs.scope_reason }}
     permissions:
       contents: read
       pull-requests: read
@@ -122,6 +122,31 @@ jobs:
             exit 1
           fi
 
+      # Required by the optional-secret contract from maxi-config#368: callers
+      # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
+      # public-only lanes) must still produce a plan, even without an
+      # App-token. The credential-dependent steps below this point are gated
+      # on has_credentials. In credential-free mode we fall back to the
+      # dependabot-style native runner.
+      - name: Detect credentials
+        id: credentials
+        if: github.actor != 'dependabot[bot]'
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
+        shell: bash
+        run: |
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
+            echo "has_credentials=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_credentials=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-plan in credential-free mode (native runner only, no App-token mint, no private policy fetch)."
+            {
+              echo "## lane-plan summary"
+              echo "- Credentials: absent; credential-free mode (native runner fallback, no App-token mint, no private policy fetch)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Checkout caller repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         timeout-minutes: 10
@@ -144,7 +169,7 @@ jobs:
       # ARE available, so the real routing policy should be read. The other
       # dependabot guards in this fleet are keyed the same way.
       - name: Generate org repo token
-        if: ${{ github.actor != 'dependabot[bot]' }}
+        if: github.actor != 'dependabot[bot]' && steps.credentials.outputs.has_credentials == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -191,7 +216,7 @@ jobs:
           permission-organization-self-hosted-runners: read
 
       - name: Checkout maxi-config policy
-        if: ${{ github.actor != 'dependabot[bot]' }}
+        if: github.actor != 'dependabot[bot]' && steps.credentials.outputs.has_credentials == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         timeout-minutes: 10
         with:
@@ -225,7 +250,7 @@ jobs:
           persist-credentials: false
 
       - name: Resolve runner
-        if: ${{ github.actor != 'dependabot[bot]' }}
+        if: github.actor != 'dependabot[bot]' && steps.credentials.outputs.has_credentials == 'true'
         id: resolve
         uses: ./.maxi-config/.github/actions/resolve-runner
         with:
@@ -310,7 +335,7 @@ jobs:
           fi
 
       - name: Plan packaging impact
-        if: ${{ github.actor != 'dependabot[bot]' }}
+        if: github.actor != 'dependabot[bot]' && steps.credentials.outputs.has_credentials == 'true'
         id: packaging
         shell: bash
         env:
@@ -354,14 +379,43 @@ jobs:
             echo 'scope_reason=dependabot: changed files are unreadable without an app token; conservatively full'
           } >> "$GITHUB_OUTPUT"
 
+      # Same trade as the Dependabot fallback above, but for any other
+      # credential-free caller (forks, external contributors, public-only
+      # lanes) who did not forward APP_ID / APP_PRIVATE_KEY. We still need a
+      # router answer so the downstream lanes are not skipped behind a
+      # failed plan. The native runner set is the same one Dependabot's
+      # fallback uses, and `packaging_impact=false` plus `scope=full` is the
+      # honest answer when the private policy cannot be read. The merge to
+      # main re-runs this chain with credentials, where the real policy is
+      # applied.
+      - name: Use native lane for credential-free caller
+        if: github.actor != 'dependabot[bot]' && steps.credentials.outputs.has_credentials == 'false'
+        id: credentials-fallback
+        run: |
+          {
+            echo 'runs-on=["self-hosted","Linux","X64"]'
+            echo 'provider=self-hosted'
+            echo 'packaging_impact=false'
+            echo 'packaging_reason=credential-free: routing and packaging policy are unreadable without an app token; planned on merge to main instead'
+            echo 'scope=full'
+            echo 'scope_reason=credential-free: changed files are unreadable without an app token; conservatively full'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Lane summary
+        env:
+          RUNNER_LABEL: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on || steps.credentials-fallback.outputs.runs-on }}
+          PROVIDER: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider || steps.credentials-fallback.outputs.provider }}
+          PACKAGING_IMPACT: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact || steps.credentials-fallback.outputs.packaging_impact }}
+          PACKAGING_REASON: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason || steps.credentials-fallback.outputs.packaging_reason }}
+          SCOPE: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope || steps.credentials-fallback.outputs.scope }}
+          SCOPE_REASON: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason || steps.credentials-fallback.outputs.scope_reason }}
         run: |
           {
             echo "## lane-plan summary"
-            echo "- Runner: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on }}"
-            echo "- Provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}"
-            echo "- Packaging impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}"
-            echo "- Packaging reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}"
-            echo "- Scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope }}"
-            echo "- Scope reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason }}"
+            echo "- Runner: $RUNNER_LABEL"
+            echo "- Provider: $PROVIDER"
+            echo "- Packaging impact: $PACKAGING_IMPACT"
+            echo "- Packaging reason: $PACKAGING_REASON"
+            echo "- Scope: $SCOPE"
+            echo "- Scope reason: $SCOPE_REASON"
           } >> "$GITHUB_STEP_SUMMARY"
