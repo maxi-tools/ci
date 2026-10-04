@@ -139,7 +139,7 @@ def _literal_at(text: str, pos: int) -> str | None:
     if raw:
         close = '"' + raw.group(1)
         end = text.find(close, raw.end())
-        return None if end < 0 else text[raw.end():end]
+        return None if end < 0 else text[raw.end() : end]
     plain = PLAIN_COOKED.match(text, pos)
     return plain.group(1) if plain else None
 
@@ -327,7 +327,9 @@ def compiled_inputs(root: pathlib.Path) -> tuple[set[str], list[str]]:
     root = root.resolve()
     found: set[str] = set()
     unresolved: list[str] = []
-    queue = [path for path in root.rglob("*.rs") if not _vendored(path.relative_to(root))]
+    queue = [
+        path for path in root.rglob("*.rs") if not _vendored(path.relative_to(root))
+    ]
     scanned: set[pathlib.Path] = set()
     while queue:
         path = queue.pop()

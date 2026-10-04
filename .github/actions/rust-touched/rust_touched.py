@@ -88,8 +88,13 @@ RUST_PREFIX = (".cargo/", ".github/actions/")
 # crates/foo with its own manifest is as build-defining as the root one.
 # The rustfmt variants reach only the formatter, but the formatter runs
 # inside a lane this gate can skip, which is the same false green.
-RUST_BASENAME = {"Cargo.toml", "build.rs", "clippy.toml",
-                 "rustfmt.toml", ".rustfmt.toml"}
+RUST_BASENAME = {
+    "Cargo.toml",
+    "build.rs",
+    "clippy.toml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+}
 
 # A workflow whose ACTIVE lines name the Rust toolchain is the build.
 # Active lines only, because whole-file matching lost to real prose on
@@ -113,7 +118,10 @@ BUILD_MARKER = re.compile(
 )
 # `just` in command position only: line start, or after the shell
 # separators/YAML colon that precede a command. `it just asked` in
-# prose has a letter before the space, which this rejects.
+# prose has a word character before the space, which this rejects.
+# Defined ONCE, beside BUILD_MARKER: an earlier edit left a second,
+# looser definition later in the file that silently overrode this
+# one -- the exact silent no-op this repo's tests exist to catch.
 JUST_REF = re.compile(r"(?:^|[:;&|`(]\s*)just\s+\w")
 WORKFLOW_GLOB = ".github/workflows"
 
@@ -125,6 +133,7 @@ def _active_text(text: str) -> str:
         out.append("" if line.lstrip().startswith("#") else line)
     return "\n".join(out)
 
+
 # Scripts the build-defining workflows run, read out of those files
 # rather than listed here. A script that only a gated lane executes is
 # never exercised by any other lane, so editing it alone would skip the
@@ -132,13 +141,9 @@ def _active_text(text: str) -> str:
 # a step is added (maxi-core's review found two such scripts missing
 # from an earlier hand-list, which is the argument for not keeping one).
 SCRIPT_REF = re.compile(
-    r"((?:\.github/(?:scripts|actions)|scripts)/[\w./-]+\.(?:sh|py))")
-ACTION_REF = re.compile(
-    r"uses:\s*(?:\.?/?)(\.github/actions/[\w./-]+)")
-# `just` recipes: `run: just t` hands the build to a justfile, and the
-# justfile is Cargo-adjacent config nothing else names. Matched on the
-# step line, not the bare word ("adjust", "justice").
-JUST_REF = re.compile(r"(?:^|\s)just\s+\w")
+    r"((?:\.github/(?:scripts|actions)|scripts)/[\w./-]+\.(?:sh|py))"
+)
+ACTION_REF = re.compile(r"uses:\s*\.??/?\.github/actions/([\w./-]+)")
 
 
 def build_defining_workflows(root: pathlib.Path) -> set[str]:
@@ -203,8 +208,7 @@ def submodule_paths(root: pathlib.Path) -> set[str]:
     found: set[str] = set()
     if not map_file.is_file():
         return found
-    for line in map_file.read_text(encoding="utf-8",
-                                   errors="replace").splitlines():
+    for line in map_file.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if line.startswith("path"):
             _, _, value = line.partition("=")
@@ -214,8 +218,9 @@ def submodule_paths(root: pathlib.Path) -> set[str]:
     return found
 
 
-def build_defining(path: str, root: pathlib.Path,
-                   workflows: set[str], submodules: set[str]) -> str | None:
+def build_defining(
+    path: str, root: pathlib.Path, workflows: set[str], submodules: set[str]
+) -> str | None:
     """Why this path is the build, or None if not decided by name alone.
 
     Split out of `decide` so each answer keeps its own early return and
@@ -225,8 +230,11 @@ def build_defining(path: str, root: pathlib.Path,
     if path.endswith(RUST_SUFFIX):
         return f"{path} is Rust source"
     if path in RUST_EXACT or path in workflows:
-        why = ("defines the build" if path in workflows
-               else "is a manifest, lockfile or submodule map")
+        why = (
+            "defines the build"
+            if path in workflows
+            else "is a manifest, lockfile or submodule map"
+        )
         return f"{path} {why}"
     if path in submodules:
         return f"{path} is a submodule of this repository"
@@ -270,8 +278,9 @@ def decide(changed: list[str], root: pathlib.Path) -> tuple[bool, str]:
 # saying "not my business" and the gate saying "nothing here can reach
 # rustc" are different claims, and collapsing them would let a rule that
 # merely fell through skip a lane.
-def _lane_script_rule(changed: list[str], root: pathlib.Path,
-                      workflows: set[str]) -> tuple[bool, str] | None:
+def _lane_script_rule(
+    changed: list[str], root: pathlib.Path, workflows: set[str]
+) -> tuple[bool, str] | None:
     """Widen if the diff edits a script a gated workflow actually runs."""
     try:
         lane_inputs = gated_lane_inputs(root)
@@ -279,13 +288,13 @@ def _lane_script_rule(changed: list[str], root: pathlib.Path,
         return True, f"could not read which scripts the gated lanes run ({err})"
     for path in changed:
         if path in lane_inputs or any(
-                path.startswith(prefix) for prefix in lane_inputs):
+            path.startswith(prefix) for prefix in lane_inputs
+        ):
             return True, f"{path} is run by a lane this gate can skip"
     return None
 
 
-def _unresolved_crates(unresolved: list[str],
-                       root: pathlib.Path) -> list[str]:
+def _unresolved_crates(unresolved: list[str], root: pathlib.Path) -> list[str]:
     """Crate directories containing the unresolvable include sites.
 
     Each entry of `unresolved` is `path:line: note` or `path: note`,
@@ -362,16 +371,23 @@ def _compiled_input_rule(
             if crate:
                 return True, (
                     f"{path} is inside {crate}, whose include sites "
-                    f"are not statically resolvable: {unresolved[0]}")
+                    f"are not statically resolvable: {unresolved[0]}"
+                )
         # Outside them, the readable index still governs.
         for path in changed:
             if path in compiled:
-                return True, f"{path} is compiled in via include_str!/include_bytes!/include!"
+                return (
+                    True,
+                    f"{path} is compiled in via include_str!/include_bytes!/include!",
+                )
         return None
 
     for path in changed:
         if path in compiled:
-            return True, f"{path} is compiled in via include_str!/include_bytes!/include!"
+            return (
+                True,
+                f"{path} is compiled in via include_str!/include_bytes!/include!",
+            )
     return None
 
 
@@ -382,8 +398,9 @@ def _compiled_input_rule(
 INDEX_RULES = (_lane_script_rule, _compiled_input_rule)
 
 
-def _decide_by_index(changed: list[str], root: pathlib.Path,
-                     workflows: set[str]) -> tuple[bool, str]:
+def _decide_by_index(
+    changed: list[str], root: pathlib.Path, workflows: set[str]
+) -> tuple[bool, str]:
     """The half that needs the repository read, split from the name-only half."""
     for rule in INDEX_RULES:
         verdict = rule(changed, root, workflows)

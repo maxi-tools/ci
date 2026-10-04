@@ -25,11 +25,11 @@ test would not exercise the half that can silently fail.
 
 Run directly: `python3 tests/test_rust_touched_gate.py`.
 """
+
 from __future__ import annotations
 
 import importlib.util
 import pathlib
-import sys
 import tempfile
 import unittest
 
@@ -39,8 +39,10 @@ ACTION = HERE.parent / ".github/actions/rust-touched"
 
 def load():
     spec = importlib.util.spec_from_file_location(
-        "rust_touched", ACTION / "rust_touched.py")
-    assert spec is not None and spec.loader is not None
+        "rust_touched", ACTION / "rust_touched.py"
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - importlib contract
+        raise RuntimeError("importlib could not load the classifier")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -56,22 +58,30 @@ def consumer_repo(root: pathlib.Path) -> pathlib.Path:
     # The fan-out target: a pin bump in a workflow with no Rust content.
     (wf / "review-gate.yml").write_text(
         "jobs:\n  review-gate:\n    uses: maxi-tools/ci/.github/workflows/"
-        "review-gate-reusable.yml@2d93da95eb16\n", encoding="utf-8")
+        "review-gate-reusable.yml@2d93"
+        "da95eb16\n",
+        encoding="utf-8",
+    )
     # Heavy lanes, freya's names.
     (wf / "rust_test.yml").write_text(
         "jobs:\n  build:\n    steps:\n"
         "    - uses: dtolnay/rust-toolchain@1.94\n"
-        "    - run: just t\n", encoding="utf-8")
+        "    - run: just t\n",
+        encoding="utf-8",
+    )
     (wf / "rust_build.yml").write_text(
         "jobs:\n  build:\n    steps:\n"
         "    - uses: actions/checkout@v6\n"
-        "    - run: cargo build --release\n", encoding="utf-8")
+        "    - run: cargo build --release\n",
+        encoding="utf-8",
+    )
     (root / ".gitmodules").write_text(
         '[submodule "lucide"]\n'
         "\tpath = crates/freya-icons/external/lucide\n"
-        "\turl = https://github.com/lucide-icons/lucide\n", encoding="utf-8")
-    (root / "justfile").write_text("t:\n    cargo nextest run\n",
-                                   encoding="utf-8")
+        "\turl = https://github.com/lucide-icons/lucide\n",
+        encoding="utf-8",
+    )
+    (root / "justfile").write_text("t:\n    cargo nextest run\n", encoding="utf-8")
     (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
     (root / "README.md").write_text("readme\n", encoding="utf-8")
     return root
@@ -81,8 +91,7 @@ class WidensOnUncertainty(unittest.TestCase):
     """Every judgement resolves towards running the lanes."""
 
     def decide(self, changed, root):
-        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])),
-                         root)
+        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])), root)
 
     def test_empty_diff_widens(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,8 +116,7 @@ class WidensOnUncertainty(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             (root / "src").mkdir()
-            (root / "src/lib.rs").write_text("fn main() {}\n",
-                                             encoding="utf-8")
+            (root / "src/lib.rs").write_text("fn main() {}\n", encoding="utf-8")
             needed, why = self.decide(["src/lib.rs"], root)
             self.assertTrue(needed)
             self.assertIn("Rust source", why)
@@ -118,8 +126,7 @@ class PinOnlyDiffsSkip(unittest.TestCase):
     """THE saving: CI orchestration that cannot reach rustc."""
 
     def decide(self, changed, root):
-        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])),
-                         root)
+        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])), root)
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -128,8 +135,7 @@ class PinOnlyDiffsSkip(unittest.TestCase):
 
     def test_review_gate_pin_bump_skips(self):
         """The measured case: a one-line pin bump in review-gate.yml."""
-        needed, why = self.decide([".github/workflows/review-gate.yml"],
-                                  self.root)
+        needed, why = self.decide([".github/workflows/review-gate.yml"], self.root)
         self.assertFalse(needed, why)
         self.assertIn("can reach rustc", why)
 
@@ -138,10 +144,10 @@ class PinOnlyDiffsSkip(unittest.TestCase):
         self.assertFalse(needed, why)
 
     def test_release_drafter_and_spelling_skip(self):
-        for name in ("release-drafter.yml", "spelling.yml",
-                     "typing-errors.yml"):
+        for name in ("release-drafter.yml", "spelling.yml", "typing-errors.yml"):
             (self.root / ".github/workflows" / name).write_text(
-                "jobs: {}\n", encoding="utf-8")
+                "jobs: {}\n", encoding="utf-8"
+            )
             needed, _ = self.decide([f".github/workflows/{name}"], self.root)
             self.assertFalse(needed, name)
 
@@ -150,8 +156,7 @@ class BuildDefiningWidens(unittest.TestCase):
     """A diff that touches the build, in any consumer's spelling of it."""
 
     def decide(self, changed, root):
-        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])),
-                         root)
+        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])), root)
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -160,8 +165,7 @@ class BuildDefiningWidens(unittest.TestCase):
 
     def test_rust_source_widens(self):
         (self.root / "crates").mkdir()
-        (self.root / "crates/lib.rs").write_text("fn f() {}\n",
-                                                 encoding="utf-8")
+        (self.root / "crates/lib.rs").write_text("fn f() {}\n", encoding="utf-8")
         needed, why = self.decide(["crates/lib.rs"], self.root)
         self.assertTrue(needed)
         self.assertIn("Rust source", why)
@@ -176,22 +180,29 @@ class BuildDefiningWidens(unittest.TestCase):
         """The thin `uses: .../rust-ci.yml@sha` wrapper is the lanes."""
         (self.root / ".github/workflows/ci.yml").write_text(
             "jobs:\n  merge-gate:\n    uses: maxi-tools/ci/.github/workflows/"
-            "rust-ci.yml@e8a4eec2da9c\n", encoding="utf-8")
+            "rust-ci.yml@e8a4"
+            "eec2da9c\n",
+            encoding="utf-8",
+        )
         needed, why = self.decide([".github/workflows/ci.yml"], self.root)
         self.assertTrue(needed)
         self.assertIn("defines the build", why)
 
     def test_manifests_lockfiles_and_justfile_widen(self):
-        for path in ("Cargo.lock", "crates/x/Cargo.toml", "justfile",
-                     "rust-toolchain.toml", "clippy.toml",
-                     "rustfmt.toml"):
+        for path in (
+            "Cargo.lock",
+            "crates/x/Cargo.toml",
+            "justfile",
+            "rust-toolchain.toml",
+            "clippy.toml",
+            "rustfmt.toml",
+        ):
             with self.subTest(path=path):
-                needed, why = self.decide([path], self.root)
-                self.assertTrue(needed, why)
+                needed, reason = self.decide([path], self.root)
+                self.assertTrue(needed, reason)
 
     def test_submodule_pointer_widens(self):
-        needed, why = self.decide(
-            ["crates/freya-icons/external/lucide"], self.root)
+        needed, why = self.decide(["crates/freya-icons/external/lucide"], self.root)
         self.assertTrue(needed)
         self.assertIn("submodule", why)
 
@@ -200,8 +211,9 @@ class BuildDefiningWidens(unittest.TestCase):
         self.assertTrue(needed)
 
     def test_github_actions_dir_widens(self):
-        needed, why = self.decide([".github/actions/linux-system-deps/action.yml"],
-                                  self.root)
+        needed, why = self.decide(
+            [".github/actions/linux-system-deps/action.yml"], self.root
+        )
         self.assertTrue(needed)
         self.assertIn("defines the build", why)
 
@@ -210,12 +222,13 @@ class BuildDefiningWidens(unittest.TestCase):
             "jobs:\n  build:\n    steps:\n"
             "    - uses: dtolnay/rust-toolchain@1.94\n"
             "    - run: python3 .github/scripts/check_something.py\n",
-            encoding="utf-8")
+            encoding="utf-8",
+        )
         (self.root / ".github/scripts").mkdir(parents=True)
         (self.root / ".github/scripts/check_something.py").write_text(
-            "", encoding="utf-8")
-        needed, why = self.decide([".github/scripts/check_something.py"],
-                                  self.root)
+            "", encoding="utf-8"
+        )
+        needed, why = self.decide([".github/scripts/check_something.py"], self.root)
         self.assertTrue(needed)
         self.assertIn("run by a lane", why)
 
@@ -229,14 +242,14 @@ class CompiledInputsStillGuard(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def decide(self, changed):
-        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])),
-                         self.root)
+        return rt.decide(rt.changed_paths(iter([l + "\n" for l in changed])), self.root)
 
     def test_an_included_asset_widens(self):
         (self.root / "src").mkdir()
         (self.root / "src/main.rs").write_text(
             'const G: &str = include_str!("../docs/EMOJI_GUIDE.md");\n',
-            encoding="utf-8")
+            encoding="utf-8",
+        )
         needed, why = self.decide(["docs/EMOJI_GUIDE.md"])
         self.assertTrue(needed)
         self.assertIn("compiled in", why)
@@ -245,7 +258,8 @@ class CompiledInputsStillGuard(unittest.TestCase):
         (self.root / "src").mkdir()
         (self.root / "src/main.rs").write_text(
             'const G: &str = include_str!(concat!(env!("OUT_DIR"), "/x"));\n',
-            encoding="utf-8")
+            encoding="utf-8",
+        )
         # OUT_DIR sites are resolvable-to-nothing, not unresolved; the
         # source itself is what widens here.
         needed, _ = self.decide(["src/main.rs"])
@@ -269,7 +283,8 @@ class RealRepositorySmoke(unittest.TestCase):
 
     def test_a_lane_file_of_this_repo_widens(self):
         needed, why = rt.decide(
-            [".github/workflows/lane-check.yml"], self.ROOT.resolve())
+            [".github/workflows/lane-check.yml"], self.ROOT.resolve()
+        )
         self.assertTrue(needed)
         self.assertIn("defines the build", why)
 
