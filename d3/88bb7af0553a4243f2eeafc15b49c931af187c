@@ -1,0 +1,30 @@
+.github/actions/install-apt-packages/action.yml
+  h_cebe5b6d461c32 17
+.github/workflows/coverage.yml
+  h_cebe5b6d461c32 168,174
+.github/workflows/lane-check.yml
+  h_cebe5b6d461c32 49,51,145-153,203-232,250-258,301,308,313,332,336,340,347,351,380,416-420,422-423,427-430,469-475
+.github/workflows/lane-package.yml
+  h_cebe5b6d461c32 30-34,42,44,78-86,112-120,122-144,226,229,250,256,270,274,278,285,289,314
+.github/workflows/lane-plan.yml
+  h_cebe5b6d461c32 55,57,87-92,125-149,172,219,253,338,382-403,405-411,415-420
+.github/workflows/lane-test.yml
+  h_cebe5b6d461c32 44,46,113-121,154-178,196-200,243,250,255,273,277,281,288,292,317
+.github/workflows/rust-ci.yml
+  h_cebe5b6d461c32 32,35,290
+.github/workflows/self-check.yml
+  h_cebe5b6d461c32 131,140
+tests/test_swift_skip_env.py
+  h_cebe5b6d461c32 1-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d388bb7af0553a4243f2eeafc15b49c931af187c",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
