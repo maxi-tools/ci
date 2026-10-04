@@ -171,7 +171,7 @@ class BuildDefiningWidens(unittest.TestCase):
         self.assertIn("Rust source", why)
 
     def test_the_repos_own_heavy_workflows_widen(self):
-        for name in ("rust_test.yml", "rust_build.yml"):  # trufflehog:ignore
+        for name in ("rust_test.yml", "rust_build.yml"):  # qlty-disable trufflehog
             needed, why = self.decide([f".github/workflows/{name}"], self.root)
             self.assertTrue(needed, name)
             self.assertIn("defines the build", why)
@@ -217,7 +217,9 @@ class BuildDefiningWidens(unittest.TestCase):
         self.assertIn("defines the build", why)
 
     def test_script_a_heavy_workflow_runs_widens(self):
-        (self.root / ".github/workflows/rust_test.yml").write_text(  # trufflehog:ignore
+        (
+            self.root / ".github/workflows/rust_test.yml"
+        ).write_text(  # qlty-disable trufflehog
             "jobs:\n  build:\n    steps:\n"
             "    - uses: dtolnay/rust-toolchain@"
             "1.94\n"
