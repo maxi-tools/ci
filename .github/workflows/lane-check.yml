@@ -71,6 +71,10 @@ env:
 
 jobs:
   lane-check:
+    # rustup resolves this job's cargo/rustc from the org pin, not the runner's
+    # mutable global default (which another job's dtolnay action can change).
+    env:
+      RUSTUP_TOOLCHAIN: '1.98.1'
     # Skipped for Dependabot, and skipped HERE rather than at the caller.
     #
     # This lane needs the app token to fetch maxi-config's Rust policy itself
@@ -301,6 +305,7 @@ jobs:
         if: steps.workspace.outputs.has_workspace == 'true'
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          toolchain: '1.98.1'
           components: rustfmt, clippy
 
       - name: Fetch maxi-config rust-lane policy
