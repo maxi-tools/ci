@@ -28,12 +28,14 @@ runs against the bytes git answers, not a transcription of them.
 Run directly: `uv run --with pyyaml python3 tests/test_plan_lane.py`
 (pyyaml is not in the system interpreter; `uv run --with` supplies it).
 """
+
 from __future__ import annotations
 
 import os
 import pathlib
 import re
-import subprocess
+import shutil
+import subprocess  # nosec B404 - the act of the test; see the module docstring
 import tempfile
 import unittest
 
@@ -41,6 +43,14 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LANE_PLAN = ROOT / ".github/workflows/lane-plan.yml"
+
+# Absolute paths, resolved once. The step under test is executed as `bash`,
+# which is the interpreter CI itself uses for `shell: bash`; resolving it
+# rather than trusting PATH is what makes the test hermetic, and it is also
+# what keeps bandit B607 (partial executable path) off a file that genuinely
+# must exec two programs.
+BASH = shutil.which("bash") or "/bin/bash"
+GIT = shutil.which("git") or "/usr/bin/git"
 
 # Git's empty tree. The step substitutes it for an all-zero SHA, and a
 # test that wants "no base at all" wants this.
@@ -58,7 +68,8 @@ def step(path: pathlib.Path, job: str, step_name: str) -> dict:
             return candidate
     raise AssertionError(
         f"{path.name} has no step named {step_name!r}; this test reads that "
-        "step directly and a rename must not silently stop testing it")
+        "step directly and a rename must not silently stop testing it"
+    )
 
 
 def resolve_expr(expr: str, substitutions: dict) -> str:
@@ -81,9 +92,10 @@ def resolve_expr(expr: str, substitutions: dict) -> str:
 
 def step_env(spec: dict, substitutions: dict) -> dict:
     """The step's `env:`, with every `${{ }}` expression resolved."""
-    return {key: EXPR.sub(lambda m: resolve_expr(m.group(1), substitutions),
-                          raw)
-            for key, raw in spec.items()}
+    return {
+        key: EXPR.sub(lambda m: resolve_expr(m.group(1), substitutions), raw)
+        for key, raw in spec.items()
+    }
 
 
 def render(body: str, substitutions: dict) -> str:
@@ -92,9 +104,18 @@ def render(body: str, substitutions: dict) -> str:
 
 
 def git(repo: pathlib.Path, *args: str) -> str:
-    proc = subprocess.run(["git", *args], cwd=repo, capture_output=True,
-                          text=True, timeout=30)
-    assert proc.returncode == 0, f"git {' '.join(args)}: {proc.stderr}"
+    # The argv is this file's own literals plus the SHAs it computed from
+    # them; there is no untrusted input in this process.
+    proc = subprocess.run(  # nosec B603
+        [GIT, *args], cwd=repo, capture_output=True, text=True, timeout=30
+    )
+    # A raise, not an assert: this is a helper rather than a test method, and
+    # `python -O` strips asserts -- a failing `git` would then return an
+    # empty string and the next assertion would report a confusing diff
+    # failure instead of naming the git call that broke. Same reasoning as
+    # test_lane_decisions' `_if_expr` (4d39d50).
+    if proc.returncode != 0:
+        raise ValueError(f"git {' '.join(args)}: {proc.stderr.strip()}")
     return proc.stdout.strip()
 
 
@@ -122,8 +143,7 @@ class PlanBaseRef(unittest.TestCase):
         # Commit 2: the queue's HEAD. Adds one source file -- exactly the
         # kind of change that must classify `full`, never `merge-gate-only`.
         (self.repo / "src").mkdir()
-        (self.repo / "src" / "main.rs").write_text("fn main() {}\n",
-                                                   encoding="utf-8")
+        (self.repo / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "--quiet", "-m", "head")
         self.head_sha = git(self.repo, "rev-parse", "HEAD")
@@ -132,32 +152,50 @@ class PlanBaseRef(unittest.TestCase):
 
     # -- helpers ------------------------------------------------------
 
-    def collect(self, *, base_ref: str, merge_group_base_sha: str,
-                event_name: str = "merge_group") -> tuple[int, str, str]:
+    def collect(
+        self,
+        *,
+        base_ref: str,
+        merge_group_base_sha: str,
+        event_name: str = "merge_group",
+    ) -> tuple[int, str, str]:
         """Execute the real step body in the real repo; return its files."""
         spec = step(LANE_PLAN, "lane-plan", "Collect changed files")
-        env = step_env(spec["env"], {
-            "github.event.merge_group.base_sha": merge_group_base_sha,
-            "inputs.base_ref": base_ref,
-        })
-        body = render(spec["run"], {
-            "github.event_name": event_name,
-            "github.repository": "maxi-tools/example",
-            "github.event.pull_request.number": "1",
-            "github.sha": self.head_sha,
-        })
+        env = step_env(
+            spec["env"],
+            {
+                "github.event.merge_group.base_sha": merge_group_base_sha,
+                "inputs.base_ref": base_ref,
+            },
+        )
+        body = render(
+            spec["run"],
+            {
+                "github.event_name": event_name,
+                "github.repository": "maxi-tools/example",
+                "github.event.pull_request.number": "1",
+                "github.sha": self.head_sha,
+            },
+        )
         with tempfile.TemporaryDirectory() as out_dir:
             out_file = pathlib.Path(out_dir) / "out"
             out_file.touch()
-            proc = subprocess.run(
-                ["bash", "--noprofile", "--norc", "-c", body],
+            # `body` is the workflow's own `run:` block read from this
+            # repository, and it is what CI executes; running it is the
+            # test. Not untrusted input: it is the artifact under test.
+            proc = subprocess.run(  # nosec B603
+                [BASH, "--noprofile", "--norc", "-c", body],
                 cwd=self.repo,
-                env={"PATH": os.environ.get("PATH", ""),
-                     "HOME": str(self.repo),
-                     "GITHUB_OUTPUT": str(out_file),
-                     "GIT_CONFIG_GLOBAL": "/dev/null",
-                     **env},
-                capture_output=True, text=True, timeout=60,
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "HOME": str(self.repo),
+                    "GITHUB_OUTPUT": str(out_file),
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    **env,
+                },
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
             files = ""
             seen_key = False
@@ -201,14 +239,14 @@ class PlanBaseRef(unittest.TestCase):
     def test_a_docs_only_merge_group_is_still_a_docs_only_diff(self):
         """The fix must not widen every queue diff into `full`: when the
         group really is docs-only, the honest list is docs-only."""
-        (self.repo / "CHANGELOG.md").write_text("## unreleased\n",
-                                                encoding="utf-8")
+        (self.repo / "CHANGELOG.md").write_text("## unreleased\n", encoding="utf-8")
         (self.repo / "src" / "main.rs").unlink()
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "--quiet", "-m", "docs only")
         self.head_sha = git(self.repo, "rev-parse", "HEAD")
-        rc, log, files = self.collect(base_ref="origin/main",
-                                      merge_group_base_sha=self.base_sha)
+        rc, log, files = self.collect(
+            base_ref="origin/main", merge_group_base_sha=self.base_sha
+        )
         self.assertEqual(rc, 0, log)
         self.assertEqual(sorted(files.split()), ["CHANGELOG.md"])
 
@@ -216,25 +254,27 @@ class PlanBaseRef(unittest.TestCase):
 
     def test_a_push_run_still_uses_the_caller_base_ref(self):
         """`push` has a real `before`; nothing about it changed."""
-        rc, log, files = self.collect(base_ref=self.base_sha,
-                                      merge_group_base_sha="",
-                                      event_name="push")
+        rc, log, files = self.collect(
+            base_ref=self.base_sha, merge_group_base_sha="", event_name="push"
+        )
         self.assertEqual(rc, 0, log)
         self.assertEqual(files.split(), ["src/main.rs"])
 
     def test_a_workflow_dispatch_run_still_uses_the_caller_base_ref(self):
-        rc, log, files = self.collect(base_ref=self.base_sha,
-                                      merge_group_base_sha="",
-                                      event_name="workflow_dispatch")
+        rc, log, files = self.collect(
+            base_ref=self.base_sha,
+            merge_group_base_sha="",
+            event_name="workflow_dispatch",
+        )
         self.assertEqual(rc, 0, log)
         self.assertEqual(files.split(), ["src/main.rs"])
 
     def test_an_all_zero_base_still_falls_back_to_the_empty_tree(self):
         """Branch creation pushes `0000...`; the step has always handled
         that and the new branch sits above it, not across it."""
-        rc, log, files = self.collect(base_ref=ZERO_SHA,
-                                      merge_group_base_sha="",
-                                      event_name="push")
+        rc, log, files = self.collect(
+            base_ref=ZERO_SHA, merge_group_base_sha="", event_name="push"
+        )
         self.assertEqual(rc, 0, log)
         # Drawn from the empty tree, so EVERY tracked file is changed.
         self.assertIn("README.md", files.split())
