@@ -64,10 +64,48 @@ Run in CI: `self-check.yml`'s "Run the test suites" step.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import unittest
 
 import yaml
+
+# The aggregate's `if:` evaluator's supported subset is string/number
+# literals, `==`, `!=`, `&&`, `||`, `always()` (renamed `True` by the
+# caller). `ast.literal_eval` would be the bandit-recommended
+# alternative but the subset includes `and`/`or` -- Python operators
+# `literal_eval` deliberately refuses -- so the supported grammar
+# cannot be expressed through `literal_eval`. Instead, the caller
+# already parsed the source with a fixed grammar (the token walker in
+# CallerLevelContextsAreSentinelsTest:::renders_true) and rejects any
+# node kind it does not recognise, so this evaluator only needs to
+# evaluate the AST produced from a string the parser has already
+# accepted. Rejecting any unexpected kind fails the test deliberately,
+# which is the regression contract the bandit reference reasserts.
+_ALLOWED_NODES: tuple[type[ast.AST], ...] = (
+    ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Compare,
+    ast.Constant, ast.And, ast.Or, ast.USub,
+    ast.Eq, ast.NotEq,
+)
+
+
+def _safe_eval(expr: str) -> bool:
+    tree = ast.parse(expr, mode="eval")
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_NODES):
+            raise ValueError(
+                f"evaluator rejected {type(node).__name__}; the parser "
+                "should have refused this node at the source. expr="
+                f"{expr!r}"
+            )
+    # The AST walk above rejects every node kind the parser did not
+    # produce. The supported subset (string/number literals,
+    # `==`/`!=`, `&&`/`||`, `always()`) reduces to a fixed grammar
+    # that bandit B307 / qlty cannot statically prove safe -- the
+    # AST whitelist IS the proof. `ast.literal_eval` cannot express
+    # this grammar because `and`/`or` are operators it refuses.
+    # nosem: bandit.B307
+    return bool(eval(compile(tree, "<renders_true>", "eval"), {"__builtins__": {}}))
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUST_CI = ROOT / ".github/workflows/rust-ci.yml"
@@ -292,6 +330,18 @@ class RustCiJobsContractTest(unittest.TestCase):
              alone does not satisfy this: an expression like
              `always() && github.event_name == 'push'` has `always()`
              but skips every PR class entirely. Pin both halves.
+
+        Evaluated, not substring-matched: the accepted spellings for
+        the same-repo gate are `github.event_name == 'pull_request' &&
+        <same-repo>` and the negated form `github.event_name !=
+        'pull_request' || <same-repo>` (the #346 shape rule), and the
+        merge-queue arm (`merge_group` admitted only with
+        `checks_requested`) is spelled the negated way too. A
+        substring pin would reject the accepted negated spelling or
+        accept a semantically dead positive one, so the expression is
+        rendered under real event scenarios and must come out TRUE for
+        a same-repo pull_request, FALSE for a fork pull_request, and
+        FALSE for every merge-queue lifecycle action.
         """
         jobs = load_jobs(RUST_CI)
         if_ = jobs["merge-gate"].get("if")
@@ -311,21 +361,6 @@ class RustCiJobsContractTest(unittest.TestCase):
             f"no verdict, not red.",
         )
         self.assertIn(
-            "github.event_name == 'pull_request'",
-            if_,
-            f"rust-ci.yml `merge-gate:` if: ({if_!r}) does not "
-            f"reference `github.event_name == 'pull_request'`. "
-            f"`always()` alone is not enough -- an expression like "
-            f"`always() && github.event_name == 'push'` skips every "
-            f"PR class entirely, the aggregate check-run is then "
-            f"absent on the PR class the ruleset is supposed to gate, "
-            f"and a ruleset requiring `merge-gate / merge-gate` "
-            f"blocks every same-repo PR. The aggregate must fire on "
-            f"`github.event_name == 'pull_request'` (and any further "
-            f"refinement -- same-repo head, fork bypass, etc. -- "
-            f"must still leave that class passing).",
-        )
-        self.assertIn(
             "github.event.pull_request.head.repo.full_name == github.repository",
             if_,
             f"rust-ci.yml `merge-gate:` if: ({if_!r}) does not gate "
@@ -336,6 +371,162 @@ class RustCiJobsContractTest(unittest.TestCase):
             f"either skips legitimate PRs or runs on forks, both of "
             f"which are the regression class.",
         )
+
+        def renders_true(scenario: dict) -> bool:
+            """Evaluate the aggregate's `if:` under one event scenario.
+
+            GitHub expression subset: string/number literals, `!=`,
+            `==`, `&&`, `||`, parentheses, `always()`. The bare `!`
+            (logical NOT) is intentionally NOT in the supported
+            subset: GitHub's `!` binds tighter than `==`, while Python's
+            `not` binds looser, so a plain `!` → `not` translation would
+            silently invert `!a == b` and emit a wrong verdict. The
+            parser `self.fail`s on a bare `!` (cubic P3 review
+            thread) so any future `if:` refactor that uses negated
+            parentheses fails deliberately, with a readable error,
+            instead of silently passing through `out.append('!')` and
+            surfacing as a Python `SyntaxError` from the eval below.
+            Context accesses resolve through `scenario`; an access
+            that is not listed resolves to `''` (GitHub's behaviour
+            for an absent event property, e.g. `github.event.action`
+            on a push).
+            """
+            expr = " ".join(if_.split())
+            expr = expr.replace("always()", "True")
+            out, i = [], 0
+            while i < len(expr):
+                if expr[i] in "'\"":
+                    quote = expr[i]
+                    j = i + 1
+                    while expr[j] != quote:
+                        j += 1
+                    out.append(repr(expr[i + 1:j]))
+                    i = j + 1
+                    continue
+                if expr[i].isalpha() or expr[i] in "_.":
+                    j = i
+                    while j < len(expr) and (expr[j].isalnum() or expr[j] in "_."):
+                        j += 1
+                    term = expr[i:j]
+                    if term in (
+                        "and", "or", "not", "True", "False",
+                    ):
+                        out.append(term)
+                    elif term.startswith("github."):
+                        out.append(repr(scenario.get(term, "")))
+                    else:
+                        self.fail(
+                            f"rust-ci.yml `merge-gate:` if: references "
+                            f"unknown term {term!r}; extend the evaluator "
+                            f"deliberately rather than silently clearing it."
+                        )
+                    i = j
+                    continue
+                if expr[i] == "=" and expr[i + 1] == "=":
+                    out.append("==")
+                    i += 2
+                    continue
+                if expr[i] == "!" and expr[i + 1] == "=":
+                    out.append("!=")
+                    i += 2
+                    continue
+                if expr[i] == "!":
+                    self.fail(
+                        "rust-ci.yml `merge-gate:` if: contains a bare `!` "
+                        "(logical NOT). The supported subset is `!=`, `==`, "
+                        "`&&`, `||`, `always()`; bare `!` is rejected because "
+                        "GitHub's `!` and Python's `not` differ in precedence "
+                        "(GitHub binds tighter than `==`, Python binds looser) "
+                        "and a literal translation would invert `!a == b`. "
+                        "Refactor the expression to use Python `not` via the "
+                        "supported `&&` / `||` disjuncts, or extend the "
+                        "evaluator deliberately."
+                    )
+                if expr[i] == "&" and expr[i + 1] == "&":
+                    out.append(" and ")
+                    i += 2
+                    continue
+                if expr[i] == "|" and expr[i + 1] == "|":
+                    out.append(" or ")
+                    i += 2
+                    continue
+                out.append(expr[i])
+                i += 1
+            return _safe_eval("".join(out))
+
+        repo = "maxi-tools/ci"
+        scenarios = {
+            "same-repo pull_request": {
+                "github.event_name": "pull_request",
+                "github.repository": repo,
+                "github.event.pull_request.head.repo.full_name": repo,
+            },
+            "fork pull_request": {
+                "github.event_name": "pull_request",
+                "github.repository": repo,
+                "github.event.pull_request.head.repo.full_name": "someone-else/fork",
+            },
+            "merge_group checks_requested": {
+                "github.event_name": "merge_group",
+                "github.repository": repo,
+                "github.event.action": "checks_requested",
+            },
+            "merge_group created (lifecycle)": {
+                "github.event_name": "merge_group",
+                "github.repository": repo,
+                "github.event.action": "created",
+            },
+            # The full lifecycle action surface, per the GitHub merge-queue
+            # reference (the operator's review-gate thread on ci#83 asked
+            # for these by name). A condition that admitted any of them
+            # would mint a required-context run for an event no one
+            # asked the verifier to evaluate, which is the exact regression
+            # the queue arm exists to prevent.
+            "merge_group merged (lifecycle)": {
+                "github.event_name": "merge_group",
+                "github.repository": repo,
+                "github.event.action": "merged",
+            },
+            "merge_group pushed (lifecycle)": {
+                "github.event_name": "merge_group",
+                "github.repository": repo,
+                "github.event.action": "pushed",
+            },
+            "merge_group removed (lifecycle)": {
+                "github.event_name": "merge_group",
+                "github.repository": repo,
+                "github.event.action": "removed",
+            },
+            "merge_group deleted (lifecycle)": {
+                "github.event_name": "merge_group",
+                "github.repository": repo,
+                "github.event.action": "deleted",
+            },
+            "push": {"github.event_name": "push", "github.repository": repo},
+        }
+        expectations = {
+            "same-repo pull_request": True,
+            "fork pull_request": False,
+            # The queue arm admits checks_requested: the aggregate must
+            # publish the required verdict on an admitted queue head.
+            "merge_group checks_requested": True,
+            # Lifecycle events must not mint a required-context run.
+            "merge_group created (lifecycle)": False,
+            "merge_group merged (lifecycle)": False,
+            "merge_group pushed (lifecycle)": False,
+            "merge_group removed (lifecycle)": False,
+            "merge_group deleted (lifecycle)": False,
+            "push": False,
+        }
+        for name, scenario in scenarios.items():
+            self.assertEqual(
+                expectations[name],
+                renders_true(scenario),
+                f"rust-ci.yml `merge-gate:` if: ({' '.join(if_.split())!r}) "
+                f"evaluates wrong under {name}; the aggregate must fire "
+                f"exactly on same-repo pull_request heads and admitted "
+                f"merge-queue groups.",
+            )
 
 
 class CallerLevelContextsAreSentinelsTest(unittest.TestCase):
