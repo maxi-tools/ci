@@ -65,19 +65,30 @@ env:
 
 jobs:
   merge-gate:
-    # Same-repo PRs only. This job is pure bash today -- it echoes two workflow
-    # variables and runs `date` -- and that is NOT why it is safe, because it is
-    # not a property a fork has to leave alone. For `pull_request`, GitHub runs
-    # the workflow file from the PR's merge commit, so a fork PR supplies this
-    # `run:` block along with everything else in the file. "Inspect what the
-    # shell body currently does" is a review of the base branch, not a boundary
-    # around what will execute on `[self-hosted, Linux]`.
+    # Same-repo pull requests, and merge-queue group heads whose only action
+    # is `checks_requested`. This job is pure bash today -- it echoes two
+    # workflow variables and runs `date` -- and that is NOT why it is safe,
+    # because it is not a property a fork has to leave alone. For
+    # `pull_request`, GitHub runs the workflow file from the PR's merge
+    # commit, so a fork PR supplies this `run:` block along with everything
+    # else in the file. "Inspect what the shell body currently does" is a
+    # review of the base branch, not a boundary around what will execute on
+    # `[self-hosted, Linux]`.
     #
     # Stated plainly because the guard is easy to over-read: this closes the
     # DECLARED lanes. A fork PR can also add a job that was never here, and no
     # `if:` in this file constrains that -- the boundary for that is the org's
     # "self-hosted runners for fork pull requests" setting plus required
     # approval for outside contributors, both of which are set at org level.
+    #
+    # The merge_group arm (maxi-core#4875 pattern): a merge-group ref is
+    # assembled by GitHub from PRs already admitted to the merge queue, and
+    # its only trust-relevant action is `checks_requested` -- only someone
+    # allowed to merge can admit a PR, so queue admission IS the trust
+    # boundary for this event and the same-repo fork guard does not apply to
+    # it. The five merge-queue lifecycle actions (`created`, `merged`,
+    # `pushed`, `removed`, `deleted`) are NOT admitted here: they must not
+    # mint a required-context check run.
     #
     # AGGREGATE, not just a sentinel. This job is the SOLE required context
     # under the post-merge-gate ruleset (maxi-tools/ci#<this PR> +
@@ -89,37 +100,30 @@ jobs:
     # fine, but failure or cancellation MUST surface as a FAILURE conclusion
     # here, not as a green check that hides a red lane.
     #
-    # `if:` adds `always()` to the fork tripwire so this gate's check run is
-    # present whether its needs succeeded OR failed -- without it, a failing
-    # `check`/`test` skips this job and the required context vanishes. That
-    # is precisely the failure mode this slice exists to fix.
+    # `if:` adds `always()` so this gate's check run is present whether its
+    # needs succeeded OR failed -- without it, a failing `check`/`test` skips
+    # this job and the required context vanishes. That is precisely the
+    # failure mode this slice exists to fix. The gate therefore NEVER skips
+    # itself on either admitted event; on a merge_group head the gates that
+    # never skip are the whole point (the queue synthesizes a head the
+    # pull_request-only lanes would otherwise not report on).
     #
-    # Two event arms, kept disjoint so a defect in one cannot widen the other:
-    #   - `pull_request` from a same-repo PR (the existing fork tripwire;
-    #     a fork PR does not pass `head.repo.full_name == github.repository`
-    #     and is filtered here, not by the runner boundary).
-    #   - `merge_group` with `action == 'checks_requested'`. The merge-queue
-    #     in maxi-config calls this workflow on `merge_group` so the queue
-    #     can read the aggregate verdict before it merges. The `merge_group`
-    #     event is GitHub-internal: only the merge-queue system itself can
-    #     trigger it, so the same-repo fork guard does not apply. The action
-    #     guard is mandatory regardless: `created`, `merged`, `pushed`,
-    #     `removed`, and `deleted` all run this workflow but only the
-    #     `checks_requested` action represents a CI evaluation request --
-    #     the others are merge-queue lifecycle events and must not mint a
-    #     required-context check run. `checks_requested` is the only arm
-    #     that owns the aggregate verdict.
+    # Spelled so the fork/queue guards are NEGATED disjuncts, not a bare
+    # positive event allowlist: the #346 rule (tests/test_self_hosted_
+    # fork_guard.py) rejects `event_name == 'x' || <guard>` because an
+    # allowlist silently drops any trigger added to `on:` later. The
+    # leading conjunct keeps the event surface EXACTLY what it was
+    # (pull_request + merge_group, nothing admitted by accident), and each
+    # following conjunct is one event's trust boundary in the accepted
+    # negated spelling: same-repo for pull_request, queue admission
+    # (checks_requested) for merge_group.
     if: >-
-      (
-        (
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        ) ||
-        (
-          github.event_name == 'merge_group' &&
-          github.event.action == 'checks_requested'
-        )
-      ) &&
+      (github.event_name == 'pull_request' ||
+      github.event_name == 'merge_group') &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'merge_group' ||
+      github.event.action == 'checks_requested') &&
       always()
     needs: [plan, check, test, package, sign-publish, release-verify]
     # Deliberately self-hosted rather than a hosted runner: when hosted
@@ -163,16 +167,56 @@ jobs:
             echo "- this job is the aggregate of every declared lane and is the sole required context under the new ruleset"
             echo "- a lane reporting failure or cancellation surfaces here as a FAILURE conclusion, not as a green check"
             echo "- package/sign/release lanes are deferred unless packaging impact or trusted release refs require them"
+            echo "- on a merge_group head a skipped check/test lane passes only when the change detector reports no relevant change (scope=merge-gate-only)"
           } >> "$GITHUB_STEP_SUMMARY"
       # Always runs so a failed upstream lane is reported by THIS job, not by
-      # the lane itself (which the ruleset no longer requires). Skipped is
-      # fine (fan-out: e.g. merge-gate-only scope, no push to release refs);
-      # failure or cancellation is the failure mode this step exists for.
+      # the lane itself (which the ruleset no longer requires).
+      #
+      # What a SKIPPED lane means now depends on the event, because it means
+      # two different things (maxi-core#4875's (a)/(b) distinction):
+      #
+      #   pull_request -- `skipped` is the fan-out and docs-only path, decided
+      #     inside the lane jobs (Dependabot actor, merge-gate-only scope,
+      #     fan-out branch). That skip is deliberate and stays acceptable.
+      #
+      #   merge_group -- the queue head is the candidate merge. A skipped
+      #     check/test lane here is merge evidence ONLY when the change
+      #     detector positively reports no relevant change
+      #     (`plan.outputs.scope == 'merge-gate-only'`, the same sentinel the
+      #     lanes themselves consult). Anything else -- a router that fell
+      #     over, a lane never scheduled, the plan job failed before the
+      #     classifier ran -- means nothing was verified and nobody chose
+      #     that, which is exactly the #3218 shape. So the merge_group arm
+      #     requires the skip to be positively explained, and `scope` missing
+      #     or unfamiliar fails closed. `package`/`sign-publish`/
+      #     `release-verify` keep the pull_request semantics on BOTH events:
+      #     they are release-ref lanes, not diff lanes, and a merge-group run
+      #     legitimately leaves them skipped.
+      #
+      # Outside a degraded window (today > CI_DEGRADED_UNTIL, or the expiry
+      # unset) the strict arm additionally requires every merge_group skip
+      # to be rejected regardless of the detector's scope -- a `skipped`
+      # that arrived with `scope=merge-gate-only` (the lane-side guard
+      # accepted the docs-only path) no longer passes the gate, the same
+      # equality-not-non-failure shape maxi-core's security-gate was held
+      # to (verifier t_caba2c83 criterion c). Inside the window the
+      # historical shape holds: failure and cancellation never pass, and a
+      # queue-head skip still needs the detector's positive verdict. The
+      # strict arm is deliberately merge_group-only: on pull_request the
+      # fan-out skip (a maxi-config-sync/* head, gated on branch prefix AND
+      # distributor id) is a deliberate skip with scope=full, and the
+      # degraded window must not turn every fan-out PR red. Fail-closed on
+      # a missing expiry, the same shape qodana's degraded gate uses.
       - name: Aggregate lane results
         if: always()
         shell: bash
         env:
           MERGE_GATE_NEEDS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PLAN_SCOPE: ${{ needs.plan.outputs.scope }}
+          CI_ENFORCEMENT_MODE_VALUE: ${{ env.CI_ENFORCEMENT_MODE }}
+          CI_DEGRADED_UNTIL_VALUE: ${{ env.CI_DEGRADED_UNTIL }}
         run: |
           set -euo pipefail
           echo "Lane needs: $MERGE_GATE_NEEDS"
@@ -180,7 +224,7 @@ jobs:
           # unbounded (one entry per lane, each with outputs) and argv is
           # bounded by ARG_MAX. (codacy, maxi-config#790.)
           python3 <<'PY'
-          import json, os, sys
+          import json, os, subprocess, sys
 
           # ALLOWLIST, not a denylist. The previous shape failed on
           # `failure` and `cancelled` only, so any other value -- a result
@@ -188,12 +232,30 @@ jobs:
           # because a lane never reported -- passed the gate silently.
           # This job is the SOLE required context under the new ruleset, so
           # "a value I do not recognise" must mean stop, not proceed.
-          # `skipped` is the one non-success that is genuinely fine: the
-          # fan-out and docs-only paths skip lanes deliberately, and the
-          # lane-side guards keep the check runs present as `skipped`.
           PASSING = ("success", "skipped")
 
+          # The heavy lanes the change detector governs. On a merge_group
+          # head a `skipped` here is merge evidence only when the detector
+          # positively says the diff cannot reach a build.
+          HEAVY_LANES = ("check", "test")
+
           needs = json.loads(os.environ["MERGE_GATE_NEEDS"])
+          event = os.environ.get("EVENT_NAME", "")
+          action = os.environ.get("EVENT_ACTION", "")
+          plan_scope = os.environ.get("PLAN_SCOPE", "")
+          is_merge_group = event == "merge_group"
+
+          # Degraded window, same fail-closed comparison the enforcement-mode
+          # step above runs: an unset or empty CI_DEGRADED_UNTIL means the
+          # window is NOT open, so strict enforcement applies. Evaluated only
+          # when the strict arm is reached, but computed here so the report
+          # below can print it.
+          until = os.environ.get("CI_DEGRADED_UNTIL_VALUE", "")
+          today = subprocess.run(["date", "-u", "+%Y-%m-%d"],
+                                 capture_output=True, text=True,
+                                 check=True).stdout.strip()
+          degraded_in_window = bool(until) and today <= until
+
           bad = [(name, info.get("result")) for name, info in needs.items()
                  if info.get("result") not in PASSING]
           if bad:
@@ -201,9 +263,69 @@ jobs:
                   print(f"::error::Required lane {name!r} reported {result!r}; "
                         "merge-gate fails.")
               sys.exit(1)
+
+          # On a queue head every skipped heavy lane must be positively
+          # explained by the change detector. `scope` absent or unfamiliar
+          # fails closed: a plan job that fell over before the classifier
+          # ran publishes no output, and an unexplained skip is the exact
+          # "green with nothing compiled" hole this gate exists to close.
+          #
+          # Two arms, deliberately different predicates so each does work
+          # the other doesn't:
+          #
+          #   INSIDE the degraded window -- accept the historical shape: a
+          #   heavy-lane skip with `scope != 'merge-gate-only'` is a
+          #   misclassified skip and must exit (plan reports the lane ran
+          #   but could not positively classify the change).
+          #
+          #   OUTSIDE the degraded window -- strict equality, the same
+          #   shape maxi-core's security-gate was held to (verifier
+          #   t_caba2c83 criterion c): a heavy-lane skip on merge_group is
+          #   rejected regardless of what scope the change detector
+          #   reports, because outside the window the gate's promise is
+          #   that the lane actually ran and passed. A `merge-gate-only`
+          #   skip that the lane fan-out itself permitted (the
+          #   `!should_run` docs-only path) is no longer acceptable when
+          #   the degraded waiver is closed.
+          #
+          # The previous single-block-and-strict-arm concatenation wrote
+          # the same predicate twice (cubic P3 / coderabbit P2 / codacy
+          # P2 -- the strict arm was unreachable because every input
+          # that would have tripped it had already exited at the first
+          # block). The two arms now cover disjoint inputs.
+          if is_merge_group:
+              skipped_heavy = [name for name in HEAVY_LANES
+                               if needs.get(name, {}).get("result") == "skipped"]
+              if not skipped_heavy:
+                  pass  # every heavy lane ran; nothing to adjudicate
+              elif degraded_in_window:
+                  if plan_scope != "merge-gate-only":
+                      print("::error::merge_group: heavy lane(s) "
+                            f"{skipped_heavy!r} skipped but the change "
+                            f"detector reports scope={plan_scope!r} "
+                            "(expected 'merge-gate-only'); inside the "
+                            f"degraded window (CI_DEGRADED_UNTIL={until or '<unset>'}, "
+                            f"today={today}) a queue head may only skip a "
+                            "heavy lane when the detector positively "
+                            "reports no relevant change.")
+                      sys.exit(1)
+              else:
+                  print("::error::merge_group: heavy lane(s) "
+                        f"{skipped_heavy!r} skipped but the degraded "
+                        f"window is closed (CI_DEGRADED_UNTIL={until or '<unset>'}, "
+                        f"today={today}); strict enforcement requires the "
+                        "lane to have run and succeeded on the queue head. "
+                        f"(scope reported by the detector: {plan_scope!r}; "
+                        "the strict arm rejects every skip outside the "
+                        "window regardless of scope.)")
+                  sys.exit(1)
+
           skipped = [name for name, info in needs.items()
                      if info.get("result") == "skipped"]
-          print(f"All required lanes passed (or were skipped). skipped={skipped}")
+          print(f"All required lanes passed (or were positively skipped). "
+                f"event={event} action={action!r} scope={plan_scope!r} "
+                f"degraded_in_window={str(degraded_in_window).lower()} "
+                f"skipped={skipped}")
           PY
 
   plan:
@@ -320,6 +442,13 @@ jobs:
     if: ${{ always() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
     needs: [plan, package]
     uses: ./.github/workflows/lane-sign-publish.yml
+    # The lane declares contents:write / id-token:write / pages:write inside
+    # its own permissions: block for completeness, but its actual steps
+    # (checkout with persist-credentials:false, download-artifact, and a
+    # bash summary) only need contents:read. Granting write scopes here
+    # would re-introduce the floor on every consumer that the design's
+    # "no step needs a write scope" rule (test_ci_design_permissions)
+    # deliberately tightened, so the call site stays at contents:read.
     permissions:
       contents: read
     with:
