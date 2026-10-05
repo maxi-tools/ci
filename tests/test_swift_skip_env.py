@@ -97,15 +97,58 @@ class SwiftSkipEnvMapping(unittest.TestCase):
                 self.assertNotIn('=""', run)
                 self.assertNotIn("=''", run)
 
-    def test_rust_ci_forwards_skip_swift_build_to_package(self):
+    def test_rust_ci_forwards_skip_swift_build_to_check_test_and_package(self):
+        """skip_swift_build is forwarded to lane-check, lane-test, and lane-package.
+
+        lane-check and lane-test skip the Swift build for maximoji-apple
+        (maxi-tray#460) on Rust-only PRs. lane-package also accepts the
+        forwarded input -- its workflow_call.inputs declares it (see
+        `.github/workflows/lane-package.yml`) and forwards it onto
+        MAXIMOJI_APPLE_SKIP_SWIFT_BUILD inside the job -- so a packaging
+        lane on a docs-only PR keeps the same skip behaviour as
+        check/test. (coderabbit P2 review thread: the previous version
+        of this test asserted `skip_swift_build:` was absent from
+        `package`, which only happened because `package`'s call site
+        had been wrongfully stripped of the forwarding under a
+        false-premise comment claiming the input was undeclared.
+        Restoring the forwarding matches the declared lane contract.)
+
+        Asserts by parsing each lane's `with:` block: the input
+        expression is bound to the expected upstream `with:` token so a
+        comment or unrelated `with:` entry containing the bare word
+        cannot make the test pass (the regression class the path
+        instructions flag).
+        """
         text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
-        package = re.search(
-            r"^ {2}package:\n(?P<body>(?:(?!^ {2}[A-Za-z0-9_-]+:).)*)",
-            text,
-            re.MULTILINE | re.DOTALL,
-        )
-        self.assertIsNotNone(package)
-        self.assertIn("skip_swift_build:", package.group(0))
+
+        def with_block(job_name: str) -> str:
+            # Match the top-level `  <job>:` header and read until the
+            # next top-level job header, or the permissions/secrets
+            # block that follows the `with:` mapping.
+            match = re.search(
+                r"^ {2}" + re.escape(job_name) + r":\n(?P<body>(?:(?!^ {2}[A-Za-z0-9_-]+:).)*)",
+                text,
+                re.MULTILINE | re.DOTALL,
+            )
+            if match is None:
+                self.fail("rust-ci.yml has no job named " + job_name)
+            body = match.group(0)
+            with_match = re.search(r"\bwith:\n(?P<with>(?: {6,}[^\n]*\n)+)", body)
+            if with_match is None:
+                self.fail(f"rust-ci.yml job {job_name} has no `with:` mapping")
+            return with_match.group("with")
+
+        expected = "skip_swift_build: ${{ inputs.skip_swift_build == true }}"
+        for job_name in ("check", "test", "package"):
+            with self.subTest(job=job_name):
+                self.assertIn(
+                    expected,
+                    with_block(job_name),
+                    f"{job_name} must forward `skip_swift_build: ${{{{ "
+                    f"inputs.skip_swift_build == true }}}}` to its lane; the "
+                    "exact-expression check guards against a comment or "
+                    "unrelated `with:` entry that mentions the bare word.",
+                )
 
 
 if __name__ == "__main__":
