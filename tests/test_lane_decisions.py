@@ -31,9 +31,121 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import types
 import unittest
 
 import yaml
+
+import ast
+
+# Module-level helpers for the merge-gate event-filter evaluator. Kept out
+# of the test class so a future widening of the supported GitHub Actions
+# grammar adds a new method here, not a new branch inside a 200-line method.
+class _NullSafe(types.SimpleNamespace):
+    """SimpleNamespace that returns None for missing attributes.
+
+    GitHub Actions returns null on `event.<missing>` and the comparison
+    `null == 'foo'` is false; Python's SimpleNamespace raises AttributeError,
+    which would mask the very case the test is checking.
+    """
+    def __getattr__(self, name: str) -> object:
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return None
+
+    @classmethod
+    def github(cls, event_name: str, event_obj: object) -> "_NullSafe":
+        wrapped = _wrap_dict({
+            "event_name": event_name,
+            "event": event_obj,
+            "repository": "maxi-tools/ci",
+        })
+        if not isinstance(wrapped, _NullSafe):
+            raise ValueError("github() expects a dict-shaped event")
+        return wrapped
+
+
+def _wrap_dict(value: object) -> object:
+    if isinstance(value, dict):
+        return _NullSafe(**{k: _wrap_dict(v) for k, v in value.items()})
+    return value
+
+
+class _Translate:
+    """GitHub Actions expression -> Python expression source.
+
+    `&&` -> `and`, `||` -> `or`, `always()` -> True. The result is a small
+    expression over the supported operators, not arbitrary user input --
+    the test loader reads the bytes straight from the workflow file and the
+    test corpus is the workflow itself.
+    """
+    @staticmethod
+    def gha_to_python(expr: str) -> str:
+        return (expr.replace("&&", " and ")
+                   .replace("||", " or ")
+                   .replace("always()", "True"))
+
+
+class _Walk:
+    """Bounded AST walker for the GitHub Actions grammar we use.
+
+    Dispatches per node type so adding a node kind is a new branch on the
+    class, not a new `isinstance` deep inside a function. The grammar is
+    the union of BoolOp, Compare, Name, Attribute, Constant -- anything
+    else raises ValueError, which fails the test loudly instead of
+    silently reading whatever `eval` happens to allow.
+    """
+    @staticmethod
+    def evaluate(node: ast.AST, ns: dict) -> object:
+        if isinstance(node, ast.Expression):
+            return _Walk.evaluate(node.body, ns)
+        if isinstance(node, ast.BoolOp):
+            return _Walk.boolop(node, ns)
+        if isinstance(node, ast.Compare):
+            return _Walk.compare(node, ns)
+        if isinstance(node, ast.Name):
+            return _Walk.name(node, ns)
+        if isinstance(node, ast.Attribute):
+            return _Walk.attribute(node, ns)
+        if isinstance(node, ast.Constant):
+            return node.value
+        raise ValueError(f"unsupported node: {type(node).__name__}")
+
+    @staticmethod
+    def boolop(node: ast.BoolOp, ns: dict) -> bool:
+        values = [_Walk.evaluate(v, ns) for v in node.values]
+        if isinstance(node.op, ast.And):
+            return all(values)
+        if isinstance(node.op, ast.Or):
+            return any(values)
+        raise ValueError(f"unsupported BoolOp: {type(node.op).__name__}")
+
+    @staticmethod
+    def compare(node: ast.Compare, ns: dict) -> bool:
+        left = _Walk.evaluate(node.left, ns)
+        for op, right_node in zip(node.ops, node.comparators):
+            right = _Walk.evaluate(right_node, ns)
+            if isinstance(op, ast.Eq) and left != right:
+                return False
+            if isinstance(op, ast.NotEq) and left == right:
+                return False
+            left = right
+        return True
+
+    @staticmethod
+    def name(node: ast.Name, ns: dict) -> object:
+        if node.id == "github":
+            return ns["github"]
+        if node.id in ("True", "False", "None"):
+            return {"True": True, "False": False, "None": None}[node.id]
+        raise ValueError(f"unknown name: {node.id!r}")
+
+    @staticmethod
+    def attribute(node: ast.Attribute, ns: dict) -> object:
+        value = _Walk.evaluate(node.value, ns)
+        return getattr(value, node.attr, None)
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LANE_PLAN = ROOT / ".github/workflows/lane-plan.yml"
@@ -150,6 +262,89 @@ class AggregateLaneResults(unittest.TestCase):
         rc, log, _ = self.aggregate({})
         self.assertEqual(rc, 0, log)
         self.assertIn("skipped=[]", log)
+
+
+# `merge-gate` is the SOLE required context under the post-merge-gate ruleset.
+# The job's `if:` decides whether the rule even exists on a given event --
+# skip it on the wrong event and the ruleset is structurally weaker than the
+# lanes it is supposed to replace. actionlint checks expression syntax, not
+# what it evaluates against. (codacy on maxi-config#790; the same reasoning
+# made this file ship its first two tests.)
+#
+# `always()` is the force-run-on-upstream-failure override, not a boolean
+# value: with it, the job runs even when its needs failed, as long as the
+# rest of the expression is true. Treat it as True in the boolean evaluation
+# so the test reads the EVENT filter, not the failure override -- the
+# override is asserted separately.
+class MergeGateEventFilter(unittest.TestCase):
+    @staticmethod
+    def _if_expr() -> str:
+        doc = yaml.safe_load(RUST_CI.read_text(encoding="utf-8"))
+        expr = doc["jobs"]["merge-gate"]["if"]
+        if not isinstance(expr, str):
+            raise ValueError(f"merge-gate `if:` is not a string: {expr!r}")
+        return expr
+
+    @staticmethod
+    def _evaluates(expr: str, event_name: str, event_obj: object) -> bool:
+        py = _Translate.gha_to_python(expr)
+        ns = {"github": _NullSafe.github(event_name, event_obj)}
+        return bool(_Walk.evaluate(ast.parse(py, mode="eval"), ns))
+
+    def gate_should_run(self, event_name: str, event_obj: object) -> bool:
+        return self._evaluates(self._if_expr(), event_name, event_obj)
+
+    def test_pull_request_same_repo_runs(self):
+        """Existing fork-tripwire arm still passes a same-repo PR."""
+        event = {"pull_request": {"head": {"repo": {"full_name": "maxi-tools/ci"}}}}
+        self.assertTrue(self.gate_should_run("pull_request", event))
+
+    def test_pull_request_fork_does_not_run(self):
+        """The fork tripwire still filters a fork PR -- the new merge_group
+        arm must not widen this."""
+        event = {"pull_request": {"head": {"repo": {"full_name": "maxi-tools/attacker"}}}}
+        self.assertFalse(self.gate_should_run("pull_request", event))
+
+    def test_merge_group_checks_requested_runs(self):
+        """The merge-queue caller asks this workflow to emit the required
+        `merge-gate / merge-gate` context on `merge_group` with action
+        `checks_requested`. Without this arm the job is skipped and the
+        ruleset sees no verdict."""
+        event = {"action": "checks_requested"}
+        self.assertTrue(self.gate_should_run("merge_group", event))
+
+    def test_merge_group_other_actions_do_not_run(self):
+        """`merge_group` actions besides `checks_requested` are merge-queue
+        lifecycle events. The aggregate check run must not be created for
+        them: it would be a required-context check run with no upstream
+        lane results to aggregate, and it would block the queue."""
+        for action in ("created", "merged", "pushed", "removed", "deleted"):
+            with self.subTest(action=action):
+                event = {"action": action}
+                self.assertFalse(self.gate_should_run("merge_group", event),
+                                 f"merge_group action={action!r} must not run merge-gate")
+
+    def test_merge_group_with_no_action_does_not_run(self):
+        """Defensive: a malformed merge_group payload without `action` must
+        not mint the required check run."""
+        event = {}
+        self.assertFalse(self.gate_should_run("merge_group", event))
+
+    def test_unrelated_event_names_do_not_run(self):
+        """A `push` or `workflow_dispatch` event must not run merge-gate.
+        The merge-gate is the PR/merge-group aggregate, not a push-triggered one."""
+        for event_name in ("push", "workflow_dispatch", "schedule", "release"):
+            with self.subTest(event_name=event_name):
+                event = {"action": "checks_requested"}  # even with a matching action
+                self.assertFalse(self.gate_should_run(event_name, event))
+
+    def test_if_expression_uses_always_override(self):
+        """The upstream-failure override must still be present in the
+        expression. Without it, a failing `check`/`test` skips merge-gate
+        and the required context vanishes -- which is the failure mode
+        this whole job exists to fix. actionlint cannot catch a deleted
+        `always()`; this test does."""
+        self.assertIn("always()", self._if_expr())
 
 
 if __name__ == "__main__":

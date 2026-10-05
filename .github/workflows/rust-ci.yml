@@ -93,9 +93,33 @@ jobs:
     # present whether its needs succeeded OR failed -- without it, a failing
     # `check`/`test` skips this job and the required context vanishes. That
     # is precisely the failure mode this slice exists to fix.
+    #
+    # Two event arms, kept disjoint so a defect in one cannot widen the other:
+    #   - `pull_request` from a same-repo PR (the existing fork tripwire;
+    #     a fork PR does not pass `head.repo.full_name == github.repository`
+    #     and is filtered here, not by the runner boundary).
+    #   - `merge_group` with `action == 'checks_requested'`. The merge-queue
+    #     in maxi-config calls this workflow on `merge_group` so the queue
+    #     can read the aggregate verdict before it merges. The `merge_group`
+    #     event is GitHub-internal: only the merge-queue system itself can
+    #     trigger it, so the same-repo fork guard does not apply. The action
+    #     guard is mandatory regardless: `created`, `merged`, `pushed`,
+    #     `removed`, and `deleted` all run this workflow but only the
+    #     `checks_requested` action represents a CI evaluation request --
+    #     the others are merge-queue lifecycle events and must not mint a
+    #     required-context check run. `checks_requested` is the only arm
+    #     that owns the aggregate verdict.
     if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
+      (
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) ||
+        (
+          github.event_name == 'merge_group' &&
+          github.event.action == 'checks_requested'
+        )
+      ) &&
       always()
     needs: [plan, check, test, package, sign-publish, release-verify]
     # Deliberately self-hosted rather than a hosted runner: when hosted
