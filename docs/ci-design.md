@@ -155,6 +155,20 @@ that opens an issue on this repository listing consumers that are more
 than one tip behind. The fan-out PR is the primary detector; this audit
 is what catches consumers that ignored the fan-out.
 
+### Merge queue
+
+`rust-ci.yml` is also called by the merge-queue template in `maxi-config`
+on the GitHub `merge_group` event. The `merge-gate` job's `if:` accepts
+both `pull_request` from a same-repo PR and `merge_group` with
+`action == 'checks_requested'` so the queue reads the same required
+aggregate verdict it would read on a PR run. `merge_group` is
+GitHub-internal -- only the merge-queue system itself can trigger it --
+so the same-repo fork guard does not apply; the action guard is the
+filter, because `created`/`merged`/`pushed`/`removed`/`deleted` are
+merge-queue lifecycle events and must not mint a required-context check
+run. Tests in `tests/test_lane_decisions.py:MergeGateEventFilter` cover
+the event filter.
+
 ## Trust boundary
 
 The source being readable is not what makes any of this safe. The gates here are
