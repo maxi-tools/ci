@@ -430,8 +430,21 @@ jobs:
       contents: read
     with:
       runs_on: ${{ needs.plan.outputs.runs_on }}
-      should_run: ${{ needs.plan.outputs.packaging_impact == 'true' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
-      skip_reason: no packaging impact on an ordinary PR
+      # PR/merge_group lanes never build with the release profile. The
+      # dev/test profile is what check and test use, and `cargo test
+      # --workspace --all-targets` already exercises every crate; an
+      # extra `cargo build --workspace --release` on every PR is the
+      # slowest possible way to learn that a release flag is missing,
+      # and the binary it produces has no consumer on a PR.
+      #
+      # "Release builds, artifacts, signing and bundling run on
+      # schedule/nightly and on tag/release events only" -- this gate
+      # is the PR half of that. Post-merge pushes to main still build
+      # when packaging_impact says so, the release/* push trigger still
+      # runs, and the nightly schedule workflow in this repository
+      # drives the optimised path on the cadence the user asked for.
+      should_run: ${{ (needs.plan.outputs.packaging_impact == 'true' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+      skip_reason: release profile is built on schedule/nightly and on tag/release events, not on PR or merge_group
       checkout_submodules: ${{ inputs.checkout_submodules == true }}
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
     secrets:
