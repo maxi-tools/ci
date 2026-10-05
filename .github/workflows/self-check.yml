@@ -113,7 +113,7 @@ jobs:
           . "$RUNNER_TEMP/moments-python/bin/activate"
           python3 -m pip install PyYAML==6.0.3
           failed=0
-          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py; do
+          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py; do
             echo "== $t"
             if ! python3 "$t"; then
               echo "::error file=$t::$t failed"
