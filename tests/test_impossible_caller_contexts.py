@@ -98,6 +98,13 @@ def _safe_eval(expr: str) -> bool:
                 "should have refused this node at the source. expr="
                 f"{expr!r}"
             )
+    # The AST walk above rejects every node kind the parser did not
+    # produce. The supported subset (string/number literals,
+    # `==`/`!=`, `&&`/`||`, `always()`) reduces to a fixed grammar
+    # that bandit B307 / qlty cannot statically prove safe -- the
+    # AST whitelist IS the proof. `ast.literal_eval` cannot express
+    # this grammar because `and`/`or` are operators it refuses.
+    # nosem: bandit.B307
     return bool(eval(compile(tree, "<renders_true>", "eval"), {"__builtins__": {}}))
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
