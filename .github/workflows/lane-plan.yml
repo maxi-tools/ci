@@ -266,10 +266,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_REF: ${{ inputs.base_ref }}
+          # The merge-queue base SHA, when this lane is called from a
+          # merge_group event on a non-`main` target (release/** queues
+          # are an explicit GitHub-supported shape). Populated here
+          # rather than at the caller so the lane owns the resolution --
+          # the same logic that owns the pull_request short-circuit.
+          # Default empty so an unset event still falls through to
+          # $BASE_REF; that is the same fail-safe as before. (ci#83
+          # codex P1 review thread, PRRT_kwDOUUTR_s6o0w-D.)
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha || '' }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             files="$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')"
+          elif [ -n "$MERGE_GROUP_BASE_SHA" ]; then
+            # merge_group payload: $BASE_REF is meaningless here (a
+            # merge-group event has no `before`, and the caller's
+            # fallback to `origin/main` is wrong on a release queue).
+            # The merge-group head SHA lives at ${{ github.sha }}; the
+            # base SHA is the queue's chosen parent.
+            files="$(git diff --name-only "$MERGE_GROUP_BASE_SHA" "${{ github.sha }}" || printf '%s\n' Cargo.lock)"
           else
             before="$BASE_REF"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
