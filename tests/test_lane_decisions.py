@@ -561,6 +561,56 @@ class MergeGateEventFilter(unittest.TestCase):
         self.assertIn("always()", self._if_expr())
 
 
+# Matches a `cargo` invocation that asks for the OPTIMISED profile.
+#
+# Two deliberate subtleties, both of which a looser pattern gets wrong:
+#
+# `(?![-_.])` after `cargo` -- without it this matches lane-package's
+# artifact-IDENTITY step, whose body spells a cache key like
+# `cargo-target-v1--...--workspace--release--...` and invokes no compiler.
+# That false positive is why the original scan reported two release builds.
+#
+# The release flag is matched as a TOKEN, not by adjacency:
+#     --release(?![-\w])        long form
+#     (?<![-\w])-r(?![-\w])     short form, but NOT the `-r` inside `--release`
+# Both ends are negative lookarounds rather than `\b` or `(?:^|\s)`. `\b`
+# fires between `e` and the `-` in a hypothetical `--release-note`, because a
+# hyphen is a non-word character; `(?:^|\s)` is worse, since `\bcargo` has
+# already consumed input by this point so a `^` alternative can never match.
+# (qlty S5996, and it was right.)
+#
+# KNOWN AND DELIBERATE. `echo "cargo build --release"` matches, because the
+# pattern cannot tell a log line from a command. That fails LOUDLY rather than
+# silently -- the assertion this feeds pins the exact expected list -- so the
+# cost of being wrong is a red test, not a missed build.
+RELEASE_BUILD = re.compile(
+    r"\bcargo(?![-_.])[^\n]*(?:--release(?![-\w])|(?<![-\w])-r(?![-\w]))"
+)
+
+
+def _release_build_steps(lane_dir: pathlib.Path):
+    """Yield `lane.yml:job:step` for every step that compiles optimised.
+
+    Split out of the test body purely for cognitive complexity: the nested
+    lane/job/step/line walk reads as one thing in the test and as four levels
+    of nesting in a linter's model.
+    """
+    for lane_path in sorted(lane_dir.glob("lane-*.yml")):
+        doc = yaml.safe_load(lane_path.read_text(encoding="utf-8"))
+        for job_name, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                body = step.get("run")
+                if not isinstance(body, str):
+                    continue
+                for line in body.splitlines():
+                    stripped = line.strip()
+                    # A commented-out command is not a build.
+                    if stripped.startswith("#"):
+                        continue
+                    if RELEASE_BUILD.search(stripped):
+                        yield f"{lane_path.name}:{job_name}:{step.get('name')}"
+
+
 class ReleaseProfileStaysOffThePullRequestPath(unittest.TestCase):
     """rust-ci's package lane must not build the optimised profile on a PR.
 
@@ -690,25 +740,7 @@ class ReleaseProfileStaysOffThePullRequestPath(unittest.TestCase):
         reason a shell would skip them.
         """
         lane_dir = RUST_CI.parent
-        builders = []
-        for lane_path in sorted(lane_dir.glob("lane-*.yml")):
-            doc = yaml.safe_load(lane_path.read_text(encoding="utf-8"))
-            for job_name, job in (doc.get("jobs") or {}).items():
-                for step in job.get("steps") or []:
-                    body = step.get("run")
-                    if not isinstance(body, str):
-                        continue
-                    for line in body.splitlines():
-                        stripped = line.strip()
-                        if stripped.startswith("#"):
-                            continue
-                        if re.search(
-                            r"\bcargo(?![-_.])[^\n]*(--release|(?:^|\s)-r(?:\s|$))",
-                            stripped,
-                        ):
-                            builders.append(
-                                f"{lane_path.name}:{job_name}:{step.get('name')}"
-                            )
+        builders = list(_release_build_steps(lane_dir))
         self.assertEqual(
             builders, ["lane-package.yml:lane-package:Build release artifacts"],
             "the optimised profile must be built by exactly one lane in "
