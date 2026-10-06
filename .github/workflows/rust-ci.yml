@@ -59,7 +59,7 @@ on:
         # (rhysd/actionlint#343) -- and self-check.yml runs actionlint with
         # fail-on-error. `job.status` in the final always() step IS the job
         # conclusion, so the published value is identical.
-        value: ${{ jobs.merge-gate.outputs.gate_result }}
+        value: ${{ jobs.merge-gate.outputs.gate_result || 'skipped' }}
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
@@ -507,7 +507,7 @@ jobs:
       # does -- a failed lane must still produce a published conclusion.
       - name: Publish gate result
         id: gate-result
-        if: always()
+        if: always() && steps.trust-admission.outcome == 'skipped'
         env:
           GATE_RESULT: ${{ job.status }}
         shell: bash
