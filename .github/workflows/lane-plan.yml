@@ -84,12 +84,12 @@ jobs:
     # wedged router from stalling the whole lane chain behind it.
     timeout-minutes: 15
     outputs:
-      runs_on: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on }}
-      provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider }}
-      packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact }}
-      packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason }}
-      scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope }}
-      scope_reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason }}
+      runs_on: ${{ steps.resolve.outputs.runs-on || steps.dependabot-fallback.outputs.runs-on || steps.credentials-fallback.outputs.runs-on }}
+      provider: ${{ steps.resolve.outputs.provider || steps.dependabot-fallback.outputs.provider || steps.credentials-fallback.outputs.provider }}
+      packaging_impact: ${{ steps.packaging.outputs.packaging_impact || steps.dependabot-fallback.outputs.packaging_impact || steps.credentials-fallback.outputs.packaging_impact }}
+      packaging_reason: ${{ steps.packaging.outputs.packaging_reason || steps.dependabot-fallback.outputs.packaging_reason || steps.credentials-fallback.outputs.packaging_reason }}
+      scope: ${{ steps.scope.outputs.scope || steps.dependabot-fallback.outputs.scope || steps.credentials-fallback.outputs.scope }}
+      scope_reason: ${{ steps.scope.outputs.scope_reason || steps.dependabot-fallback.outputs.scope_reason || steps.credentials-fallback.outputs.scope_reason }}
     permissions:
       contents: read
       pull-requests: read
