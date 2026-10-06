@@ -360,19 +360,40 @@ class RustCiJobsContractTest(unittest.TestCase):
             f"whether to block, and a missing conclusion is read as "
             f"no verdict, not red.",
         )
+        # TRUST IS STEP 1, NEVER A JOB-LEVEL `if:` (maxi-tools standing
+        # rule; maxi-config#1028 verifier t_e5bf80a3 criterion c). The
+        # job-level `if:` names the event scope plus `always()`; the
+        # same-repo / queue-admission boundary is the `Trust admission`
+        # step that opens the job and fails it RED for a fork PR or a
+        # lifecycle action -- a job-level guard would publish `skipped`,
+        # which an aggregate can be talked into reading as green.
+        steps = jobs["merge-gate"].get("steps") or [{}]
+        trust = steps[0]
+        self.assertEqual(
+            "trust-admission", trust.get("id"),
+            "rust-ci.yml `merge-gate:` step 1 must be the trust admission "
+            "step (never a job-level `if:` trust guard).",
+        )
+        trust_if = " ".join(str(trust.get("if", "")).split())
+        prefix, suffix = "${{ !(", ") }}"
+        self.assertTrue(
+            trust_if.startswith(prefix) and trust_if.endswith(suffix),
+            f"trust step if: must be a negated allowlist, got {trust_if!r}",
+        )
+        admitted_expr = trust_if[len(prefix):-len(suffix)].strip()
         self.assertIn(
             "github.event.pull_request.head.repo.full_name == github.repository",
-            if_,
-            f"rust-ci.yml `merge-gate:` if: ({if_!r}) does not gate "
-            f"on `github.event.pull_request.head.repo.full_name == "
-            f"github.repository`. The aggregate must run on same-repo "
-            f"PRs and skip on fork PRs (fork code must not reach the "
-            f"self-hosted fleet). A condition that lacks this clause "
-            f"either skips legitimate PRs or runs on forks, both of "
-            f"which are the regression class.",
+            admitted_expr,
+            "the trust step must admit pull requests only from this repository",
         )
+        for term in ("head.repo.full_name", "github.event.action", "sender.id"):
+            self.assertNotIn(
+                term, if_,
+                f"rust-ci.yml `merge-gate:` job-level if: carries trust term "
+                f"{term!r}; move it to the trust admission step.",
+            )
 
-        def renders_true(scenario: dict) -> bool:
+        def renders_true(if_: str, scenario: dict) -> bool:
             """Evaluate the aggregate's `if:` under one event scenario.
 
             GitHub expression subset: string/number literals, `!=`,
@@ -409,7 +430,7 @@ class RustCiJobsContractTest(unittest.TestCase):
                         j += 1
                     term = expr[i:j]
                     if term in (
-                        "and", "or", "not", "True", "False",
+                        "and", "or", "True", "False",
                     ):
                         out.append(term)
                     elif term.startswith("github."):
@@ -518,10 +539,17 @@ class RustCiJobsContractTest(unittest.TestCase):
             "merge_group deleted (lifecycle)": False,
             "push": False,
         }
+        def produces_verdict(scenario: dict) -> bool:
+            """The job starts (job-level `if:`) AND its trust step admits
+            the run. Anything else either never starts (push) or fails RED
+            in step 1 (fork, lifecycle) -- neither publishes a verdict."""
+            return renders_true(if_, scenario) and renders_true(
+                admitted_expr, scenario)
+
         for name, scenario in scenarios.items():
             self.assertEqual(
                 expectations[name],
-                renders_true(scenario),
+                produces_verdict(scenario),
                 f"rust-ci.yml `merge-gate:` if: ({' '.join(if_.split())!r}) "
                 f"evaluates wrong under {name}; the aggregate must fire "
                 f"exactly on same-repo pull_request heads and admitted "

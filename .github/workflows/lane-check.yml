@@ -146,6 +146,45 @@ jobs:
     permissions:
       contents: read
     steps:
+      # TRUST ADMISSION -- step 1 of this self-hosted job, never a job-level
+      # `if:` (maxi-tools standing rule). A job-level guard turns an untrusted
+      # run into a SKIPPED lane, and `skipped` is precisely the result an
+      # aggregate can be talked into reading as green. Here the untrusted run
+      # goes RED before checkout, before any token is minted, before any PR
+      # content exists on the runner. Every later step has an implicit
+      # `success()` (or names `steps.trust-admission.outcome`), so nothing
+      # after this one runs once it fires.
+      #
+      # Trusted: a same-repo pull request, an admitted merge-queue head
+      # (`checks_requested` -- only someone allowed to merge can admit one),
+      # a workflow_dispatch by the owner's numeric id (874012, the id the
+      # trusted-actor policy pins; logins can be reassigned, ids cannot), and
+      # push / schedule (callers' push trigger is `branches: [main,
+      # release/**]`, post-merge code; a schedule runs the default branch). Everything else -- including any trigger added to a
+      # caller later -- fails here: an ALLOWLIST of trusted shapes, negated, so
+      # an unknown event is untrusted by construction.
+      - name: Trust admission
+        id: trust-admission
+        if: >-
+          ${{ !(
+          github.event_name == 'push' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository) ||
+          (github.event_name == 'merge_group' &&
+          github.event.action == 'checks_requested') ||
+          (github.event_name == 'workflow_dispatch' &&
+          github.event.sender.id == 874012)
+          ) }}
+        shell: bash
+        env:
+          TRUST_EVENT: ${{ github.event_name }}
+          TRUST_ACTION: ${{ github.event.action }}
+          TRUST_SENDER: ${{ github.event.sender.login }}
+        run: |
+          echo "::error::Untrusted ${TRUST_EVENT} run (action=${TRUST_ACTION:-none}, sender=${TRUST_SENDER:-unknown}): this self-hosted job only admits pushes and schedules, same-repo pull requests, admitted merge-queue heads (checks_requested) and owner dispatches."
+          exit 1
+
       # maxi-tray#460: maximoji-apple honours MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
       # and requires unset or exactly `1`. The GHA `cond && '1' || ''` OFF
       # spelling writes an empty string, which that crate treats as a hard
@@ -385,7 +424,7 @@ jobs:
           fi
 
       - name: Remove private dependency auth
-        if: always()
+        if: always() && steps.trust-admission.outcome == 'skipped'
         run: |
           rm -rf "$RUNNER_TEMP/rust-lane"
           # Point at an empty real file, not /dev/null: later steps (e.g. the
