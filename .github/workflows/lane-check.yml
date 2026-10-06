@@ -337,13 +337,13 @@ jobs:
           set -euo pipefail
           # Any manifest `path` that escapes this workspace. A path inside the
           # repository (e.g. "crates/foo") is fine and must not trip this; only
-          # `../<repo>` or an absolute path names a checkout we do not have.
+          # a `../<repo>` escape names a checkout that lives outside it.
           #
           # Not anchored, so the inline-table form
           # (`foo = { path = "../bar" }`) is caught too; target/ is excluded
           # because cargo never reads manifests out of the build directory.
           matches="$(grep -rInE --exclude-dir=target --include=Cargo.toml \
-            "path[[:space:]]*=[[:space:]]*[\"'](\.\./|/)" . || true)"
+            'path[[:space:]]*=[[:space:]]*[^[:space:]]*\.\./' . || true)"
           if [ -n "$matches" ]; then
             echo "::error::credential-free run: this workspace declares sibling path dependencies that cannot be cloned or verified without APP_ID/APP_PRIVATE_KEY:"
             printf '%s\n' "$matches"
