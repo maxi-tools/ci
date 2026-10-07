@@ -88,12 +88,19 @@ class MacLanesContractTest(unittest.TestCase):
             "setting it on the wrapper's merge-gate job otherwise fails "
             "run creation with 'unexpected input'",
         )
-        self.assertEqual(
-            mac_lanes.get("required", False), False,
+        self.assertFalse(
+            mac_lanes.get("required", False),
             "mac_lanes must be optional: the 57 wrappers that have no "
             "standalone Mac workflow must keep working unchanged, which is "
             "the whole point of making this an opt-in rather than a "
             "breaking template change",
+        )
+        self.assertEqual(
+            mac_lanes.get("type"),
+            "string",
+            "mac_lanes must keep its declared `type: string`: another type "
+            "would still satisfy optionality here yet break callers that "
+            "supply the lane declaration as a string",
         )
 
     def test_linux_gate_output_publishes_the_aggregate_result(self):
@@ -106,7 +113,8 @@ class MacLanesContractTest(unittest.TestCase):
             "chain does not exist",
         )
         self.assertIn(
-            "jobs.merge-gate.outputs.gate_result", gate.get("value", ""),
+            "jobs.merge-gate.outputs.gate_result",
+            gate.get("value", ""),
             "linux_gate must publish the merge-gate aggregate's conclusion. "
             "That job is the SOLE required context and waits on every "
             "declared lane with always() in its if:, so its result is "
@@ -123,7 +131,8 @@ class MacLanesContractTest(unittest.TestCase):
         jobs = load_workflow(RUST_CI)["jobs"]
         if_ = jobs["merge-gate"].get("if", "")
         self.assertIn(
-            "always()", if_,
+            "always()",
+            if_,
             "merge-gate's if: must keep always(); if a failed lane could "
             "skip the aggregate, linux_gate would never publish on exactly "
             "the PRs the fail-fast chain exists for, and the consumer's Mac "
@@ -142,7 +151,8 @@ class MacLanesContractTest(unittest.TestCase):
         """
         text = RUST_CI.read_text(encoding="utf-8")
         self.assertIn(
-            'PASSING = ("success", "skipped")', text,
+            'PASSING = ("success", "skipped")',
+            text,
             "merge-gate's Aggregate step must keep its PASSING allowlist in "
             "the literal form this test greps; the consumer-side Mac-lane "
             "gate copies that rule and this assertion is the coupling",
@@ -161,7 +171,8 @@ class MacLanesContractTest(unittest.TestCase):
         """
         text = RUST_CI.read_text(encoding="utf-8")
         self.assertNotIn(
-            "mac_lanes", text.split("jobs:", 1)[1],
+            "mac_lanes",
+            text.split("jobs:", 1)[1],
             "rust-ci.yml's jobs section must not reference mac_lanes. The "
             "input is a declaration for the consumer's own standalone "
             "workflows (and the wrapper fan-out preserves a non-empty "
