@@ -1,0 +1,19 @@
+.github/workflows/rust-ci.yml
+  s_975c951a0b4be2::t_5313ff6e3c01ed 62-76,520-527,530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dd52bc61bd18b12eb9dcaafc0b531b3a757968da",
+  "prompts": {},
+  "sessions": {
+    "s_975c951a0b4be2": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_975c951a0b4be2",
+        "model": "unknown"
+      },
+      "human_author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
