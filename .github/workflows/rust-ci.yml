@@ -59,13 +59,21 @@ on:
         # (rhysd/actionlint#343) -- and self-check.yml runs actionlint with
         # fail-on-error. `job.status` in the final always() step IS the job
         # conclusion, so the published value is identical.
-        # The fallback matters: `Publish gate result` runs under `always()`,
-        # so gate_result is only EMPTY when the merge-gate itself never ran
-        # -- a genuinely skipped job. Any other shape (a literal fallback
-        # that can mask a suppressed publish, for instance) would let a
-        # consumer's `success|skipped` allowlist claim the Mac runner on a
-        # rejected run.
-        value: ${{ jobs.merge-gate.outputs.gate_result || 'skipped' }}
+        # The fallback matters. gate_result is EMPTY in two cases, and they
+        # must not publish the same value: on push/schedule/dispatch the
+        # merge-gate job is skipped by its own `if:` -- 'skipped' is the
+        # correct passing handoff; on a pull_request or merge_group run the
+        # job is always present (its `if:` is `always() && (...)`), so an
+        # empty gate_result means `Publish gate result` was suppressed by a
+        # FAILED trust admission -- the run was rejected, and 'failure' is
+        # the only honest value. A flat 'skipped' fallback here would let a
+        # consumer's `success|skipped` allowlist claim the Mac runner on
+        # code the trust step just refused.
+        value: >-
+          ${{ jobs.merge-gate.outputs.gate_result
+          || ((github.event_name == 'pull_request' ||
+               github.event_name == 'merge_group') && 'failure')
+          || 'skipped' }}
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
@@ -509,16 +517,17 @@ jobs:
 
       # Published for the linux_gate workflow output (see on.workflow_call
       # above): standalone macOS lanes in wrapper repositories read this as
-      # their fail-fast handoff. Always runs, for the same reason Aggregate
-      # does -- a failed lane must still produce a published conclusion, and
-      # a TRUST-REJECTED one most of all: suppressing this step on a failed
-      # trust admission leaves gate_result empty, and any passing fallback
-      # in the output mapping would then claim the consumer's Mac runner on
-      # code this job just refused. `job.status` after a failed step is
-      # `failure` -- exactly the verdict the consumer's allowlist rejects.
+      # their fail-fast handoff. Always runs when trust admission passed,
+      # for the same reason Aggregate does -- a failed lane must still
+      # produce a published conclusion. On a TRUST-REJECTED run this step is
+      # suppressed (every later step must be: the fleet's fork-guard checker
+      # forbids an always() step after a failed trust admission unless it
+      # requires the skip) and gate_result stays empty -- which the output
+      # mapping's event-aware fallback turns into `failure`, not a passing
+      # value. See on.workflow_call.outputs.linux_gate above.
       - name: Publish gate result
         id: gate-result
-        if: always()
+        if: always() && steps.trust-admission.outcome == 'skipped'
         env:
           GATE_RESULT: ${{ job.status }}
         shell: bash
