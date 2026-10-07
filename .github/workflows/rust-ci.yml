@@ -581,7 +581,12 @@ jobs:
     # is created in exactly the same cases bare `needs:` created it. See
     # the `if:` on the lane job for the full account. `scope` is passed
     # down so the lane can make the decision this job used to make.
-    if: ${{ always() && needs.plan.result == 'success' }}
+    # `!cancelled()` is the one documented case where always() must NOT
+    # win: GitHub's own troubleshooting guidance calls a bare always()
+    # the reason cancelled runs keep queued jobs alive, and these lanes
+    # can resolve to scarce macOS runners -- an obsolete tree must not
+    # hold one after the run was superseded or cancelled.
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
     uses: ./.github/workflows/lane-check.yml
     permissions:
       contents: read
@@ -620,7 +625,12 @@ jobs:
     # is created in exactly the same cases bare `needs:` created it. See
     # the `if:` on the lane job for the full account. `scope` is passed
     # down so the lane can make the decision this job used to make.
-    if: ${{ always() && needs.plan.result == 'success' }}
+    # `!cancelled()` is the one documented case where always() must NOT
+    # win: GitHub's own troubleshooting guidance calls a bare always()
+    # the reason cancelled runs keep queued jobs alive, and these lanes
+    # can resolve to scarce macOS runners -- an obsolete tree must not
+    # hold one after the run was superseded or cancelled.
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
     uses: ./.github/workflows/lane-test.yml
     permissions:
       contents: read
@@ -637,7 +647,7 @@ jobs:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
   package:
-    if: ${{ always() && needs.plan.result == 'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     needs: [plan, check, test]
     uses: ./.github/workflows/lane-package.yml
     permissions:
@@ -653,7 +663,7 @@ jobs:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
   sign-publish:
-    if: ${{ always() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
     needs: [plan, package]
     uses: ./.github/workflows/lane-sign-publish.yml
     # The lane declares contents:write / id-token:write / pages:write inside
@@ -672,7 +682,7 @@ jobs:
       artifact_name: ${{ needs.package.outputs.artifact_name }}
 
   release-verify:
-    if: ${{ always() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (needs.sign-publish.result == 'success' || needs.sign-publish.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (needs.sign-publish.result == 'success' || needs.sign-publish.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
     needs: [plan, package, sign-publish]
     uses: ./.github/workflows/lane-release-verify.yml
     permissions:
