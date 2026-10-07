@@ -573,13 +573,20 @@ jobs:
   # lane job's `if:`.
   check:
     needs: plan
-    # No `if:` here on purpose. The docs-only and fan-out skips live INSIDE
-    # lane-check.yml (with the Dependabot one), because skipping THIS job
-    # skips the reusable workflow and the nested check run
-    # `merge-gate / check / lane-check` is then never created -- absent, not
-    # skipped -- and the fleet's rulesets require it by that name. See the
-    # `if:` on the lane job for the full account. `scope` is passed down so
-    # the lane can make the decision this job used to make.
+    # The `if:` is the explicit success-of-gates form of what bare `needs:`
+    # already meant: this job runs iff `plan` succeeded, nothing more. It
+    # exists because these lanes route to whatever pool `runs_on` resolves
+    # to -- including macOS for the Mac-primary consumers in
+    # ci/runner-routing.toml -- and a Mac runner must provably wait on a
+    # cheap Linux check in the needs-graph, not just on an implicit
+    # dependency edge. `plan` IS that check (self-hosted Linux, ~0.2 min).
+    # The docs-only and fan-out skips still live INSIDE lane-check.yml
+    # (with the Dependabot one): this `if:` can never skip when `plan`
+    # succeeded, so the nested `merge-gate / check / lane-check` check run
+    # is created in exactly the same cases bare `needs:` created it. See
+    # the `if:` on the lane job for the full account. `scope` is passed
+    # down so the lane can make the decision this job used to make.
+    if: ${{ always() && needs.plan.result == 'success' }}
     uses: ./.github/workflows/lane-check.yml
     permissions:
       contents: read
@@ -605,13 +612,20 @@ jobs:
   # lane job's `if:`.
   test:
     needs: plan
-    # No `if:` here on purpose. The docs-only and fan-out skips live INSIDE
-    # lane-test.yml (with the Dependabot one), because skipping THIS job
-    # skips the reusable workflow and the nested check run
-    # `merge-gate / test / lane-test` is then never created -- absent, not
-    # skipped -- and the fleet's rulesets require it by that name. See the
-    # `if:` on the lane job for the full account. `scope` is passed down so
-    # the lane can make the decision this job used to make.
+    # The `if:` is the explicit success-of-gates form of what bare `needs:`
+    # already meant: this job runs iff `plan` succeeded, nothing more. It
+    # exists because these lanes route to whatever pool `runs_on` resolves
+    # to -- including macOS for the Mac-primary consumers in
+    # ci/runner-routing.toml -- and a Mac runner must provably wait on a
+    # cheap Linux check in the needs-graph, not just on an implicit
+    # dependency edge. `plan` IS that check (self-hosted Linux, ~0.2 min).
+    # The docs-only and fan-out skips still live INSIDE lane-test.yml
+    # (with the Dependabot one): this `if:` can never skip when `plan`
+    # succeeded, so the nested `merge-gate / test / lane-test` check run
+    # is created in exactly the same cases bare `needs:` created it. See
+    # the `if:` on the lane job for the full account. `scope` is passed
+    # down so the lane can make the decision this job used to make.
+    if: ${{ always() && needs.plan.result == 'success' }}
     uses: ./.github/workflows/lane-test.yml
     permissions:
       contents: read
