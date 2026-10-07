@@ -59,21 +59,16 @@ on:
         # (rhysd/actionlint#343) -- and self-check.yml runs actionlint with
         # fail-on-error. `job.status` in the final always() step IS the job
         # conclusion, so the published value is identical.
-        # The fallback matters. gate_result is EMPTY in two cases, and they
-        # must not publish the same value: on push/schedule/dispatch the
-        # merge-gate job is skipped by its own `if:` -- 'skipped' is the
-        # correct passing handoff; on a pull_request or merge_group run the
-        # job is always present (its `if:` is `always() && (...)`), so an
-        # empty gate_result means `Publish gate result` was suppressed by a
-        # FAILED trust admission -- the run was rejected, and 'failure' is
-        # the only honest value. A flat 'skipped' fallback here would let a
-        # consumer's `success|skipped` allowlist claim the Mac runner on
-        # code the trust step just refused.
+        # The fallback matters. merge-gate now runs on EVERY event (its
+        # `if:` is plain `always()`), so an EMPTY gate_result can only mean
+        # the publish step was suppressed -- a failed trust admission or a
+        # cancelled run -- and 'failure' is the only honest residual. A
+        # passing-looking residual (the old 'skipped') would let a
+        # same-run caller's `success|skipped` allowlist claim the Mac
+        # runner on code the trust step just refused, or behind lanes that
+        # went red while the aggregate was event-skipped.
         value: >-
-          ${{ jobs.merge-gate.outputs.gate_result
-          || ((github.event_name == 'pull_request' ||
-               github.event_name == 'merge_group') && 'failure')
-          || 'skipped' }}
+          ${{ jobs.merge-gate.outputs.gate_result || 'failure' }}
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
@@ -155,24 +150,24 @@ jobs:
     # needs succeeded OR failed -- without it, a failing `check`/`test` skips
     # this job and the required context vanishes. That is precisely the
     # failure mode this slice exists to fix. The gate therefore NEVER skips
-    # itself on either admitted event; on a merge_group head the gates that
+    # itself on any event; on a merge_group head the gates that
     # never skip are the whole point (the queue synthesizes a head the
     # pull_request-only lanes would otherwise not report on).
     #
-    # The job-level `if:` is EVENT SCOPE ONLY, not trust. It names the two
-    # events this aggregate reports on (pull_request heads and merge-queue
-    # heads; push runs the release lanes and has no PR to gate) and adds
-    # `always()`. It deliberately carries NO trust term -- no head-repository
+    # The `if:` carries no event scope either: linux_gate publishes this
+    # job to callers, and an event-skipped aggregate left the output to a
+    # static fallback that could not distinguish a green push from a red
+    # one. The aggregate step already evaluates lane results fail-closed
+    # for any event, and trust admission below already admits push and
+    # schedule -- so reporting on every event is cheap, honest, and red
+    # exactly when it should be. It deliberately carries NO trust term -- no head-repository
     # comparison, no merge_group action, no sender: trust admission is the
     # FIRST STEP below, so a fork pull request or a merge_group lifecycle
     # action reaches this job and fails RED in step 1 instead of reporting a
     # skipped required context. A positive event conjunction is the accepted
     # #346 shape (tests/test_self_hosted_fork_guard.py): the allowlist the
     # #346 rule rejects is `event_name == 'x' || <guard>`, which this is not.
-    if: >-
-      always() &&
-      (github.event_name == 'pull_request' ||
-      github.event_name == 'merge_group')
+    if: always()
     needs: [plan, check, test, package, sign-publish, release-verify]
     outputs:
       # Consumed by on.workflow_call.outputs.linux_gate. Kept as a job-level
