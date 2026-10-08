@@ -397,6 +397,10 @@ LABEL_TO_LOGIN = {
     'gemini': 'gemini-review',
 }
 
+#: The bare-suffix logins LABEL_TO_LOGIN points at, precomputed once so
+#: `roster_logins` does not rebuild the set on every label it inspects.
+KNOWN_LOGINS = frozenset(_strip_bot_suffix(value) for value in LABEL_TO_LOGIN.values())
+
 
 def roster_logins(asked):
     """The logins a roster's `asked` labels correspond to.
@@ -418,7 +422,7 @@ def roster_logins(asked):
             # publisher could spell the login, and refusing a name the
             # table itself uses would fail the gate on a roster that
             # named its reviewer correctly.
-            if bare in {_strip_bot_suffix(value) for value in LABEL_TO_LOGIN.values()}:
+            if bare in KNOWN_LOGINS:
                 login = bare
             else:
                 raise Malformed(
