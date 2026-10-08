@@ -26,6 +26,51 @@ on:
         required: false
         type: boolean
         default: false
+      mac_lanes:
+        # Opt-in declaration that this consumer keeps heavy macOS jobs in its
+        # own standalone workflow(s), and that those workflows wait on THIS
+        # template's Linux gate before claiming a Mac runner. Non-empty means
+        # the consumer has (or is adopting) a completion-triggered Mac lane;
+        # the output below is what the standalone workflow reads. Empty (the
+        # default) changes nothing for the 57 wrappers that do not use it.
+        # The fan-out renderer (scripts/rust_ci_render.py in maxi-config)
+        # special-cases a non-empty consumer value so the declaration
+        # survives the weekly tick the way a fork's repo_policy does.
+        description: Declared standalone macOS lane(s) that gate on this workflow's linux_gate output.
+        required: false
+        type: string
+        default: ''
+    outputs:
+      linux_gate:
+        # The fail-fast handoff for standalone macOS lanes. `needs.merge-gate`
+        # has `always()` in its `if:` (the fork-tripwire shape, above), so the
+        # job is present -- and this output is published -- even when a lane
+        # failed: the value is the job's RESULT, not a boolean, precisely so
+        # the consumer can distinguish "still running" (no event) from
+        # "concluded" (completed webhook) from "concluded red" (failure).
+        # `skipped` is a passing value by the same rule the Aggregate step
+        # uses: fan-out and docs-only PRs skip lanes deliberately, and those
+        # PRs must not wedge the consumer's Mac lane forever.
+        description: Result of this workflow's merge-gate aggregate (success, skipped, failure, or cancelled).
+        # Routed through a job-level output rather than read directly as
+        # `jobs.merge-gate.result` on purpose. The direct form is valid per
+        # GitHub's contexts reference, but actionlint types a job that CALLS
+        # a reusable workflow as {outputs: {}} and flags `.result` on it
+        # (rhysd/actionlint#343) -- and self-check.yml runs actionlint with
+        # fail-on-error. `job.status` in the final always() step IS the job
+        # conclusion, so the published value is identical.
+        # The fallback matters. An EMPTY gate_result means the aggregate
+        # did not publish: either the job was event-skipped (push/schedule/
+        # dispatch -- merge-gate deliberately does not run there; the
+        # standalone consumer reads run conclusions, not this output), or
+        # the publish step was suppressed -- a failed trust admission or a
+        # cancelled run. 'failure' is the only honest residual in either
+        # case: a passing-looking fallback (the old 'skipped') would let a
+        # same-run caller's `success|skipped` allowlist claim the Mac
+        # runner on code the trust step just refused, or behind lanes that
+        # went red while the aggregate was event-skipped.
+        value: >-
+          ${{ jobs.merge-gate.outputs.gate_result || 'failure' }}
     secrets:
       APP_ID:
         description: GitHub App ID used for read-only private repository access.
@@ -62,6 +107,9 @@ env:
   # workspace-local and disposable.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # Pin rustup for jobs defined here too. Workflow env does NOT cross a reusable
+  # workflow boundary; lane-check/test/package set their own job env below.
+  RUSTUP_TOOLCHAIN: '1.98.1'
 
 jobs:
   merge-gate:
@@ -108,24 +156,27 @@ jobs:
     # never skip are the whole point (the queue synthesizes a head the
     # pull_request-only lanes would otherwise not report on).
     #
-    # Spelled so the fork/queue guards are NEGATED disjuncts, not a bare
-    # positive event allowlist: the #346 rule (tests/test_self_hosted_
-    # fork_guard.py) rejects `event_name == 'x' || <guard>` because an
-    # allowlist silently drops any trigger added to `on:` later. The
-    # leading conjunct keeps the event surface EXACTLY what it was
-    # (pull_request + merge_group, nothing admitted by accident), and each
-    # following conjunct is one event's trust boundary in the accepted
-    # negated spelling: same-repo for pull_request, queue admission
-    # (checks_requested) for merge_group.
+    # The job-level `if:` is EVENT SCOPE ONLY, not trust. It names the two
+    # events this aggregate reports on (pull_request heads and merge-queue
+    # heads; push runs the release lanes and has no PR to gate) and adds
+    # `always()`. It deliberately carries NO trust term -- no head-repository
+    # comparison, no merge_group action, no sender: trust admission is the
+    # FIRST STEP below, so a fork pull request or a merge_group lifecycle
+    # action reaches this job and fails RED in step 1 instead of reporting a
+    # skipped required context. A positive event conjunction is the accepted
+    # #346 shape (tests/test_self_hosted_fork_guard.py): the allowlist the
+    # #346 rule rejects is `event_name == 'x' || <guard>`, which this is not.
     if: >-
+      always() &&
       (github.event_name == 'pull_request' ||
-      github.event_name == 'merge_group') &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository) &&
-      (github.event_name != 'merge_group' ||
-      github.event.action == 'checks_requested') &&
-      always()
+      github.event_name == 'merge_group')
     needs: [plan, check, test, package, sign-publish, release-verify]
+    outputs:
+      # Consumed by on.workflow_call.outputs.linux_gate. Kept as a job-level
+      # output instead of a direct `jobs.merge-gate.result` read so
+      # actionlint's reusable-call typing (rhysd/actionlint#343) does not
+      # fail self-check on a valid expression.
+      gate_result: ${{ steps.gate-result.outputs.result }}
     # Deliberately self-hosted rather than a hosted runner: when hosted
     # capacity is unavailable a job is rejected before a runner is assigned --
     # zero steps, no log, seconds to "failure" -- so this sentinel reported the
@@ -146,6 +197,45 @@ jobs:
       # silently stops working. Read-only; nothing here writes to Actions.
       actions: read
     steps:
+      # TRUST ADMISSION -- step 1, never a job-level `if:` (maxi-tools
+      # standing rule). A job-level guard turns an untrusted run into a
+      # SKIPPED job, and `skipped` is precisely the result an aggregate can be
+      # talked into reading as green. Here an untrusted run goes RED before
+      # anything else in this job executes. The same step opens every lane job
+      # this workflow calls (lane-plan/check/test/package/sign-publish/
+      # release-verify), so each self-hosted job refuses untrusted code before
+      # checkout; tests/test_self_hosted_fork_guard.py pins that shape.
+      #
+      # Trusted: push and schedule (default-branch / protected-ref code), a
+      # same-repo pull request, an admitted merge-queue head
+      # (`checks_requested` -- only someone allowed to merge can admit one),
+      # and a workflow_dispatch by the owner's numeric id (874012, the id the
+      # trusted-actor policy pins; logins can be reassigned, ids cannot).
+      # Written as a NEGATED ALLOWLIST so any event nobody listed -- a trigger
+      # a caller adds later, a merge_group lifecycle action -- is untrusted by
+      # construction.
+      - name: Trust admission
+        id: trust-admission
+        if: >-
+          ${{ !(
+          github.event_name == 'push' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository) ||
+          (github.event_name == 'merge_group' &&
+          github.event.action == 'checks_requested') ||
+          (github.event_name == 'workflow_dispatch' &&
+          github.event.sender.id == 874012)
+          ) }}
+        shell: bash
+        env:
+          TRUST_EVENT: ${{ github.event_name }}
+          TRUST_ACTION: ${{ github.event.action }}
+          TRUST_SENDER: ${{ github.event.sender.login }}
+        run: |
+          echo "::error::Untrusted ${TRUST_EVENT} run (action=${TRUST_ACTION:-none}, sender=${TRUST_SENDER:-unknown}): self-hosted jobs only admit pushes and schedules, same-repo pull requests, admitted merge-queue heads (checks_requested) and owner dispatches."
+          exit 1
+
       - name: Report CI enforcement mode
         shell: bash
         run: |
@@ -174,6 +264,7 @@ jobs:
             echo "- a lane reporting failure or cancellation surfaces here as a FAILURE conclusion, not as a green check"
             echo "- package/sign/release lanes are deferred unless packaging impact or trusted release refs require them"
             echo "- on a merge_group head a skipped check/test lane passes only when the change detector reports no relevant change (scope=merge-gate-only)"
+            echo "- a skipped plan lane never passes; a skipped package lane passes only on the planner's packaging_impact=false; sign/release skips pass only off a release ref"
           } >> "$GITHUB_STEP_SUMMARY"
       # Always runs so a failed upstream lane is reported by THIS job, not by
       # the lane itself (which the ruleset no longer requires).
@@ -214,7 +305,7 @@ jobs:
       # degraded window must not turn every fan-out PR red. Fail-closed on
       # a missing expiry, the same shape qodana's degraded gate uses.
       - name: Aggregate lane results
-        if: always()
+        if: always() && steps.trust-admission.outcome == 'skipped'
         shell: bash
         env:
           MERGE_GATE_NEEDS: ${{ toJSON(needs) }}
@@ -224,6 +315,13 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
           PLAN_SCOPE: ${{ needs.plan.outputs.scope }}
+          GIT_REF: ${{ github.ref }}
+          # The three facts lane-check/lane-test's own job `if:` decides a
+          # skip on, so the aggregate can tell a recorded skip from an
+          # unexplained one (see skip_reason below).
+          ACTOR: ${{ github.actor }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_USER_ID: ${{ github.event.pull_request.user.id }}
           CI_ENFORCEMENT_MODE_VALUE: ${{ env.CI_ENFORCEMENT_MODE }}
           CI_DEGRADED_UNTIL_VALUE: ${{ env.CI_DEGRADED_UNTIL }}
         run: |
@@ -258,6 +356,16 @@ jobs:
           def gh(*args):
               return subprocess.run(["gh", *args], capture_output=True,
                                     text=True, check=True).stdout
+          # Every lane this job `needs:`. A key missing from the needs
+          # context is a lane that never reported -- fail closed.
+          LANES = ("plan", "check", "test", "package", "sign-publish",
+                   "release-verify")
+
+          # Release-only lanes. Their skip is explained ONLY by the ref
+          # filter their callers use (`main` / `release/**`); on any other
+          # ref -- every PR head, every merge-queue head -- the lane is out
+          # of scope for this diff by declaration.
+          RELEASE_LANES = ("sign-publish", "release-verify")
 
           # The heavy lanes the change detector governs. On a merge_group
           # head a `skipped` here is merge evidence only when the detector
@@ -268,6 +376,15 @@ jobs:
           event = os.environ.get("EVENT_NAME", "")
           action = os.environ.get("EVENT_ACTION", "")
           plan_scope = os.environ.get("PLAN_SCOPE", "")
+          ref = os.environ.get("GIT_REF", "")
+          release_ref = ref == "refs/heads/main" or ref.startswith(
+              "refs/heads/release/")
+          plan_outputs = (needs.get("plan") or {}).get("outputs") or {}
+          actor = os.environ.get("ACTOR", "")
+          fan_out = (event == "pull_request"
+                     and os.environ.get("PR_HEAD_REF", "").startswith(
+                         "maxi-config-sync/")
+                     and os.environ.get("PR_USER_ID", "") == "264883562")
           is_merge_group = event == "merge_group"
 
           # Degraded window, same fail-closed comparison the enforcement-mode
@@ -283,6 +400,7 @@ jobs:
 
           bad = [(name, info.get("result")) for name, info in needs.items()
                  if info.get("result") not in PASSING]
+          bad += [(name, "<missing>") for name in LANES if name not in needs]
 
           # Lane job names are prefixed by the calling job in reusable-workflow
           # runs (`plan / lane-plan`), so a lane is matched by SUFFIX rather
@@ -332,6 +450,71 @@ jobs:
               # in flight, so the next attempt carries a real verdict.
               for name, job_id in sorted(starved_by_lane.items()):
                   print(f"inconclusive-by-capacity: {name} (job {job_id})")
+              sys.exit(1)
+
+          # A SKIPPED lane is merge evidence only when something with the
+          # authority to scope this diff RECORDED that the lane is out of
+          # scope. `skipped` on its own is not that record: a lane whose
+          # `needs` failed, a caller `if:` that went false for a reason nobody
+          # chose, a job GitHub never scheduled -- all of them read
+          # `skipped`, and all of them mean nothing was verified. So each
+          # lane's skip is checked against the one source allowed to explain
+          # it, and anything unexplained fails the gate (verifier t_e5bf80a3,
+          # criterion a).
+          #
+          #   plan            -- never. The planner IS the scoping authority;
+          #                      a skipped planner explained nothing, and no
+          #                      other lane's verdict can be trusted without
+          #                      it.
+          #   package         -- only when the planner published
+          #                      packaging_impact == 'false' (no packaging
+          #                      paths, or the Dependabot fallback's recorded
+          #                      'planned on merge to main instead') AND this
+          #                      is not a release ref, where packaging always
+          #                      runs.
+          #   sign-publish,
+          #   release-verify  -- only off a release ref: their callers' ref
+          #                      filter is the path filter that excludes them.
+          #   check, test     -- only for one of the three skips the lane's
+          #                      own job `if:` records: the Dependabot actor,
+          #                      the planner's docs-only verdict
+          #                      (scope == 'merge-gate-only'), or the fan-out
+          #                      identity (maxi-config-sync/* head AND the
+          #                      distributor's numeric id -- both halves).
+          #                      The merge_group arm below is stricter still.
+          def skip_reason(name):
+              if name == "plan":
+                  return None
+              if name == "package":
+                  if (plan_outputs.get("packaging_impact") == "false"
+                          and not release_ref):
+                      return ("planner: packaging_impact=false ("
+                              f"{plan_outputs.get('packaging_reason') or 'no reason recorded'})")
+                  return None
+              if name in RELEASE_LANES:
+                  return None if release_ref else f"ref filter: {ref or '<unset>'} is not a release ref"
+              if name in HEAVY_LANES:
+                  if actor == "dependabot[bot]":
+                      return "lane if: dependabot actor"
+                  if plan_scope == "merge-gate-only":
+                      return ("planner: scope=merge-gate-only ("
+                              f"{plan_outputs.get('scope_reason') or 'no reason recorded'})")
+                  if fan_out:
+                      return "lane if: maxi-config fan-out identity"
+                  return None
+              return None
+
+          unexplained = [name for name in LANES
+                         if needs[name].get("result") == "skipped"
+                         and skip_reason(name) is None]
+          if unexplained:
+              for name in unexplained:
+                  print(f"::error::Required lane {name!r} was skipped with no "
+                        "recorded reason (planner outputs: "
+                        f"{json.dumps(plan_outputs, sort_keys=True)}; "
+                        f"ref={ref or '<unset>'}). A skip passes only when the "
+                        "path filter or planner explicitly puts the lane out of "
+                        "scope; merge-gate fails.")
               sys.exit(1)
 
           # On a queue head every skipped heavy lane must be positively
@@ -390,13 +573,31 @@ jobs:
                         "window regardless of scope.)")
                   sys.exit(1)
 
-          skipped = [name for name, info in needs.items()
-                     if info.get("result") == "skipped"]
-          print(f"All required lanes passed (or were positively skipped). "
+          skipped = [f"{name} ({skip_reason(name)})" for name in LANES
+                     if needs[name].get("result") == "skipped"]
+          print(f"All required lanes passed (or were skipped with a recorded reason). "
                 f"event={event} action={action!r} scope={plan_scope!r} "
                 f"degraded_in_window={str(degraded_in_window).lower()} "
                 f"skipped={skipped}")
           PY
+
+      # Published for the linux_gate workflow output (see on.workflow_call
+      # above): standalone macOS lanes in wrapper repositories read this as
+      # their fail-fast handoff. Always runs when trust admission passed,
+      # for the same reason Aggregate does -- a failed lane must still
+      # produce a published conclusion. On a TRUST-REJECTED run this step is
+      # suppressed (every later step must be: the fleet's fork-guard checker
+      # forbids an always() step after a failed trust admission unless it
+      # requires the skip) and gate_result stays empty -- which the output
+      # mapping's event-aware fallback turns into `failure`, not a passing
+      # value. See on.workflow_call.outputs.linux_gate above.
+      - name: Publish gate result
+        id: gate-result
+        if: always() && steps.trust-admission.outcome == 'skipped'
+        env:
+          GATE_RESULT: ${{ job.status }}
+        shell: bash
+        run: echo "result=$GATE_RESULT" >> "$GITHUB_OUTPUT"
 
   plan:
     # The gate for the WHOLE lane chain. `check`, `test`, `package`,
@@ -404,22 +605,22 @@ jobs:
     # `needs.plan.result == 'success'`, so a condition here is the one place
     # that decides whether any of them reach the fleet.
     #
-    # Two clauses, two different holes. The first keeps fork pull requests out:
-    # the lanes below check out the head tree and run cargo over it on
-    # persistent runners holding an org App token.
+    # NO `if:` HERE, deliberately. This caller used to carry the fork guard
+    # and the workflow_dispatch owner pin as a job-level condition, which made
+    # an untrusted run a SKIPPED plan -- and a skipped plan skips every lane
+    # below it, the exact "nothing ran, nothing failed" shape the aggregate
+    # can be talked into reading as green. Both clauses now live in the
+    # `Trust admission` step that opens lane-plan (and every other lane job),
+    # where an untrusted run fails RED before checkout. The two holes they
+    # close are unchanged:
     #
-    # The second is the dispatch hole the first one hid. A `workflow_dispatch`
-    # is not a pull request, so `github.event_name != 'pull_request'` cleared
-    # it unconditionally -- and `gh workflow run --ref` accepts ANY branch, so
-    # anyone with write access to a consumer repository could dispatch its CI
-    # at a branch of their own and have the fleet build that branch. Pinned to
-    # the owner by numeric id, which the trusted-actor policy also pins; logins
-    # can be reassigned, ids cannot. The ref is deliberately NOT pinned:
-    # dispatching CI at a work-in-progress branch is the normal use.
-    #
-    # `push` keeps its unconditional clearance -- this workflow's push trigger
-    # is `branches: [main, release/**]`, i.e. post-merge code.
-    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || github.event.sender.id == 874012) }}
+    #   * fork pull requests -- the lanes below check out the head tree and
+    #     run cargo over it on persistent runners holding an org App token;
+    #   * workflow_dispatch by anyone but the owner -- `gh workflow run --ref`
+    #     accepts ANY branch, so a writer could otherwise have the fleet build
+    #     a branch of their own. Pinned to the owner's numeric id; the ref is
+    #     deliberately NOT pinned (dispatching CI at a work-in-progress branch
+    #     is the normal use).
     uses: ./.github/workflows/lane-plan.yml
     permissions:
       contents: read
@@ -438,13 +639,25 @@ jobs:
   # lane job's `if:`.
   check:
     needs: plan
-    # No `if:` here on purpose. The docs-only and fan-out skips live INSIDE
-    # lane-check.yml (with the Dependabot one), because skipping THIS job
-    # skips the reusable workflow and the nested check run
-    # `merge-gate / check / lane-check` is then never created -- absent, not
-    # skipped -- and the fleet's rulesets require it by that name. See the
-    # `if:` on the lane job for the full account. `scope` is passed down so
-    # the lane can make the decision this job used to make.
+    # The `if:` is the explicit success-of-gates form of what bare `needs:`
+    # already meant: this job runs iff `plan` succeeded, nothing more. It
+    # exists because these lanes route to whatever pool `runs_on` resolves
+    # to -- including macOS for the Mac-primary consumers in
+    # ci/runner-routing.toml -- and a Mac runner must provably wait on a
+    # cheap Linux check in the needs-graph, not just on an implicit
+    # dependency edge. `plan` IS that check (self-hosted Linux, ~0.2 min).
+    # The docs-only and fan-out skips still live INSIDE lane-check.yml
+    # (with the Dependabot one): this `if:` can never skip when `plan`
+    # succeeded, so the nested `merge-gate / check / lane-check` check run
+    # is created in exactly the same cases bare `needs:` created it. See
+    # the `if:` on the lane job for the full account. `scope` is passed
+    # down so the lane can make the decision this job used to make.
+    # `!cancelled()` is the one documented case where always() must NOT
+    # win: GitHub's own troubleshooting guidance calls a bare always()
+    # the reason cancelled runs keep queued jobs alive, and these lanes
+    # can resolve to scarce macOS runners -- an obsolete tree must not
+    # hold one after the run was superseded or cancelled.
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
     uses: ./.github/workflows/lane-check.yml
     permissions:
       contents: read
@@ -470,13 +683,25 @@ jobs:
   # lane job's `if:`.
   test:
     needs: plan
-    # No `if:` here on purpose. The docs-only and fan-out skips live INSIDE
-    # lane-test.yml (with the Dependabot one), because skipping THIS job
-    # skips the reusable workflow and the nested check run
-    # `merge-gate / test / lane-test` is then never created -- absent, not
-    # skipped -- and the fleet's rulesets require it by that name. See the
-    # `if:` on the lane job for the full account. `scope` is passed down so
-    # the lane can make the decision this job used to make.
+    # The `if:` is the explicit success-of-gates form of what bare `needs:`
+    # already meant: this job runs iff `plan` succeeded, nothing more. It
+    # exists because these lanes route to whatever pool `runs_on` resolves
+    # to -- including macOS for the Mac-primary consumers in
+    # ci/runner-routing.toml -- and a Mac runner must provably wait on a
+    # cheap Linux check in the needs-graph, not just on an implicit
+    # dependency edge. `plan` IS that check (self-hosted Linux, ~0.2 min).
+    # The docs-only and fan-out skips still live INSIDE lane-test.yml
+    # (with the Dependabot one): this `if:` can never skip when `plan`
+    # succeeded, so the nested `merge-gate / test / lane-test` check run
+    # is created in exactly the same cases bare `needs:` created it. See
+    # the `if:` on the lane job for the full account. `scope` is passed
+    # down so the lane can make the decision this job used to make.
+    # `!cancelled()` is the one documented case where always() must NOT
+    # win: GitHub's own troubleshooting guidance calls a bare always()
+    # the reason cancelled runs keep queued jobs alive, and these lanes
+    # can resolve to scarce macOS runners -- an obsolete tree must not
+    # hold one after the run was superseded or cancelled.
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
     uses: ./.github/workflows/lane-test.yml
     permissions:
       contents: read
@@ -493,7 +718,7 @@ jobs:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
   package:
-    if: ${{ always() && needs.plan.result == 'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     needs: [plan, check, test]
     uses: ./.github/workflows/lane-package.yml
     permissions:
@@ -509,7 +734,7 @@ jobs:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 
   sign-publish:
-    if: ${{ always() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
     needs: [plan, package]
     uses: ./.github/workflows/lane-sign-publish.yml
     # The lane declares contents:write / id-token:write / pages:write inside
@@ -528,7 +753,7 @@ jobs:
       artifact_name: ${{ needs.package.outputs.artifact_name }}
 
   release-verify:
-    if: ${{ always() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (needs.sign-publish.result == 'success' || needs.sign-publish.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (needs.sign-publish.result == 'success' || needs.sign-publish.result == 'skipped') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
     needs: [plan, package, sign-publish]
     uses: ./.github/workflows/lane-release-verify.yml
     permissions:
