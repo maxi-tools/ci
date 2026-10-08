@@ -257,26 +257,62 @@ class ClassifyChangeScope(unittest.TestCase):
         self.assertEqual(outputs.get("scope"), "full")
 
 
+LANES = ("plan", "check", "test", "package", "sign-publish", "release-verify")
+
+
+def all_lanes(outputs: dict | None = None, **results) -> dict:
+    """A full `toJSON(needs)`: every lane `success` unless overridden. Plan
+    outputs default to an ordinary PR verdict (full scope, packaging impact)."""
+    plan_outputs = {"scope": "full", "packaging_impact": "true"}
+    plan_outputs.update(outputs or {})
+    return {name: {"result": results.get(name.replace("-", "_"), "success"),
+                   "outputs": plan_outputs if name == "plan" else {}}
+            for name in LANES}
+
+
 class AggregateLaneResults(unittest.TestCase):
-    def aggregate(self, needs: dict):
+    """Executes the REAL aggregate step. Since maxi-config#1028 (verifier
+    t_e5bf80a3 criterion a) a skipped lane passes only with a RECORDED
+    reason, and a lane missing from `needs` fails closed."""
+
+    def aggregate(self, needs: dict, **env):
         body = step_run(RUST_CI, "merge-gate", "Aggregate lane results")
-        return run_bash(body, {"MERGE_GATE_NEEDS": json.dumps(needs)})
+        base = {"MERGE_GATE_NEEDS": json.dumps(needs),
+                "EVENT_NAME": "pull_request",
+                "GIT_REF": "refs/pull/1/merge",
+                "PLAN_SCOPE": (needs.get("plan") or {}).get("outputs", {}).get("scope", ""),
+                "CI_DEGRADED_UNTIL_VALUE": "2999-01-01"}
+        base.update(env)
+        return run_bash(body, base)
 
     def test_every_lane_successful_passes(self):
-        rc, log, _ = self.aggregate({"plan": {"result": "success"},
-                                     "check": {"result": "success"}})
+        rc, log, _ = self.aggregate(all_lanes())
         self.assertEqual(rc, 0, log)
 
-    def test_a_skipped_lane_is_fine(self):
-        rc, log, _ = self.aggregate({"check": {"result": "skipped"},
-                                     "test": {"result": "success"}})
+    def test_an_explained_skip_is_fine(self):
+        # Release lanes off a release ref, package on the planner's
+        # packaging_impact=false, check on the planner's docs-only verdict.
+        rc, log, _ = self.aggregate(all_lanes(
+            outputs={"scope": "merge-gate-only", "packaging_impact": "false"},
+            check="skipped", package="skipped",
+            sign_publish="skipped", release_verify="skipped"))
         self.assertEqual(rc, 0, log)
-        self.assertIn("skipped=['check']", log)
+        self.assertIn("recorded reason", log)
+
+    def test_an_unexplained_skip_fails_the_gate(self):
+        for lane, outputs in (("plan", {}), ("package", {}), ("check", {}),
+                              ("sign-publish", None)):
+            with self.subTest(lane=lane):
+                needs = all_lanes(outputs, **{lane.replace("-", "_"): "skipped"})
+                env = {"GIT_REF": "refs/heads/main"} if outputs is None else {}
+                rc, log, _ = self.aggregate(needs, **env)
+                self.assertEqual(rc, 1, log)
+                self.assertIn(f"::error::Required lane {lane!r} was skipped", log)
 
     def test_failure_and_cancellation_fail_the_gate(self):
         for result in ("failure", "cancelled"):
             with self.subTest(result=result):
-                rc, log, _ = self.aggregate({"check": {"result": result}})
+                rc, log, _ = self.aggregate(all_lanes(check=result))
                 self.assertEqual(rc, 1)
                 self.assertIn("::error::Required lane 'check'", log)
 
@@ -284,21 +320,26 @@ class AggregateLaneResults(unittest.TestCase):
         """THE defect: the old denylist passed anything it did not name."""
         for result in ("timed_out", "action_required", "neutral", "stale", ""):
             with self.subTest(result=result):
-                rc, log, _ = self.aggregate({"check": {"result": result}})
+                rc, log, _ = self.aggregate(all_lanes(check=result))
                 self.assertEqual(rc, 1, log)
                 self.assertIn("::error::Required lane 'check'", log)
 
     def test_a_lane_with_no_result_key_fails(self):
         """A lane that never reported is not a lane that passed."""
-        rc, log, _ = self.aggregate({"check": {}})
+        needs = all_lanes()
+        needs["check"] = {}
+        rc, log, _ = self.aggregate(needs)
         self.assertEqual(rc, 1, log)
         self.assertIn("None", log)
 
-    def test_no_lanes_at_all_passes_but_says_so(self):
-        """`needs` empty is the merge-gate-only shape, not an error."""
-        rc, log, _ = self.aggregate({})
-        self.assertEqual(rc, 0, log)
-        self.assertIn("skipped=[]", log)
+    def test_a_lane_missing_from_needs_fails(self):
+        """`needs` empty or partial is a lane that never reported -- it was
+        once read as 'merge-gate-only, fine'; now it fails closed."""
+        for needs in ({}, {"plan": {"result": "success"}}):
+            with self.subTest(needs=sorted(needs)):
+                rc, log, _ = self.aggregate(needs)
+                self.assertEqual(rc, 1, log)
+                self.assertIn("'<missing>'", log)
 
 
 # `merge-gate` is the SOLE required context under the post-merge-gate ruleset.
@@ -328,8 +369,27 @@ class MergeGateEventFilter(unittest.TestCase):
         ns = {"github": _NullSafe.github(event_name, event_obj)}
         return bool(_Walk.evaluate(ast.parse(py, mode="eval"), ns))
 
+    @staticmethod
+    def _trust_admits_expr() -> str:
+        """The allowlist inside step 1's `${{ !( ... ) }}` refusal. Trust is
+        step 1 of the job, never its `if:` (maxi-config#1028, verifier
+        t_e5bf80a3 criterion c)."""
+        doc = yaml.safe_load(RUST_CI.read_text(encoding="utf-8"))
+        step = doc["jobs"]["merge-gate"]["steps"][0]
+        if step.get("id") != "trust-admission":
+            raise ValueError("merge-gate step 1 is not the trust admission step")
+        expr = " ".join(str(step["if"]).split())
+        prefix, suffix = "${{ !(", ") }}"
+        if not (expr.startswith(prefix) and expr.endswith(suffix)):
+            raise ValueError(f"trust step if: is not a negated allowlist: {expr!r}")
+        return expr[len(prefix):-len(suffix)].strip()
+
     def gate_should_run(self, event_name: str, event_obj: object) -> bool:
-        return self._evaluates(self._if_expr(), event_name, event_obj)
+        """Publishes a verdict: the job starts AND step 1 admits the run.
+        A fork PR or a lifecycle action starts the job and fails it RED in
+        step 1 -- it does not publish a skipped required context."""
+        return (self._evaluates(self._if_expr(), event_name, event_obj)
+                and self._evaluates(self._trust_admits_expr(), event_name, event_obj))
 
     def test_pull_request_same_repo_runs(self):
         """Existing fork-tripwire arm still passes a same-repo PR."""
