@@ -34,7 +34,7 @@ LANES = (
 )
 INSTALL_STEP = "Install repo-declared system packages"
 CHECKOUT_USES = re.compile(r"^actions/checkout@")
-SUBMODULES_EXPR = re.compile(r"inputs\.checkout_submodules")
+EXPECTED_SUBMODULES = "inputs.checkout_submodules&&'recursive'||'false'"
 
 
 def load(path: pathlib.Path):
@@ -49,11 +49,7 @@ def job_steps(doc):
 
 
 def checkout_steps(steps):
-    return [
-        step
-        for step in steps
-        if CHECKOUT_USES.match(str(step.get("uses") or ""))
-    ]
+    return [step for step in steps if CHECKOUT_USES.match(str(step.get("uses") or ""))]
 
 
 class AptInstallOrdering(unittest.TestCase):
@@ -103,12 +99,18 @@ class AptInstallOrdering(unittest.TestCase):
                 self.assertTrue(checkouts, f"{path.name}: no checkout step")
                 step = checkouts[0]
                 submodules = str((step.get("with") or {}).get("submodules") or "")
-                self.assertRegex(
-                    submodules,
-                    SUBMODULES_EXPR,
+                # Normalise the ${{ ... }} wrapper and whitespace, then pin the
+                # exact mapping: checkout_submodules=true must initialise
+                # recursively and false must not. Merely mentioning the input
+                # would also accept an expression that always disables.
+                normalised = re.sub(r"\s+", "", submodules)
+                normalised = normalised.removeprefix("${{").removesuffix("}}")
+                self.assertEqual(
+                    normalised,
+                    EXPECTED_SUBMODULES,
                     f"{path.name}: checkout `submodules` must map the "
                     "checkout_submodules input so recursive initialisation "
-                    "still reaches submodule callers",
+                    "reaches submodule callers and stays off for the rest",
                 )
 
 
