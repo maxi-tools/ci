@@ -1,0 +1,14 @@
+tests/test_apt_install_ordering.py
+  h_cebe5b6d461c32 37,52,102-110,113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ffa1647458b8dd19eaca3180de3ff4258b28760c",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
