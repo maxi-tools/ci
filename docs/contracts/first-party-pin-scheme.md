@@ -99,15 +99,24 @@ execute the new bytes with the consumer's trust still attached to the
 old ones. Tags add a moving target on top of the fork-guard problem
 without removing it. They are rejected.
 
-## Why not a bot that auto-merges fan-out PRs
+## Protected consumer auto-merge
 
-A bot that auto-merges a fleet-wide pin advance would defeat the pin
-entirely: any PR that lands on ci main would reach every consumer without
-human review, and a malicious ci PR would compromise every consumer in
-the same merge commit. The fan-out PR is the **review surface**, not an
-obstacle to it. Each consumer's maintainer (or the reviewer the
-consumer's `CODEOWNERS` names) sees the change in their own repo's PR
-queue and approves it. The fan-out IS the human-in-the-loop detector.
+The producer now enables merge-commit auto-merge when the effective
+default-branch policy (including classic protection) names required checks.
+An empty or unreadable check policy never authorizes it. The consumer's
+required checks and reviews still decide when the PR lands. The old
+human-only queue allowed green pin PRs to sit for weeks, while sync PRs
+advanced the same workflow files and made them conflict. This changes
+the operational policy, not the immutable-SHA pin format: every advance
+still has its own consumer PR and check history.
+
+For a `review-gate.yml` bearing the maxi-config ownership marker, the
+ci producer no longer opens a competing pin PR in that consumer. It
+advances both `maxi-review/review-gate.yml` (the source) and the installed
+copy in maxi-config's pin PR, then maxi-config's distributor sends the
+new source to its consumers as their single sync PR. Existing one-file
+`ci/fanout-pin` PRs in owned consumers are closed as superseded; a PR
+with an unexpected author or files is never closed automatically.
 
 ## Known limits
 
@@ -157,11 +166,8 @@ The fan-out PR is the inert-detector, and it is firing: 48 PRs are
 visible, dated 2026-09-20, recording exactly the gap this contract
 was written to expose. The consumer-side merge is the missing step.
 
-**The fan-out PR was designed not to auto-merge** (see "Why not a
-bot that auto-merges fan-out PRs" above). Landing them is a
-per-consumer maintainer (or `CODEOWNERS`) decision. The intent is that
-each consumer's owner sees the diff in their own PR queue, and the
-fleet-wide advance happens at human speed on a human's clock.
+This historical snapshot predates protected auto-merge. Repos with no
+required checks still need a human to judge and merge the pin PR.
 
 **Known merge-blocker on the open PRs:** `lint-gate` rejects
 intra-org pin updates without the `pin-intra-org` label (per

@@ -25,10 +25,8 @@ Override per-invocation with `--consumer-repo` (repeatable) or
 
 What this script does NOT do:
 
-* It does not auto-merge the consumer's PR. The fan-out PR is the
-  human-in-the-loop review surface. See
-  docs/contracts/first-party-pin-scheme.md for why auto-merging a
-  fleet-wide pin is the wrong shape.
+* It enables merge-commit auto-merge only when effective branch policy
+  requires checks. An unprotected consumer remains for manual acceptance.
 * It does not retry on a closed PR. A consumer that closes the
   fan-out PR with `pin: skip` is recorded in `OPT_OUTS` (constant
   below) and skipped on subsequent runs.
@@ -174,7 +172,7 @@ class Consumer:
 # Every consumer the run looked at ends in exactly ONE of these. The
 # summary is a partition, not a count of the happy path: a consumer
 # whose pin could not be read is `unreadable`, not silently absent.
-OUTCOMES = ('opened', 'reused', 'already', 'dry-run', 'failed', 'unreadable',
+OUTCOMES = ('opened', 'reused', 'already', 'owned-sync', 'dry-run', 'failed', 'unreadable',
             'opt-out', 'no-pin', 'not-a-sha')
 
 
@@ -226,6 +224,33 @@ def _gh(args: list[str], *, token: str) -> str:
     return _run(['gh', *args], env={'GH_TOKEN': token})
 
 
+def _required_checks(consumer: Consumer, *, token: str) -> set[str]:
+    '''Fail closed on unreadable rules; decide from effective rules only.
+
+    The /rules/branches endpoint returns the EFFECTIVE rules (rulesets and
+    classic protection) and needs only metadata read. The classic protection
+    endpoint needs administration:read, which the fanout-ci-pin token lacks,
+    so it 403s and would fail closed fleet-wide. A required_status_checks
+    rule with a non-empty list means "requires checks".
+    '''
+    repo = consumer.name
+    branch = json.loads(_gh(['api', f'repos/{repo}', '--jq', '.default_branch | @json'], token=token))
+    rules = json.loads(_gh(['api', f'repos/{repo}/rules/branches/{branch}'], token=token))
+    if not isinstance(rules, list):
+        raise RuntimeError(f'{repo}: effective rules are not a list')
+    return {
+        check['context'] for rule in rules if rule['type'] == 'required_status_checks'
+        for check in rule['parameters']['required_status_checks']
+    }
+
+
+def _enable_automerge(consumer: Consumer, url: str, *, token: str) -> None:
+    if not _required_checks(consumer, token=token):
+        print(f'{consumer}: no required checks; auto-merge withheld', file=sys.stderr)
+        return
+    _gh(['pr', 'merge', url, '--repo', consumer.name, '--auto', '--merge'], token=token)
+
+
 def _fetch_consumer_pin(consumer: Consumer, *, token: str) -> dict[str, str]:
     '''Return {workflow_file: pinned_ref} for `consumer`.
 
@@ -257,6 +282,12 @@ def _fetch_consumer_pin(consumer: Consumer, *, token: str) -> dict[str, str]:
             token=token,
         )
         text = _decode_b64(content)
+        # This whole workflow is shipped from maxi-config. An independent pin
+        # PR races its sync PR and the next sync reverts the pin. Change the
+        # maxi-config SOURCE first; its distributor handles these consumers.
+        if (name == 'review-gate.yml' and consumer.name != 'maxi-tools/maxi-config'
+                and '# maxi-config-owned Maxi review gate workflow.' in text.splitlines()):
+            return {'__owned_sync__': ''}
         for match in USES_RE.finditer(text):
             wf = match.group('workflow')
             if wf not in WORKFLOW_FILES:
@@ -287,17 +318,92 @@ def _open_fanout_prs(consumer: Consumer, *, token: str) -> list[dict]:
     '''Every open PR on `consumer` whose head is a fan-out branch of ours.'''
     out = _gh(
         [
-            'pr', 'list',
-            '--repo', consumer.name,
-            '--state', 'open',
-            '--limit', '100',
-            '--json', 'number,url,headRefName',
+            'api', '--paginate', '-X', 'GET', f'repos/{consumer.name}/pulls',
+            '-f', 'state=open', '-f', 'per_page=100',
+            '--jq', '.[] | [.number, .html_url, .head.ref] | @json',
         ],
         token=token,
     ).strip()
-    prs = json.loads(out) if out else []
-    return [p for p in prs
-            if p['headRefName'] == HEAD_REF or LEGACY_HEAD_RE.match(p['headRefName'])]
+    prs = [json.loads(line) for line in out.splitlines()]
+    return [{'number': n, 'url': url, 'headRefName': head}
+            for n, url, head in prs
+            if head == HEAD_REF or LEGACY_HEAD_RE.match(head)]
+
+
+def _retire_pin_pr(consumer: Consumer, pr: dict, *, token: str,
+                   reason: str, expected_paths: list[str],
+                   additional_allowed_paths: list[str] | None = None) -> None:
+    '''Never close or delete a pin branch with human history or extra files.'''
+    number = str(pr['number'])
+    detail = json.loads(_gh(
+        ['pr', 'view', number, '--repo', consumer.name,
+         '--json', 'author,headRefName,files'], token=token))
+    commits = [json.loads(line) for line in _gh(
+        ['api', '--paginate', '-X', 'GET',
+         f'repos/{consumer.name}/pulls/{number}/commits',
+         '-f', 'per_page=100',
+         '--jq', '.[] | {author: .commit.author, committer: .commit.committer, message: .commit.message} | @json'],
+        token=token).splitlines()]
+    # The fanout commits under the repo-required identity `Maxi Boch
+    # <874012+maxiboch@users.noreply.github.com>`, which humans and fleet
+    # agents also use, so identity alone cannot prove a commit is bot-made.
+    # The discriminator is the commit message: bot advances always read
+    # exactly `ci: advance pin to <12hex>`, which a human following the repo
+    # rules would never write for a fix commit.
+    bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
+    fanout_msg_re = re.compile(r'^ci: advance pin to [0-9a-f]{12}$')
+    allowed = set(expected_paths)
+    if additional_allowed_paths:
+        allowed.update(additional_allowed_paths)
+    paths = [f['path'] for f in detail['files']]
+    problems = []
+    if detail['author']['login'] != 'app/maxi-tools-auth':
+        problems.append('PR author is not the bot')
+    if detail['headRefName'] != pr['headRefName']:
+        problems.append('head branch changed')
+    if set(paths) != allowed:
+        problems.append('PR does not change exactly the expected file set')
+    if not commits:
+        problems.append('no commits on PR')
+    else:
+        for commit in commits:
+            if not fanout_msg_re.match(commit['message'].splitlines()[0]):
+                problems.append('commit message does not match fan-out advance pattern')
+                break
+            if any(commit[role].get(key) != value for key, value in bot.items()
+                   for role in ('author', 'committer')):
+                problems.append('not every commit is bot-authored and bot-committed')
+                break
+    if problems and not _already_commented(consumer, number, token):
+        _gh(['pr', 'comment', number, '--repo', consumer.name, '--body',
+             'Leaving this pin PR and its branch open: ' + '; '.join(problems) + '.'], token=token)
+    if not problems:
+        _gh(['pr', 'close', number, '--repo', consumer.name,
+             '--delete-branch', '--comment', reason], token=token)
+
+
+def _already_commented(consumer: Consumer, number: str, token: str) -> bool:
+    out = _gh(
+        ['api', '--paginate', '-X', 'GET',
+         f'repos/{consumer.name}/issues/{number}/comments',
+         '-f', 'per_page=100',
+         '--jq', '.[] | select(.body | startswith("Leaving this pin PR and its branch open:")) | .id'],
+        token=token,
+    ).strip()
+    return bool(out)
+
+
+def _retire_owned_pin_prs(consumer: Consumer, *, token: str) -> None:
+    '''Close only bot-owned pin proposals whose files are the expected set; sync owns the advance.'''
+    expected = ['.github/workflows/review-gate.yml']
+    additional = ['maxi-review/review-gate.yml'] if consumer.name == 'maxi-tools/maxi-config' else None
+    for pr in _open_fanout_prs(consumer, token=token):
+        _retire_pin_pr(
+            consumer, pr, token=token, expected_paths=expected,
+            additional_allowed_paths=additional,
+            reason='Superseded by the maxi-config-owned review-gate.yml sync. '
+                   'The ci pin now advances in maxi-config/maxi-review/review-gate.yml '
+                   'and reaches this repo through its sync PR.')
 
 
 def _push_pin_branch(
@@ -317,7 +423,9 @@ def _push_pin_branch(
             str(cwd),
         ])
         _run(['git', 'checkout', '-B', head_ref], workdir=str(cwd))
-        target = cwd / '.github/workflows/review-gate.yml'
+        target = cwd / (('maxi-review/review-gate.yml'
+                         if consumer.name == 'maxi-tools/maxi-config'
+                         else '.github/workflows/review-gate.yml'))
         text = target.read_text(encoding='utf-8')
         new_text, n = USES_RE.subn(
             lambda m: (
@@ -334,6 +442,10 @@ def _push_pin_branch(
             )
         target.write_text(new_text, encoding='utf-8')
         _run(['git', 'add', str(target)], workdir=str(cwd))
+        if consumer.name == 'maxi-tools/maxi-config':
+            installed = cwd / '.github/workflows/review-gate.yml'
+            installed.write_text(new_text, encoding='utf-8')
+            _run(['git', 'add', str(installed)], workdir=str(cwd))
         _run(
             [
                 'git', '-c', 'user.name=Maxi Boch',
@@ -390,10 +502,9 @@ def _open_pr(
     if ours:
         _gh(
             [
-                'pr', 'edit', str(ours['number']),
-                '--repo', consumer.name,
-                '--title', title,
-                '--body', body,
+                'api', '--method', 'PATCH',
+                f'repos/{consumer.name}/pulls/{ours["number"]}',
+                '-f', f'title={title}', '-f', f'body={body}',
             ],
             token=token,
         )
@@ -413,17 +524,15 @@ def _open_pr(
         outcome = 'opened'
 
     for p in legacy:
-        _gh(
-            [
-                'pr', 'close', str(p['number']),
-                '--repo', consumer.name,
-                '--delete-branch',
-                '--comment',
-                f'Superseded by {url}: the fan-out now keeps one branch per '
-                f'consumer (`{HEAD_REF}`) and moves it forward on each tip.',
-            ],
-            token=token,
-        )
+        _retire_pin_pr(
+            consumer, p, token=token,
+            expected_paths=['.github/workflows/review-gate.yml'],
+            additional_allowed_paths=(
+                ['maxi-review/review-gate.yml']
+                if consumer.name == 'maxi-tools/maxi-config' else None),
+            reason=f'Superseded by {url}: the fan-out now keeps one branch per '
+                   f'consumer (`{HEAD_REF}`) and moves it forward on each tip.')
+    _enable_automerge(consumer, url, token=token)
     return (outcome, url)
 
 
@@ -460,6 +569,10 @@ def _plan(
             dropped(consumer, 'no-pin',
                     'no `uses: maxi-tools/ci/.github/workflows/...` line')
             continue
+        if '__owned_sync__' in pins:
+            dropped(consumer, 'owned-sync',
+                    'review-gate.yml is maxi-config-owned; the source pin is distributed by sync')
+            continue
         for wf, ref in pins.items():
             if not SHA.match(ref):
                 dropped(consumer, 'not-a-sha',
@@ -479,6 +592,12 @@ def _execute(plan: list[FanOut], *, tip_sha: str, token: str, dry_run: bool) -> 
     executed: list[FanOut] = []
     for entry in plan:
         if entry.outcome != 'planned':
+            if entry.outcome == 'owned-sync' and not dry_run:
+                try:
+                    _retire_owned_pin_prs(entry.consumer, token=token)
+                except Exception as exc:  # noqa: BLE001
+                    executed.append(replace(entry, outcome='failed', detail=str(exc)))
+                    continue
             executed.append(entry)  # dropped in _plan, reason already set
             continue
         if entry.old_ref == entry.new_ref:
