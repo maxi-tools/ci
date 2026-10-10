@@ -1,0 +1,121 @@
+name: Decide whether the Rust lanes must run
+description: >
+  The compiled-inputs classifier maxi-core uses, published for every
+  consumer: reads a changed-file list on stdin (or via the
+  changed-files input), writes `rust-touched` / `rust-touched-reason`
+  outputs, and ALWAYS fails towards `rust-touched=true` (run every
+  lane) when it cannot read the diff, the repository, or its own index.
+
+
+  A composite action rather than a lane-side script, because a public
+  consumer's workflow cannot `python3` a file that lives in this
+  repository without first fetching it, and the fetch-policy action
+  pattern (which pulls from the PRIVATE maxi-config) does not apply:
+  this action must be resolvable by PUBLIC consumers like freya, so the
+  classifier has to live here beside it.
+
+
+  Referenced by its full owner/repo path (maxi-tools/ci/...@main).
+  `./.github/actions/...` would resolve against the CALLER's workspace,
+  which in a consumer repo does not contain this action at all. The
+  same shape as fetch-policy and verify-sibling-checkouts.
+
+
+  TRUST: the caller checks out its own tree and the action reads only
+  that checkout plus the changed-file list handed to it. For a
+  `pull_request` event the list comes from the caller's own
+  `gh api repos/.../pulls/N/files` with `github.token` (maxi-core's
+  route step is the reference implementation), so an untrusted fork PR
+  is judged by the files the PR API reports, not by anything the fork
+  supplies.
+
+inputs:
+  changed-files:
+    description: >
+      The changed paths, newline-separated. When empty the action runs
+      `gh api` itself against the pull request (or `git diff` on push)
+      using the token input.
+    required: false
+    default: ''
+  token:
+    description: >
+      Token for the changed-file lookup when changed-files is empty.
+      `github.token` suffices on pull_request; it needs
+      pull-requests:read.
+    required: false
+    default: ''
+
+outputs:
+  rust-touched:
+    description: >
+      'true' when at least one changed path can reach rustc (or the
+      verdict is unknown), 'false' only when the whole diff is provably
+      outside the build. Defaults to 'true' on any internal failure.
+    value: ${{ steps.decide.outputs.rust-touched || 'true' }}
+  rust-touched-reason:
+    description: Why the verdict is what it is; reaches check summaries.
+    value: ${{ steps.decide.outputs.rust-touched-reason || 'rust-touched action did not reach a verdict' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Decide whether the Rust lanes must run
+      id: decide
+      shell: bash
+      env:
+        CHANGED_FILES: ${{ inputs.changed-files }}
+        GH_TOKEN: ${{ inputs.token || github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        # The classifier lives beside this action.yml, in the caller's
+        # checkout OF THIS ACTION. A composite action's own files are on
+        # disk under $GITHUB_ACTION_PATH, which is where this reads it
+        # from -- the caller's workspace is never consulted for it.
+        set -euo pipefail
+        if [ -n "$CHANGED_FILES" ]; then
+          # A nonzero exit from the classifier must surface as
+          # rust-touched=true (run every lane), never as a failed step:
+          # this step's failure would skip lane-plan, which skips every
+          # lane behind it -- the opposite of the documented direction.
+          if ! printf '%s\n' "$CHANGED_FILES" | \
+               REPO_ROOT="$GITHUB_WORKSPACE" \
+               python3 "$GITHUB_ACTION_PATH/rust_touched.py"; then
+            {
+              echo "rust-touched=true"
+              echo "rust-touched-reason=classifier exited nonzero; running every lane"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+        fi
+        if [ "${{ github.event_name }}" = 'pull_request' ] && [ -n "$PR_NUMBER" ]; then
+          # Pipefail matters: a truncated file list reads as a smaller
+          # diff, which is the direction that wrongly skips a lane.
+          # `previous_filename` as well as `filename`: a rename emits
+          # only the new name, so renaming a file that an
+          # include_str! still points at breaks the build and leaves
+          # nothing in the list for the gate to recognise.
+          if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+                 --jq '.[] | .filename, (.previous_filename // empty)' \
+                 > "$RUNNER_TEMP/changed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"; then
+            {
+              echo "rust-touched=true"
+              echo "rust-touched-reason=could not read the changed-file list"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Same guard as the explicit-list branch above.
+          if ! REPO_ROOT="$GITHUB_WORKSPACE" \
+               python3 "$GITHUB_ACTION_PATH/rust_touched.py" \
+               < "$RUNNER_TEMP/changed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"; then
+            {
+              echo "rust-touched=true"
+              echo "rust-touched-reason=classifier exited nonzero; running every lane"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+        fi
+        # Push, dispatch, or anything else: never skip on an unread diff.
+        {
+          echo "rust-touched=true"
+          echo "rust-touched-reason=event ${{ github.event_name }} has no PR file list; running every lane"
+        } >> "$GITHUB_OUTPUT"
