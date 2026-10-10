@@ -392,7 +392,7 @@ LABEL_TO_LOGIN = {
     'claude-review': 'claude-review',
     'cubic': 'cubic-dev-ai[bot]',
     'codacy': 'codacy-production',
-    'qlty': 'qlty[bot]',
+    'qlty': 'qltysh',
     'qodana': 'qodana',
     'gemini': 'gemini-review',
 }
