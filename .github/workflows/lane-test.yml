@@ -226,7 +226,7 @@ jobs:
       # in one place is the deduplication that closes maxi-config#174.
       - name: Install repo-declared system packages
         if: runner.os == 'Linux'
-        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
+        uses: maxi-tools/ci/.github/actions/install-apt-packages@d12fd27751c71c1b4e3b546dd0c5aa194dfe34aa  # 2026-09-29, maxi-tools/ci
 
       - name: Generate org repo token
         # Skipped entirely in credential-free mode (#368). Forks and external
@@ -277,7 +277,7 @@ jobs:
       # external-pin SHA requirement in check_workflow_refs.py.
       - name: Verify sibling path-dependency checkouts
         if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
-        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
+        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@14f387b4144a783899e91c5f4a2da83b315560bb  # 2026-09-27, maxi-tools/ci
         with:
           token: ${{ steps.app-token.outputs.token }}
 
@@ -300,7 +300,7 @@ jobs:
         # private). This copy must name maxi-tools/ci, which owns the same
         # action. A mirror from maxi-config that copies the private path
         # makes every public fork's lane fail at job setup.
-        uses: maxi-tools/ci/.github/actions/fetch-policy@main
+        uses: maxi-tools/ci/.github/actions/fetch-policy@ef87df4e288628ad6c7979d44f27c4b11baba07a  # 2026-09-10, maxi-tools/ci
         with:
           policy-files: |
             scripts/select-rust-toolchain.sh
