@@ -134,16 +134,6 @@ jobs:
             echo "- lane skipped/deferred: ${{ inputs.skip_reason }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Repos with native system-library deps (e.g. alsa-sys behind a midi
-      # feature) declare them in ci/apt-packages.txt — one package per line,
-      # '#' comments allowed. Absent file means no extra packages. The
-      # install logic lives in .github/actions/install-apt-packages and is
-      # shared with lane-check.yml and lane-test.yml; one implementation
-      # in one place is the deduplication that closes maxi-config#174.
-      - name: Install repo-declared system packages
-        if: ${{ inputs.should_run && runner.os == 'Linux' }}
-        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
-
       # Required by the optional-secret contract from maxi-config#368: callers
       # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
       # public-only lanes) must still produce release artifacts when
@@ -232,6 +222,16 @@ jobs:
           set -euo pipefail
           git submodule foreach --recursive 'git config --local --unset-all http.https://github.com/.extraheader || :'
           git config --local --unset-all http.https://github.com/.extraheader || :
+
+      # Repos with native system-library deps (e.g. alsa-sys behind a midi
+      # feature) declare them in ci/apt-packages.txt — one package per line,
+      # '#' comments allowed. Absent file means no extra packages. The
+      # install logic lives in .github/actions/install-apt-packages and is
+      # shared with lane-check.yml and lane-test.yml; one implementation
+      # in one place is the deduplication that closes maxi-config#174.
+      - name: Install repo-declared system packages
+        if: ${{ inputs.should_run && runner.os == 'Linux' }}
+        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
 
       # should_run is true on main and on release refs even when the change
       # has no packaging impact (rust-ci.yml). check and test already no-op
