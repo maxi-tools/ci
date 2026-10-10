@@ -190,6 +190,12 @@ jobs:
     runs-on: [self-hosted, Linux]
     permissions:
       contents: read
+      # The `Aggregate lane results` step reads this run's job payloads to tell
+      # a queue-starved lane (`cancelled`, no runner, no steps) from a real one.
+      # Without this scope `gh api .../jobs` returns 403, the step falls back to
+      # treating every non-passing lane as a failure, and the classification
+      # silently stops working. Read-only; nothing here writes to Actions.
+      actions: read
     steps:
       # TRUST ADMISSION -- step 1, never a job-level `if:` (maxi-tools
       # standing rule). A job-level guard turns an untrusted run into a
@@ -303,6 +309,9 @@ jobs:
         shell: bash
         env:
           MERGE_GATE_NEEDS: ${{ toJSON(needs) }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
           PLAN_SCOPE: ${{ needs.plan.outputs.scope }}
@@ -332,6 +341,21 @@ jobs:
           # "a value I do not recognise" must mean stop, not proceed.
           PASSING = ("success", "skipped")
 
+          # Queue starvation: the fleet never picked the job up. `needs` alone
+          # cannot tell this from a real cancellation -- both surface as
+          # `result == 'cancelled'` -- so the job payloads are consulted and
+          # the FULL four-way shape is required. Measured 2026-10-04 on the X64
+          # pool: 17 runners, 15 busy, queue waits up to 2100s, and `lane-plan`
+          # (a REQUIRED context) ending `cancelled` without ever running.
+          def starved(job):
+              return (job.get("conclusion") == "cancelled"
+                      and not (job.get("steps") or [])
+                      and not (job.get("runner_name") or "").strip()
+                      and not (job.get("started_at") or "").strip())
+
+          def gh(*args):
+              return subprocess.run(["gh", *args], capture_output=True,
+                                    text=True, check=True).stdout
           # Every lane this job `needs:`. A key missing from the needs
           # context is a lane that never reported -- fail closed.
           LANES = ("plan", "check", "test", "package", "sign-publish",
@@ -377,10 +401,55 @@ jobs:
           bad = [(name, info.get("result")) for name, info in needs.items()
                  if info.get("result") not in PASSING]
           bad += [(name, "<missing>") for name in LANES if name not in needs]
+
+          # Lane job names are prefixed by the calling job in reusable-workflow
+          # runs (`plan / lane-plan`), so a lane is matched by SUFFIX rather
+          # than equality. Anything unmatched stays a failure -- an unmatched
+          # lane means the API shape changed, and guessing there is how a real
+          # red gets relabelled as capacity pressure.
+          starved_by_lane = {}
+          if bad:
+              try:
+                  payload = json.loads(gh(
+                      "api", "--paginate",
+                      f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                      f"{os.environ['RUN_ID']}/attempts/"
+                      f"{os.environ['RUN_ATTEMPT']}/jobs"))
+              except Exception as exc:  # noqa: BLE001 - classification only
+                  print(f"::warning::could not read job payloads ({exc}); "
+                        "treating every non-passing lane as a failure")
+                  payload = {"jobs": []}
+              jobs = payload.get("jobs", [])
+              for name, _ in bad:
+                  for job in jobs:
+                      jname = job.get("name") or ""
+                      if (jname == name or jname.endswith(f" / {name}")
+                              or jname.startswith(f"{name} / ")):
+                          if starved(job):
+                              starved_by_lane[name] = job.get("id")
+                          break
+
           if bad:
               for name, result in bad:
-                  print(f"::error::Required lane {name!r} reported {result!r}; "
-                        "merge-gate fails.")
+                  if name in starved_by_lane:
+                      print(f"::warning::Required lane {name!r} was never "
+                            "scheduled: the runner pool was saturated, so the "
+                            "job was cancelled with zero steps, no runner and "
+                            "no start time. This is NOT a verdict about the "
+                            "pull request -- re-running it (see the "
+                            "`Stalled job re-run` watchdog).")
+                  else:
+                      print(f"::error::Required lane {name!r} reported "
+                            f"{result!r}; merge-gate fails.")
+              # Still exit 1, deliberately. This is a required status check, so
+              # there is no third conclusion available: reporting SUCCESS
+              # because the fleet was busy would publish a green that stands in
+              # for work no runner ever evaluated. What changes is the LABEL --
+              # an `::error::` line means "your code", a `::warning::` line
+              # plus these lines means "the fleet" -- and the retry is already
+              # in flight, so the next attempt carries a real verdict.
+              for name, job_id in sorted(starved_by_lane.items()):
+                  print(f"inconclusive-by-capacity: {name} (job {job_id})")
               sys.exit(1)
 
           # A SKIPPED lane is merge evidence only when something with the
