@@ -300,6 +300,42 @@ def _open_fanout_prs(consumer: Consumer, *, token: str) -> list[dict]:
             if p['headRefName'] == HEAD_REF or LEGACY_HEAD_RE.match(p['headRefName'])]
 
 
+def _advance_pin_line(text: str, new_ref: str) -> tuple[str, int]:
+    '''Rewrite the first pinned `uses:` line in `text` to `new_ref`.
+
+    `new_ref` must be the FULL 40-char sha. Codacy flags short-SHA pins
+    on every fan-out PR (maxi-kvm#166, 2026-09-27), and in repos whose
+    ruleset requires review-thread resolution the unresolved thread
+    blocks the merge; short shas can also be ambiguous. A trailing
+    comment after the ref (e.g. `  # maxi-tools/ci main`) is outside
+    the match and survives, so the human-readable short form or tag is
+    preserved.
+
+    Returns (new_text, n) where n is the number of lines advanced
+    (0 or 1 -- only the first matching line per file).
+    '''
+    return USES_RE.subn(
+        lambda m: (
+            f'{m.group("indent")}'
+            f'maxi-tools/ci/.github/workflows/{m.group("workflow")}.yml@'
+            f'{new_ref}'
+        ),
+        text,
+        count=1,
+    )
+
+
+def _commit_message(new_ref: str) -> str:
+    # The FULL sha: a short form here is what Codacy keyed on in
+    # maxi-kvm#166 (it anchored the thread on the changed line but
+    # quoted the 12-char sha from the commit title).
+    return f'ci: advance pin to {new_ref}'
+
+
+def _pr_title(tip_sha: str, workflow_file: str) -> str:
+    return f'ci: advance pin to {tip_sha} ({workflow_file})'
+
+
 def _push_pin_branch(
     consumer: Consumer, *, head_ref: str, new_ref: str, token: str,
 ) -> None:
@@ -319,15 +355,7 @@ def _push_pin_branch(
         _run(['git', 'checkout', '-B', head_ref], workdir=str(cwd))
         target = cwd / '.github/workflows/review-gate.yml'
         text = target.read_text(encoding='utf-8')
-        new_text, n = USES_RE.subn(
-            lambda m: (
-                f'{m.group("indent")}'
-                f'maxi-tools/ci/.github/workflows/{m.group("workflow")}.yml@'
-                f'{new_ref}'
-            ),
-            text,
-            count=1,  # advance only the first matching line per file
-        )
+        new_text, n = _advance_pin_line(text, new_ref)
         if n == 0:
             raise RuntimeError(
                 f'{consumer.name}: no `uses:` line matched after dry lookup'
@@ -339,7 +367,7 @@ def _push_pin_branch(
                 'git', '-c', 'user.name=Maxi Boch',
                 '-c', 'user.email=874012+maxiboch@users.noreply.github.com',
                 'commit', '-m',
-                f'ci: advance pin to {new_ref[:12]}',
+                _commit_message(new_ref),
             ],
             workdir=str(cwd),
         )
@@ -365,7 +393,7 @@ def _open_pr(
     the new tip and its title/body updated. Either way, any legacy
     per-sha fan-out PR still open is closed as superseded.
     '''
-    title = f'ci: advance pin to {tip_sha[:12]} ({workflow_file})'
+    title = _pr_title(tip_sha, workflow_file)
     body = (
         f'Fan-out from `maxi-tools/ci` @{tip_sha}.\n\n'
         f'This PR advances `{workflow_file}.yml` from `{old_ref}` to '
