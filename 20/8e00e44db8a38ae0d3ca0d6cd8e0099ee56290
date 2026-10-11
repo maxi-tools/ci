@@ -1,0 +1,14 @@
+tests/test_lane_decisions.py
+  h_cebe5b6d461c32 314-319,337-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "208e00e44db8a38ae0d3ca0d6cd8e0099ee56290",
+  "prompts": {},
+  "humans": {
+    "h_cebe5b6d461c32": {
+      "author": "Maxi Boch <874012+maxiboch@users.noreply.github.com>"
+    }
+  }
+}
