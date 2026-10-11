@@ -257,7 +257,7 @@ jobs:
             echo "- this job is the aggregate of every declared lane and is the sole required context under the new ruleset"
             echo "- a lane reporting failure or cancellation surfaces here as a FAILURE conclusion, not as a green check"
             echo "- package/sign/release lanes are deferred unless packaging impact or trusted release refs require them"
-            echo "- on a merge_group head a skipped check/test lane passes only when the change detector reports no relevant change (scope=merge-gate-only)"
+            echo "- on a merge_group head a skipped check/test lane passes only when the change detector reports no relevant change (scope=merge-gate-only), in BOTH enforcement windows"
             echo "- a skipped plan lane never passes; a skipped package lane passes only on the planner's packaging_impact=false; sign/release skips pass only off a release ref"
           } >> "$GITHUB_STEP_SUMMARY"
       # Always runs so a failed upstream lane is reported by THIS job, not by
@@ -285,19 +285,21 @@ jobs:
       #     legitimately leaves them skipped.
       #
       # Outside a degraded window (today > CI_DEGRADED_UNTIL, or the expiry
-      # unset) the strict arm additionally requires every merge_group skip
-      # to be rejected regardless of the detector's scope -- a `skipped`
-      # that arrived with `scope=merge-gate-only` (the lane-side guard
-      # accepted the docs-only path) no longer passes the gate, the same
-      # equality-not-non-failure shape maxi-core's security-gate was held
-      # to (verifier t_caba2c83 criterion c). Inside the window the
-      # historical shape holds: failure and cancellation never pass, and a
-      # queue-head skip still needs the detector's positive verdict. The
-      # strict arm is deliberately merge_group-only: on pull_request the
-      # fan-out skip (a maxi-config-sync/* head, gated on branch prefix AND
+      # unset) the strict arm additionally requires the skip to be the
+      # selector's OWN verdict, read from the planner's job output: a
+      # heavy lane skipped BECAUSE `scope=merge-gate-only` is satisfied
+      # (the skip is the gate's own docs-only design, applied to a queue
+      # head); a heavy lane skipped for any OTHER reason -- cancelled,
+      # needs failed, condition error, or a missing/unfamiliar scope
+      # output -- still fails strict, because nothing verified the diff
+      # and nobody chose that. Inside the window the historical shape
+      # holds: failure and cancellation never pass, and a queue-head skip
+      # still needs the detector's positive verdict. The strict arm is
+      # deliberately merge_group-only: on pull_request the fan-out skip
+      # (a maxi-config-sync/* head, gated on branch prefix AND
       # distributor id) is a deliberate skip with scope=full, and the
-      # degraded window must not turn every fan-out PR red. Fail-closed on
-      # a missing expiry, the same shape qodana's degraded gate uses.
+      # degraded window must not turn every fan-out PR red. Fail-closed
+      # on a missing expiry, the same shape qodana's degraded gate uses.
       - name: Aggregate lane results
         if: always() && steps.trust-admission.outcome == 'skipped'
         shell: bash
@@ -462,15 +464,22 @@ jobs:
           #   misclassified skip and must exit (plan reports the lane ran
           #   but could not positively classify the change).
           #
-          #   OUTSIDE the degraded window -- strict equality, the same
-          #   shape maxi-core's security-gate was held to (verifier
-          #   t_caba2c83 criterion c): a heavy-lane skip on merge_group is
-          #   rejected regardless of what scope the change detector
-          #   reports, because outside the window the gate's promise is
-          #   that the lane actually ran and passed. A `merge-gate-only`
-          #   skip that the lane fan-out itself permitted (the
-          #   `!should_run` docs-only path) is no longer acceptable when
-          #   the degraded waiver is closed.
+          #   OUTSIDE the degraded window -- a heavy-lane skip on
+          #   merge_group is satisfied ONLY when the scope selector's own
+          #   output put the lane out of scope for this diff
+          #   (`scope == 'merge-gate-only'`, read from the planner's job
+          #   output -- never from the file list a second time). The
+          #   lanes' own job `if:` skips check/test on exactly that
+          #   verdict, so a docs-only queue head would otherwise fail the
+          #   gate on every attempt: the skip is the gate's own design,
+          #   not missing evidence (maxi-kvm merge_group run 38071103682,
+          #   PRs #164/#165 ejected repeatedly). A heavy lane skipped for
+          #   any OTHER reason -- a cancelled dependency, a caller `if:`
+          #   nobody chose, a lane never scheduled, or the planner
+          #   failing before the classifier ran so `scope` is absent or
+          #   unfamiliar -- is still rejected: strict enforcement's
+          #   promise is that a lane the diff reaches actually ran and
+          #   passed on the queue head.
           #
           # The previous single-block-and-strict-arm concatenation wrote
           # the same predicate twice (cubic P3 / coderabbit P2 / codacy
@@ -482,26 +491,34 @@ jobs:
                                if needs.get(name, {}).get("result") == "skipped"]
               if not skipped_heavy:
                   pass  # every heavy lane ran; nothing to adjudicate
+              elif plan_scope == "merge-gate-only":
+                  # The scope selector positively recorded that this diff
+                  # cannot reach a build, and the lanes skipped themselves
+                  # on exactly that verdict. Satisfied in BOTH windows.
+                  pass
               elif degraded_in_window:
-                  if plan_scope != "merge-gate-only":
-                      print("::error::merge_group: heavy lane(s) "
-                            f"{skipped_heavy!r} skipped but the change "
-                            f"detector reports scope={plan_scope!r} "
-                            "(expected 'merge-gate-only'); inside the "
-                            f"degraded window (CI_DEGRADED_UNTIL={until or '<unset>'}, "
-                            f"today={today}) a queue head may only skip a "
-                            "heavy lane when the detector positively "
-                            "reports no relevant change.")
-                      sys.exit(1)
+                  print("::error::merge_group: heavy lane(s) "
+                        f"{skipped_heavy!r} skipped but the change "
+                        f"detector reports scope={plan_scope!r} "
+                        "(expected 'merge-gate-only'); inside the "
+                        f"degraded window (CI_DEGRADED_UNTIL={until or '<unset>'}, "
+                        f"today={today}) a queue head may only skip a "
+                        "heavy lane when the detector positively "
+                        "reports no relevant change.")
+                  sys.exit(1)
               else:
                   print("::error::merge_group: heavy lane(s) "
-                        f"{skipped_heavy!r} skipped but the degraded "
-                        f"window is closed (CI_DEGRADED_UNTIL={until or '<unset>'}, "
-                        f"today={today}); strict enforcement requires the "
-                        "lane to have run and succeeded on the queue head. "
-                        f"(scope reported by the detector: {plan_scope!r}; "
-                        "the strict arm rejects every skip outside the "
-                        "window regardless of scope.)")
+                        f"{skipped_heavy!r} skipped but the scope "
+                        f"selector reports scope={plan_scope!r} "
+                        "(expected 'merge-gate-only' when a heavy lane is "
+                        "skipped by design); the degraded window is "
+                        f"closed (CI_DEGRADED_UNTIL={until or '<unset>'}, "
+                        f"today={today}) and strict enforcement requires "
+                        "the lane to have run and succeeded on the queue "
+                        "head. Only a skip the selector itself put out of "
+                        "scope passes strict; a skip for any other reason "
+                        "(cancelled, needs failed, condition error, "
+                        "missing scope output) is not merge evidence.")
                   sys.exit(1)
 
           skipped = [f"{name} ({skip_reason(name)})" for name in LANES

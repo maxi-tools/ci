@@ -304,6 +304,54 @@ class AggregateLaneResults(unittest.TestCase):
                 self.assertEqual(rc, 1, log)
                 self.assertIn("'<missing>'", log)
 
+    # The strict-arm merge_group contract (maxi-kvm merge_group run
+    # 38071103682: a docs-only queue head was ejected on every attempt
+    # because the strict arm rejected the skip the gate's own design
+    # produced). A heavy lane skipped BECAUSE the scope selector's own
+    # output put it out of scope is satisfied in strict; a heavy lane
+    # skipped for any other reason still fails strict.
+    CLOSED_WINDOW = {"CI_DEGRADED_UNTIL_VALUE": "2020-01-01"}
+
+    def aggregate_merge_group(self, needs: dict, **env):
+        base = {"EVENT_NAME": "merge_group",
+                "EVENT_ACTION": "checks_requested"}
+        base.update(env)
+        return self.aggregate(needs, **base)
+
+    def test_merge_group_docs_only_scope_skip_passes_strict(self):
+        """scope=merge-gate-only + skipped check/test -> pass in strict:
+        the skip is the gate's own docs-only design on a queue head."""
+        needs = all_lanes(
+            outputs={"scope": "merge-gate-only", "packaging_impact": "false"},
+            check="skipped", test="skipped", package="skipped",
+            sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 0, log)
+
+    def test_merge_group_code_scope_skip_fails_strict(self):
+        """scope=full + skipped check -> fail in strict: the diff reaches
+        a build, so strict enforcement requires the lane to have run."""
+        needs = all_lanes(check="skipped",
+                          sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 1, log)
+        # The unexplained-skip check runs before the strict merge_group
+        # arm, so the recorded-reason error is the first verdict here;
+        # what matters for the acceptance is the gate FAILS, not which
+        # of the two overlapping checks prints first.
+        self.assertIn("::error::Required lane 'check' was skipped", log)
+
+    def test_merge_group_missing_scope_skip_fails_strict(self):
+        """scope output missing + skipped -> fail in strict: a plan job
+        that fell over before the classifier ran publishes no scope, and
+        an unexplained skip is not merge evidence."""
+        needs = all_lanes(outputs={"scope": ""},
+                          check="skipped", test="skipped",
+                          sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("was skipped with no recorded reason", log)
+
 
 # `merge-gate` is the SOLE required context under the post-merge-gate ruleset.
 # The job's `if:` decides whether the rule even exists on a given event --
