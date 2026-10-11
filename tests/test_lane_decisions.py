@@ -311,6 +311,12 @@ class AggregateLaneResults(unittest.TestCase):
     # output put it out of scope is satisfied in strict; a heavy lane
     # skipped for any other reason still fails strict.
     CLOSED_WINDOW = {"CI_DEGRADED_UNTIL_VALUE": "2020-01-01"}
+    # The strict arm is documented to be "satisfied in BOTH windows" on a
+    # scope=merge-gate-only skip. The closed-window test below pins the
+    # closed-arm shape; this one pins the open-arm symmetry so a future
+    # refactor that drops one half can be caught by the test that the
+    # arm's docstring claims to encode.
+    OPEN_WINDOW = {"CI_DEGRADED_UNTIL_VALUE": "2099-01-01"}
 
     def aggregate_merge_group(self, needs: dict, **env):
         base = {"EVENT_NAME": "merge_group",
@@ -326,6 +332,21 @@ class AggregateLaneResults(unittest.TestCase):
             check="skipped", test="skipped", package="skipped",
             sign_publish="skipped", release_verify="skipped")
         rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 0, log)
+
+    def test_merge_group_docs_only_scope_skip_passes_open_window(self):
+        """Same docs-only shape on a merge_group head WITH the degraded
+        window still open -- the strict arm claims BOTH windows are
+        satisfied by an in-scope selector skip; pin that explicitly so a
+        regression that re-ordered the strict-arm branches (the new
+        `plan_scope == 'merge-gate-only' -> pass` branch moves ahead of
+        the historical `degraded_in_window` arm) cannot silently desync
+        the two windows."""
+        needs = all_lanes(
+            outputs={"scope": "merge-gate-only", "packaging_impact": "false"},
+            check="skipped", test="skipped", package="skipped",
+            sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.OPEN_WINDOW)
         self.assertEqual(rc, 0, log)
 
     def test_merge_group_code_scope_skip_fails_strict(self):
