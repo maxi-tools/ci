@@ -107,7 +107,22 @@ jobs:
     # stripped to empty, but the shim's own fork guard
     # (`head.repo.full_name == github.repository`) skips before the App
     # token step runs, so an empty value here is benign.
-    secrets: inherit
+    #
+    # Listed BY NAME rather than `secrets: inherit`. zizmor flags `secrets:
+    # inherit` as `secrets-inherit` (the called workflow receives every
+    # secret from the caller's context, not just the two it asks for);
+    # qlty's zizmor plugin then post the finding as an unresolved review
+    # thread on every push, which fails the `review-gate / per-run:
+    # resolve-review-threads` step on this very PR. Each name below is one
+    # the callee specifically asks for via `with:` in its own declaration,
+    # so the surface is the same regardless of which form is used -- the
+    # difference is only what the static analyzer sees. zizmor:
+    # ignore[secrets-inherit] is the alternative if a future qlty version
+    # tightens this check; it would suppress the same warning at the call
+    # site rather than shaping the call.
+    secrets:
+      APP_CLIENT_ID: ${{ secrets.APP_CLIENT_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
     with:
       # See the header. Public repository, fork pull requests, hosted minutes.
       runs_on: '["ubuntu-latest"]'
