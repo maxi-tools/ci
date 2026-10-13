@@ -81,7 +81,7 @@ permissions: {}
 
 jobs:
   review-gate:
-    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@96393c66f35c1a37d54aa639200f931074f1fdcd  # maxi-tools/ci main
+    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@1de1d804c32ab67d99fd3576617c474a6cb62850  # maxi-tools/ci main
     # A reusable workflow cannot elevate the token its caller hands it, and the
     # whole nested graph is validated when the run is CREATED -- before any job
     # `if:` is evaluated. So this map is the union of what EVERY job in the
