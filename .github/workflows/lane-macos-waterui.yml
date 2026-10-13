@@ -1,0 +1,177 @@
+# Reusable Mac + waterui unit-test lane for maxi-tools Rust CI consumers that
+# keep a cfg-gated `#[cfg(all(feature = "waterui", target_os = "macos"))]`
+# surface on the runtime side (e.g. voicemaci src/app.rs's waterui smoke
+# tests, see maxi-tools/voicemaci#202 / t_5c7fc48e).
+#
+# WHY THIS REUSABLE LIVES HERE AND NOT IN VOICEMACI
+# rust-ci.yml is the SOLE required-context source under the post-merge-gate
+# ruleset (maxi-tools/voicemaci ruleset 21168253 names only `merge-gate /
+# merge-gate`). A consumer's standalone workflow publishes its own check
+# (`Mac WaterUI test / lane-mac-waterui` in voicemaci) but the ruleset never
+# reads it, so a red lane there is invisible to the merge button. This
+# reusable lets rust-ci.yml add a `lane-mac-waterui` job to the merge-gate
+# `needs:` chain so the aggregate picks the verdict up; the same job also
+# gives that reusable's nested check run the name `merge-gate / lane-mac-
+# waterui / lane-mac-waterui-test`, which is what rolls up under the
+# `merge-gate / lane-mac-waterui` context consumer rulesets read.
+#
+# shape: one job, one workflow_call, no inputs / no secrets. The caller in
+# rust-ci.yml gates on the consumer's `mac_lanes:` declaration being non-
+# empty and forwards nothing to this reusable, so the lane is fully
+# described by the file itself. That keeps the consumer-side
+# `mac-waterui-test.yml` standalone workflow (still triggered on
+# `pull_request` with a path filter) untouched -- the path-filtered
+# invocation that publishes the PR-visible check run is left in place, and
+# this lane exists solely to give the merge-gate aggregate a verdict to
+# roll up.
+#
+# The gated shape (caller decides whether to schedule) is the documented
+# exception in test_mac_lanes_contract.py: mac_lanes appears under
+# `jobs:` ONLY as a gate (`${{ inputs.mac_lanes != '' }}`), never as a
+# path-resolver or `uses:` argument, because GitHub's `uses:` takes no
+# expressions and consumers do not share a relative-path hub.
+name: CI lane / macos waterui
+
+on:
+  workflow_call:
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+# Reusable boundary: env does not cross it, so CARGO_NET_GIT_FIT_WITH_CLI
+# is mandatory here for the same reason it is on lane-check/lane-test --
+# Cargo's libgit2 transport does not apply url.*.insteadOf rewrite, so a
+# private maxi-tools dep fetch on a clean runner would reach the
+# unauthenticated URL. Same fleet rules as the shared lanes.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: always
+  # Pin the target dir to the job workspace so a runner-level
+  # CARGO_TARGET_DIR (e.g. a shared farm cache in the runner service .env)
+  # can never redirect build output or make concurrent jobs serialize on
+  # one build-dir flock, where the cpu-liveness guard kills the lock-
+  # waiter at 0% CPU. Fleet policy: cross-run reuse belongs in sccache;
+  # Cargo target dirs stay workspace-local and disposable.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  lane-mac-waterui-test:
+    # Same-repo admission guard (org-standard first step on self-hosted PR
+    # jobs: lane-test/lane-check/lane-package all open with this shape; see
+    # tests/test_self_hosted_fork_guard.py). A fork PR's pull_request
+    # event must NEVER execute on a persistent Mac runner, and dependabot
+    # PRs do not bring the org App token they would need to fetch private
+    # deps. Step 1 not a job-level `if:` (maxi-tools standing rule): a
+    # job-level guard turns an untrusted run into a SKIPPED job, and
+    # `skipped` is precisely the result an aggregate can be talked into
+    # reading as green. Here the untrusted run goes RED before checkout.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository
+       && github.actor != 'dependabot[bot]')
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Trust admission
+        id: trust-admission
+        if: >-
+          ${{ !(
+          github.event_name == 'push' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository) ||
+          (github.event_name == 'merge_group' &&
+          github.event.action == 'checks_requested') ||
+          (github.event_name == 'workflow_dispatch' &&
+          github.event.sender.id == 874012)
+          ) }}
+        shell: bash
+        env:
+          TRUST_EVENT: ${{ github.event_name }}
+          TRUST_ACTION: ${{ github.event.action }}
+          TRUST_SENDER: ${{ github.event.sender.login }}
+        run: |
+          echo "::error::Untrusted ${TRUST_EVENT} run (action=${TRUST_ACTION:-none}, sender=${TRUST_SENDER:-unknown}): this self-hosted job only admits pushes and schedules, same-repo pull requests, admitted merge-queue heads (checks_requested) and owner dispatches."
+          exit 1
+
+      - name: Generate org repo token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          # Scoped to the same repository set the existing voicemaci
+          # mac-waterui-test.yml lane lists (coreml-rs fork,
+          # maxi-libs / maxi-ml / maxi-e2e / maxi-sandbox / maxi-ui /
+          # maxi-io for the private deps the waterui-gated modules
+          # reach), so a fresh cargo cache on a clean Mac runner can
+          # resolve private path/git deps without a 401.
+          repositories: |
+            coreml-rs
+            maxi-libs
+            maxi-ml
+            maxi-e2e
+            maxi-sandbox
+            maxi-ui
+            maxi-io
+          permission-contents: read
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Private git config
+        run: |
+          cfg="$RUNNER_TEMP/gitconfig-ci"
+          git config --file "$cfg" url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "GIT_CONFIG_GLOBAL=$cfg" >> "$GITHUB_ENV"
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: rustfmt
+
+      - name: Mac + WaterUI unit tests
+        id: lane
+        # --features waterui is the default feature set in voicemaci's
+        # Cargo.toml (and the canonical way other consumers can keep
+        # the surface gated), so naming it explicitly makes the lane
+        # self-documenting and prevents an accidental default-feature
+        # reordering from turning this lane quiet. `--lib` keeps lib
+        # unit tests in scope and the heavy `tests/` integration files
+        # out (those typically require e2e features the lane does not
+        # need). `--no-fail-fast` would HIDE a partial regression; the
+        # lane's purpose is to surface precisely one failing test -- the
+        # cfg-mismatch mode the parent card named.
+        run: |
+          cargo test \
+            --features waterui \
+            --lib \
+            -- --nocapture
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Mac WaterUI lane — $(hostname -s), $(date -u +%Y-%m-%dT%H:%MZ)"
+            echo
+            echo "result: ${{ steps.lane.outcome || 'unknown' }}"
+            echo "feature: waterui (declared on the wrapper's merge-gate job's with:)"
+            echo "scope: lib unit tests behind #[cfg(all(feature=\"waterui\", target_os=\"macos\"))]"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup private git config
+        if: always()
+        run: |
+          if [ -n "${GIT_CONFIG_GLOBAL:-}" ] && [ -f "$GIT_CONFIG_GLOBAL" ]; then
+            rm -f "$GIT_CONFIG_GLOBAL"
+          fi

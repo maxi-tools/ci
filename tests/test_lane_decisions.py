@@ -220,15 +220,32 @@ class ClassifyChangeScope(unittest.TestCase):
                 self.assertEqual(self.scope(path)[0], "full")
 
 
-LANES = ("plan", "check", "test", "package", "sign-publish", "release-verify")
+LANES = ("plan", "check", "test", "lane-mac-waterui", "package",
+         "sign-publish", "release-verify")
 
 
 def all_lanes(outputs: dict | None = None, **results) -> dict:
     """A full `toJSON(needs)`: every lane `success` unless overridden. Plan
-    outputs default to an ordinary PR verdict (full scope, packaging impact)."""
+    outputs default to an ordinary PR verdict (full scope, packaging impact).
+    `lane-mac-waterui` defaults to `skipped` (a non-adopter), so callers
+    that exercise the adopter path must pass
+    `lane_mac_waterui="success"` or `"failure"` explicitly."""
     plan_outputs = {"scope": "full", "packaging_impact": "true"}
     plan_outputs.update(outputs or {})
-    return {name: {"result": results.get(name.replace("-", "_"), "success"),
+    plan_outputs.setdefault("scope_reason",
+                            "all changed paths are documentation or metadata")
+    defaults: dict[str, str] = {
+        "plan": "success",
+        "check": "success",
+        "test": "success",
+        "lane-mac-waterui": "skipped",
+        "package": "success",
+        "sign-publish": "skipped",
+        "release-verify": "skipped",
+    }
+    for lane, default in defaults.items():
+        results.setdefault(lane.replace("-", "_"), default)
+    return {name: {"result": results[name.replace("-", "_")],
                    "outputs": plan_outputs if name == "plan" else {}}
             for name in LANES}
 
@@ -324,6 +341,13 @@ class AggregateLaneResults(unittest.TestCase):
         base.update(env)
         return self.aggregate(needs, **base)
 
+    def aggregate_pull_request(self, needs: dict, **env):
+        # The pull_request path is what `lane-mac-waterui` actually
+        # runs on (a PR head, not a merge-queue head -- the consumer-
+        # opt-in gate is read from the same workflow input on both
+        # events).
+        return self.aggregate(needs, **env)
+
     def test_merge_group_docs_only_scope_skip_passes_strict(self):
         """scope=merge-gate-only + skipped check/test -> pass in strict:
         the skip is the gate's own docs-only design on a queue head."""
@@ -372,6 +396,70 @@ class AggregateLaneResults(unittest.TestCase):
         rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
         self.assertEqual(rc, 1, log)
         self.assertIn("was skipped with no recorded reason", log)
+
+    def test_non_adopter_skips_lane_mac_waterui_explained(self):
+        """A consumer that did NOT opt in (the 56 wrappers that the lane
+        is opt-in for) reads as a skipped lane-mac-waterui whose reason
+        is the wrapper's empty mac_lanes declaration -- an EXPLAINED skip
+        that does not red the gate. The default fixtures match this shape
+        (lane-mac-waterui: skipped, MAC_LANES_VALUE unset), and a
+        closed-window merge_group head must still pass."""
+        needs = all_lanes(
+            outputs={"scope": "full", "packaging_impact": "true"},
+            lane_mac_waterui="skipped")
+        rc, log, _ = self.aggregate_pull_request(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 0, log)
+        self.assertIn(
+            "consumer opt-in: mac_lanes declared empty", log,
+            "the aggregate must accept a skipped lane-mac-waterui as a "
+            "non-adopter's deliberate opt-out. The skip reason explains "
+            "WHY the lane did not run; without it the 56 non-adopting "
+            "consumers' PRs would all red.",
+        )
+
+    def test_adopter_running_lane_mac_waterui_runs_with_red_failure(self):
+        """A consumer that DID opt in (mac_lanes declared) runs the lane,
+        and a FAILURE conclusion surfaces -- this is the whole point of
+        closing the loop. The test proves that the new lane actually
+        feeds the aggregate (a missing aggregate entry would no-op and
+        the consumer would never see a real red)."""
+        needs = all_lanes(
+            outputs={"scope": "full", "packaging_impact": "true"},
+            lane_mac_waterui="failure")
+        rc, log, _ = self.aggregate_pull_request(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 1, log)
+        self.assertIn(
+            "::error::Required lane 'lane-mac-waterui' reported 'failure'",
+            log,
+            "the merge-gate aggregate must surface a red lane-mac-waterui "
+            "as a gate failure -- not silently skip it. Without this, the "
+            "lane's verdict never reaches the ruleset and the consumer's "
+            "mac-waterui surface stays unverified, the exact hole this "
+            "card exists to close.",
+        )
+
+    def test_adopter_lane_mac_waterui_skipped_against_adopter_fails(self):
+        """If the consumer adopted but the lane is skipped (cancelled,
+        needs failed, ...) the aggregate has no positive explanation --
+        the wrapper's mac_lanes declaration says the lane should have
+        run. This case is the dual of the non-adopter test above and
+        exists to pin that the opt-in gate is BOTH necessary and
+        sufficient to explain a skip, not OR."""
+        # The mac_lanes_value env binding is non-empty (consumer opted
+        # in), but the lane is still skipped -- unexplained.
+        needs = all_lanes(
+            outputs={"scope": "full", "packaging_impact": "true"},
+            lane_mac_waterui="skipped")
+        rc, log, _ = self.aggregate_pull_request(
+            needs, MAC_LANES_VALUE="declared", **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("was skipped with no recorded reason", log)
+        self.assertIn(
+            "'lane-mac-waterui'", log,
+            "the unexplained skip must name lane-mac-waterui specifically; "
+            "without that, a real regressor (an adopted wrapper whose "
+            "lane cancelled out from under it) would not be pinned.",
+        )
 
 
 # `merge-gate` is the SOLE required context under the post-merge-gate ruleset.

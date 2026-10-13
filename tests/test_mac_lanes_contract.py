@@ -168,19 +168,193 @@ class MacLanesContractTest(unittest.TestCase):
         in maxi-tools/ci -- the wrong repo -- on every consumer at once.
         The declaration is consumed by the consumer's own workflows, which
         is the only place GitHub's trigger model can express the chain.
+
+        ALLOWED EXCEPTION (the merge-gate-incorporated lane): a hard-coded
+        `lane-mac-waterui` job whose `if:` reads `${{ inputs.mac_lanes }}`
+        is the documented shape for funneling a consumer's mac-waterui lane
+        INTO the merge-gate aggregate without violating the dynamic-`uses:`
+        dead end. The literal string `mac_lanes` is permitted inside that
+        job's `if:` (the gate) and inside the merge-gate aggregate step's
+        `env:` binding (so skip_reason can read the same signal). Anywhere
+        ELSE in the jobs section -- in another job's `uses:` value, in a
+        step's `with:`, in a `uses:` argument on `lane-mac-waterui` itself,
+        on the `mac_lanes` string without the `${{ inputs.X }}` shape --
+        is rejected. The pin is intentionally narrow: a future commit that
+        reaches for `mac_lanes` to dispatch a different lane is exactly the
+        dynamic-`uses:`-style mistake this test exists to catch.
+        """
+        import re
+
+        doc = yaml.safe_load(RUST_CI.read_text(encoding="utf-8"))
+        jobs = doc.get("jobs", {}) or {}
+
+        # Every concrete value a `uses:` would resolve to. GitHub does NOT
+        # accept expressions in `uses:` -- the value is literal -- so a
+        # string interpolation here would fail run creation or, worse, a
+        # relative path would silently resolve inside this repo on every
+        # consumer at once.
+        for job_id, job in jobs.items():
+            uses = job.get("uses")
+            if isinstance(uses, str) and "mac_lanes" in uses:
+                self.fail(
+                    f"job {job_id!r}: `uses: {uses}` interpolates `mac_lanes` "
+                    "into a value GitHub resolves statically. A "
+                    "`uses: ./<workflow>.yml@${{ inputs.mac_lanes }}`-style "
+                    "ship broke run creation; this test pins the failure."
+                )
+
+            # `with:` values: mac_lanes as a value (even if inside an
+            # expression) would also reach into the consumer's workflows.
+            for step in job.get("steps", []) or []:
+                with_block = step.get("with") or {}
+                for key, val in with_block.items():
+                    if isinstance(val, str) and "mac_lanes" in val:
+                        self.fail(
+                            f"job {job_id!r}, step {step.get('name')!r}: "
+                            f"`with: {key}: {val}` interpolates `mac_lanes` "
+                            "into a value. mac_lanes is a wrapper-side "
+                            "declaration; the reusable it calls owns its "
+                            "own inputs."
+                        )
+
+        # Now a narrower pass: `mac_lanes` may appear in jobs ONLY inside
+        # one of the documented gate expressions -- on the
+        # `lane-mac-waterui` job's `if:`, or on the `merge-gate` job's
+        # aggregate step's `env:` binding (so the skip_reason predicate
+        # can read the same signal). Any other surface (a free token in
+        # another job, a stray env binding, a comment-as-instruction in
+        # another job's body) is rejected by the broad `uses:` /
+        # `with:` check above; the gate-expression-only pass below keeps
+        # the permitted occurrences to exactly the two named sites.
+        gate_pat = re.compile(r"\${{\s*inputs\.mac_lanes[^}]*}}")
+        permitted_gate_sites: list[str] = []
+
+        # Lane-mac-waterui: if: must read inputs.mac_lanes.
+        lwm = jobs.get("lane-mac-waterui") or {}
+        lwm_if = lwm.get("if", "")
+        if gate_pat.search(lwm_if):
+            permitted_gate_sites.append("lane-mac-waterui.if")
+        else:
+            self.fail(
+                "the `lane-mac-waterui` job's `if:` must gate on "
+                "`${{ inputs.mac_lanes ... }}`; without it the gate runs "
+                "on every consumer (including the 56 wrappers that did "
+                "not adopt the lane)."
+            )
+
+        # Merge-gate aggregate step env: must bind inputs.mac_lanes into
+        # MAC_LANES_VALUE (or equivalent), so the Python skip_reason
+        # can read it.
+        mg = jobs.get("merge-gate") or {}
+        for step in mg.get("steps", []) or []:
+            if step.get("name") != "Aggregate lane results":
+                continue
+            env_block = step.get("env") or {}
+            for env_val in env_block.values():
+                if isinstance(env_val, str) and gate_pat.search(env_val):
+                    permitted_gate_sites.append(
+                        f"merge-gate.steps[Aggregate lane results].env"
+                    )
+                    break
+        self.assertIn(
+            "merge-gate.steps[Aggregate lane results].env",
+            permitted_gate_sites,
+            "the merge-gate aggregate step's `env:` must bind "
+            "`${{ inputs.mac_lanes }}` (e.g. MAC_LANES_VALUE) so the "
+            "skip_reason predicate reads the same gate signal the lane's "
+            "`if:` applied. Without this binding the aggregate has no "
+            "way to distinguish an explained skip (non-adopter) from an "
+            "unexplained one (red lane).",
+        )
+
+        # No other job may name `mac_lanes` in its `if:`, `name:`,
+        # `description:`, or anywhere else. The narrow surfaces a
+        # future refactor would reach for -- a free token in another
+        # job, a stray env binding, a `with:` value -- are caught by
+        # the `uses:` / `with:` passes above. This assertion closes
+        # the `if:` half of that surface (gate_pat already excludes
+        # those sites from the global check).
+        for job_id, job in jobs.items():
+            if job_id in ("lane-mac-waterui", "merge-gate"):
+                continue  # both permitted gate sites above
+            job_body = str(job)
+            if gate_pat.search(job_body):
+                self.fail(
+                    f"job {job_id!r}: the `${{{{ inputs.mac_lanes ... }}}}` "
+                    "expression is permitted ONLY on `lane-mac-waterui`'s "
+                    "`if:` (and on `merge-gate`'s aggregate step's `env:`, "
+                    "as a path for `skip_reason` to read). Anywhere else "
+                    "(in another job's `if:`, on the inputs that flow into "
+                    "a `uses:`) is the dynamic-`uses:` mistake this test "
+                    "exists to catch."
+                )
+
+    def test_lane_mac_waterui_is_in_the_merge_gate_needs_chain(self):
+        """Closing the loop requires the new lane in merge-gate's needs.
+
+        Without `lane-mac-waterui` in the merge-gate aggregate's `needs:`,
+        the new job runs but its result never reaches the gate's PASSING
+        allowlist check, and the consumer-side `Mac WaterUI test` lane
+        stays as advisory as it was before this card. The LANES tuple in
+        the aggregate step must name it too, so a missing-from-needs lane
+        fails the `bad += [(name, '<missing>') ...]` path with a clear
+        error rather than silently passing.
         """
         text = RUST_CI.read_text(encoding="utf-8")
-        self.assertNotIn(
-            "mac_lanes",
-            text.split("jobs:", 1)[1],
-            "rust-ci.yml's jobs section must not reference mac_lanes. The "
-            "input is a declaration for the consumer's own standalone "
-            "workflows (and the wrapper fan-out preserves a non-empty "
-            "value via rust_ci_render.py's mac_lanes special-case), not a "
-            "value the template can act on: `uses:` takes no expressions, "
-            "and a relative path would resolve inside maxi-tools/ci rather "
-            "than the consumer. If GitHub ever ships dynamic `uses:`, "
-            "revisit this test deliberately, not by deleting it",
+        # The merge-gate job's needs: list. Most specific match: the line
+        # under `merge-gate:` that starts with `needs:`.
+        import re
+
+        m: "re.Match[str] | None" = re.search(
+            r"^  merge-gate:\n(?:(?:    [^\n]*\n)+)",
+            text, flags=re.MULTILINE,
+        )
+        self.assertIsNotNone(
+            m,
+            "rust-ci.yml must declare a `merge-gate:` job; the rest of the "
+            "contract assumes one",
+        )
+        needs_block = m.group(0)
+        self.assertIn(
+            "lane-mac-waterui", needs_block,
+            "merge-gate's `needs:` must include `lane-mac-waterui`: the "
+            "card's whole purpose is making the mac-waterui verdict roll "
+            "up under the merge-gate aggregate, and the aggregate only "
+            "reads the jobs in `needs:`. Without this entry the new lane "
+            "publishes its own check run but the ruleset never sees it.",
+        )
+
+    def test_lane_mac_waterui_aggregate_skip_reason_refs_consumer_opt_in(self):
+        """The aggregate must classify the lane as a consumer opt-in skip.
+
+        The `lane-mac-waterui` job is heavy (Mac-primary), so the
+        merge-gate's `skip_reason` predicate must reach it on the
+        `HEAVY_LANES` branch AND recognise the consumer opt-in shape (an
+        empty `mac_lanes` declaration). Without this test, a future
+        refactor that drops `lane-mac-waterui` from `HEAVY_LANES` would
+        silently turn it into a `RELEASE_LANES`-shape or fall through the
+        `def skip_reason(): return None` default -- both of which would
+        reject the legitimate skip a non-adopter sees today (maximoji-rs,
+        maxi-ml-mac-app, ... -- the 56 wrappers that the lane is opt-in
+        for), and 56 PRs a week would red.
+        """
+        text = RUST_CI.read_text(encoding="utf-8")
+        # Both halves are required: the lane must be in HEAVY_LANES (else
+        # skip_reason returns None for it), AND the consumer-opt-in branch
+        # must explain an empty `mac_lanes`.
+        self.assertIn(
+            '("check", "test", "lane-mac-waterui")', text,
+            "the aggregate's HEAVY_LANES tuple must include "
+            "`lane-mac-waterui` so `skip_reason` reaches the heavy-lane "
+            "branch for it. Without that entry, an empty mac_lanes "
+            "declaration is treated as an unexplained skip and the gate "
+            "fails on the 56 wrappers that did not opt in.",
+        )
+        self.assertIn(
+            "consumer opt-in: mac_lanes declared empty", text,
+            "the aggregate's skip_reason must explain a skipped "
+            "lane-mac-waterui as the consumer opt-in shape; an unexplained "
+            "skip on a heavy lane is a gate fail.",
         )
 
 
