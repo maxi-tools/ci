@@ -289,6 +289,39 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
+      # Fail closed when a workspace declares a sibling `path = "../<repo>"`
+      # dependency and this run has no credentials to clone it with.
+      #
+      # The Verify sibling step above needs an App token, so credential-free
+      # mode skips it -- and the cargo steps below would then resolve
+      # `path = "../other-repo"` against whatever checkout happens to sit
+      # beside this workspace on a persistent self-hosted runner: a leftover
+      # from an unrelated job, compiled and tested as if it were current. That
+      # is a false green, and it is the stale-checkout shape
+      # verify-sibling-checkouts exists to close. Without credentials the
+      # sibling cannot be re-cloned, so the honest answer is to refuse the
+      # workspace rather than test it against someone else's checkout.
+      - name: Reject sibling path dependencies without credentials
+        if: ${{ inputs.should_run && steps.credentials.outputs.has_credentials == 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Any manifest `path` that escapes this workspace. A path inside the
+          # repository (e.g. "crates/foo") is fine and must not trip this; only
+          # a `../<repo>` escape names a checkout that lives outside it.
+          #
+          # Not anchored, so the inline-table form
+          # (`foo = { path = "../bar" }`) is caught too; target/ is excluded
+          # because cargo never reads manifests out of the build directory.
+          matches="$(grep -rInE --exclude-dir=target --include=Cargo.toml \
+            'path[[:space:]]*=[[:space:]]*[^[:space:]]*\.\./' . || true)"
+          if [ -n "$matches" ]; then
+            echo "::error::credential-free run: this workspace declares sibling path dependencies that cannot be cloned or verified without APP_ID/APP_PRIVATE_KEY:"
+            printf '%s\n' "$matches"
+            echo "Credential-free mode is public-only by contract; vendor or publish the dependency, or run this lane with credentials."
+            exit 1
+          fi
+
       - name: Fetch maxi-config rust-lane policy
         if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
         # One implementation, in .github/actions/fetch-policy. This block
@@ -348,7 +381,18 @@ jobs:
           # connection parks `git remote-https` at 0% CPU indefinitely.
           echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
       - name: Fetch private dependencies
-        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
+        # Runs in BOTH credential modes. The lockfile assertion
+        # (`cargo fetch --locked`) is a property of the workspace, not of the
+        # credentials: gating this whole step on credentials skipped the only
+        # --locked invocation and left the later cargo steps free to rewrite
+        # an inconsistent Cargo.lock silently, so a manifest change with no
+        # matching lockfile update passed credential-free and failed
+        # credentialed. Only the private-auth SETUP above is credential-gated;
+        # without it this fetch uses the default public HTTPS remotes, which is
+        # exactly the public-only surface a fork has. A workspace that needs a
+        # private dependency cannot be fetched without credentials and fails
+        # loudly here instead of silently succeeding.
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
         run: |
           if [ -f Cargo.lock ]; then
             cargo fetch --locked
