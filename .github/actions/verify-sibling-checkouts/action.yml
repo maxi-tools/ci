@@ -59,158 +59,38 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # Discover uses stdlib `tomllib`, which is Python 3.11+. The
-        # org's macOS runners ship python@3.14 and the GitHub-hosted Linux
-        # images ship 3.13; both are fine. A self-hosted NixOS box that
-        # exposes an older `python3` would fail with a bare ImportError at
-        # the top of the embedded script; surface a clear, attributable
-        # error here instead of letting the traceback reach the runner
-        # log, and the lane-plan tool check already gates boxes that have
-        # no `python3` on PATH at all.
-        if ! python3 -c 'import sys, tomllib; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
-          echo "::error::verify-sibling-checkouts requires python3 >= 3.11 (tomllib); the runner's python3 is too old. Lane-plan already gates the absence of python3; this gate covers the version."
+        # The discover script lives beside this action as
+        # `.github/actions/verify-sibling-checkouts/discover.py`. It is
+        # deliberately NOT embedded as a heredoc: keeping it as a real
+        # file under the action directory means the test
+        # `tests/test_verify_sibling_checkouts_tomllib.py` can run the
+        # identical bytes under a stripped module table and prove the
+        # Python 3.10 fallback works, not just that the YAML parses.
+        discover="${GITHUB_ACTION_PATH}/discover.py"
+        if [ ! -f "$discover" ]; then
+          echo "::error::verify-sibling-checkouts discover.py is missing at $discover; the action's source is incomplete."
           exit 1
         fi
-        discover="$RUNNER_TEMP/sibling-discover.py"
-        cat > "$discover" <<'PY'
-        import os, pathlib, sys, tomllib
-
-        root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-        skip = {
-            ".git", "target", ".worktrees", ".maxi-worktrees",
-            "node_modules", "vendor",
-        }
-
-        def harvest_dep_table(table):
-            """[dependencies] / [dev-dependencies] / [build-dependencies]
-            / [workspace.dependencies] -- a name -> dep-spec table. Each
-            spec is either a string (version) or a table that may carry
-            `path`. Skip string specs."""
-            if not isinstance(table, dict):
-                return
-            for v in table.values():
-                if isinstance(v, dict) and isinstance(v.get("path"), str):
-                    yield v["path"]
-
-        def harvest_patch_table(table):
-            """[patch.<registry>] -- registry name -> crate-name -> spec."""
-            if not isinstance(table, dict):
-                return
-            for reg in table.values():
-                if not isinstance(reg, dict):
-                    continue
-                for v in reg.values():
-                    if isinstance(v, dict) and isinstance(v.get("path"), str):
-                        yield v["path"]
-
-        def harvest_replace_table(table):
-            """[replace] -- crate-name -> spec (single map, not registry-
-            scoped). Same shape as a dependency spec."""
-            if not isinstance(table, dict):
-                return
-            for v in table.values():
-                if isinstance(v, dict) and isinstance(v.get("path"), str):
-                    yield v["path"]
-
-        siblings = {}
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
-            if "Cargo.toml" not in filenames:
-                continue
-            manifest = pathlib.Path(dirpath) / "Cargo.toml"
-            try:
-                doc = tomllib.loads(manifest.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, tomllib.TOMLDecodeError) as exc:
-                print(f"::error::cannot read {manifest}: {exc}", file=sys.stderr)
-                sys.exit(1)
-            paths = []
-            # Top-level dependency tables. tomllib parses nested tables as
-            # nested dicts, so `[workspace]` and `[workspace.dependencies]`
-            # both appear under doc["workspace"]; harvest_dep_table is
-            # called on both shapes directly.
-            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-                paths.extend(harvest_dep_table(doc.get(key)))
-            ws = doc.get("workspace")
-            if isinstance(ws, dict):
-                paths.extend(harvest_dep_table(ws.get("dependencies")))
-            # Target-specific dependency tables. `[target.'cfg(...)'.dependencies]`
-            # is parsed as doc["target"][<triple-quoted key>]["dependencies"],
-            # so walk the target map and harvest every {dependencies, dev-
-            # dependencies, build-dependencies} table under it. These are
-            # the tables Cargo consults when the matching cfg is active --
-            # e.g. Apple lanes resolve `[target.'cfg(target_os = "macos")'.
-            # dependencies]`, so missing or stale siblings there would
-            # otherwise surface as cargo-time errors on the lane the issue
-            # documents.
-            target = doc.get("target")
-            if isinstance(target, dict):
-                for t in target.values():
-                    if not isinstance(t, dict):
-                        continue
-                    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-                        paths.extend(harvest_dep_table(t.get(key)))
-            # `[patch.<registry>]` may live at doc["patch"] (single
-            # registry block) or under doc["workspace"]["patch"] (the
-            # workspace-wide patch). Either way it's a registry map.
-            for patch_root in (doc.get("patch"), (ws or {}).get("patch")):
-                paths.extend(harvest_patch_table(patch_root))
-            # Deprecated `[replace]` -- Cargo still honours it on 1.95.
-            paths.extend(harvest_replace_table(doc.get("replace")))
-            for raw in paths:
-                # `os.path.normpath` first, then re-check for `..` in the
-                # segment. A `path = "./../foo/crate"` declaration would
-                # be skipped by a raw `startswith("..")` check even though
-                # it normpath()s to `../foo/crate`; without normalisation
-                # the lane retains both original failure modes (missing
-                # manifest, false-positive green against a stale sibling).
-                if not os.path.normpath(raw).split(os.sep)[0].startswith(".."):
-                    # Pure intra-tree path, e.g. `path = "crates/foo"` or
-                    # `path = "./crates/foo"`. Cargo resolves it under
-                    # this checkout and the lane already handles it.
-                    continue
-                # Lexical normalisation. `Path.resolve()` follows symlinks
-                # on disk, which means a leftover sibling at ../waterui
-                # that points at ../waterui-old would resolve to the wrong
-                # repository -- the action would clone the wrong tree and
-                # leave a stale symlink in place for cargo to follow. Decide
-                # the sibling from the manifest, not from the runner.
-                resolved = pathlib.Path(os.path.normpath(manifest.parent / raw))
-                try:
-                    resolved.relative_to(root)
-                    continue
-                except ValueError:
-                    pass
-                # root/../<name> normpath()s away the `..`, so the sibling
-                # is the first path component that departs from the
-                # checkout root's own parts.
-                root_parts = root.parts
-                parts = resolved.parts
-                if len(parts) < len(root_parts):
-                    print(
-                        f"::error::{manifest.relative_to(root)} path {raw} "
-                        f"resolves to {resolved}, which is the checkout's "
-                        "parent or above; a Cargo path dependency must name "
-                        "a sibling of this checkout, not the checkout itself",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-                if parts[: len(root_parts)] == root_parts:
-                    continue
-                if parts[: len(root_parts) - 1] != root_parts[:-1]:
-                    print(
-                        f"::error::{manifest.relative_to(root)} path {raw} "
-                        f"escapes to {resolved}, which is not a direct sibling "
-                        "of this checkout",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-                name = parts[len(root_parts) - 1]
-                siblings.setdefault(name, set()).add(str(manifest.relative_to(root)))
-        for name in sorted(siblings):
-            where = ", ".join(sorted(siblings[name]))
-            print(f"sibling: {name} (from {where})", file=sys.stderr)
-            print(name)
-        PY
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "::error::verify-sibling-checkouts requires python3 on PATH"
+          exit 1
+        fi
+        # Probe once that the interpreter can actually parse TOML.
+        # Accept BOTH of these Python setups:
+        #
+        #   - Python 3.11+            (stdlib tomllib is present)
+        #   - Python 3.10 with tomli  (the official PyPI backport)
+        #
+        # The earlier gate (`python3 >= 3.11` or hard fail) red-lined the
+        # whole lane-test lane on the self-hosted [macOS, ARM64] fleet
+        # (maxiStudio22 on maxi-e2e#171 run 38388255166, maximini20 on
+        # maxi-e2e#101 run 38429245800) whose provisioned python3 is
+        # <3.11 due to the runner's Nix pin. Those images ship PyPI
+        # `tomli`; the action now consults both instead of refusing.
+        if ! python3 -c 'import tomllib' 2>/dev/null && ! python3 -c 'import tomli' 2>/dev/null; then
+          echo "::error::verify-sibling-checkouts requires Python >= 3.11 (stdlib tomllib) OR the tomli PyPI package importable from python3; the runner's python3 has neither."
+          exit 1
+        fi
         # Write names to a file first (see qodana.yml's sibling step for why
         # the process-substitution alternative hides a discover failure):
         # `read -r < <(python3 discover.py)` does not apply `set -e` to a
