@@ -103,7 +103,21 @@ jobs:
   # org's fleet exactly as it was on the hosted call site.
   route-review-gate:
     name: 'per-run: route to a self-hosted lane (Linux primary, Mac overflow)'
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    # Was `fromJSON(inputs.runs_on)`. The shim calls resolve-runner,
+    # which needs the org-scoped `actions: read` + `organization_self_
+    # hosted_runners: read` permissions to list the fleet -- permissions
+    # `GITHUB_TOKEN` does NOT carry (it is repo-scoped). The org App
+    # token mints those permissions, but it is only available on
+    # SELF-hosted runners; on a hosted runner `secrets.APP_CLIENT_ID`
+    # is empty and the App token step errors with `client-id input must
+    # be set to a non-empty string`. The shim is therefore pinned to
+    # self-hosted Linux, and the four downstream jobs read the shim's
+    # `outputs.runs_on` -- a hosted caller gets the shim on self-hosted
+    # but the downstream on whatever the router picks. Same shape as
+    # `route-clippy` in maxi-config/.github/workflows/clippy.yml (also
+    # `[self-hosted, Linux]`), and a fork PR still skips via the same
+    # `if:` as before -- the trust gate is unchanged.
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 3
     permissions:
       actions: read

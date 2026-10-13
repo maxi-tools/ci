@@ -217,30 +217,49 @@ class RouteShimWiringTest(unittest.TestCase):
             f"`route-clippy` shim in maxi-config.",
         )
 
-    def test_shim_runs_on_inputs_runs_on(self):
-        # The shim's OWN runner is the caller's `inputs.runs_on`. This
-        # is what lets a caller that wants hosted runners (e.g. the
-        # local `review-gate.yml` here) keep the shim on hosted even
-        # though the downstream jobs land on the router's answer.
-        # The shim does NOT run on the router's output -- that would
-        # create a circular dependency.
+    def test_shim_runs_on_self_hosted_linux(self):
+        # The shim is pinned to self-hosted Linux, NOT to
+        # `inputs.runs_on`. The reason is the App token mint:
+        # `secrets.APP_CLIENT_ID` is empty on a hosted runner, so the
+        # `actions/create-github-app-token` step errors with `client-id
+        # input must be set to a non-empty string`. Self-hosted runners
+        # (which `route-clippy` also uses) DO see org secrets. The
+        # trade-off: hosted callers of the reusable now pay one
+        # self-hosted slot for the shim -- which is fine, because the
+        # shim is a cheap API job and the four downstream jobs land on
+        # whatever the router picks. The shape is locked; future edits
+        # to the shim's `runs-on:` MUST keep `[self-hosted, Linux]` or
+        # the App token mint fails on hosted callers.
         shim = self.jobs[SHIM_NAME]
-        runs_on = shim.get("runs-on") or ""
-        self.assertIn(
-            "inputs.runs_on",
-            runs_on,
-            f"{WORKFLOW.name} `{SHIM_NAME}:` `runs-on:` is {runs_on!r}. The "
-            f"shim's OWN runner is the caller's `inputs.runs_on`, NOT the "
-            f"router's output (a circular dependency would deadlock the "
-            f"workflow).",
+        runs_on = shim.get("runs-on")
+        # YAML parses `[self-hosted, Linux]` as a list. Normalise to a
+        # comparable string so the assertion reads the way the file
+        # does.
+        if isinstance(runs_on, list):
+            runs_on_str = f"[{', '.join(runs_on)}]"
+        else:
+            runs_on_str = str(runs_on)
+        self.assertEqual(
+            runs_on_str,
+            "[self-hosted, Linux]",
+            f"{WORKFLOW.name} `{SHIM_NAME}:` `runs-on:` is {runs_on!r}. "
+            f"The shim MUST run on `[self-hosted, Linux]` because the "
+            f"App token mint (`secrets.APP_CLIENT_ID`) is only available "
+            f"on self-hosted runners -- on a hosted runner the secret is "
+            f"empty and the mint errors with `client-id input must be "
+            f"set to a non-empty string`. Mirrors `route-clippy` in "
+            f"maxi-config.",
         )
+        # The shim MUST NOT read its own `outputs.runs_on` (a job
+        # cannot depend on its own outputs -- actionlint will catch it
+        # before this test, but pinning it here makes the intent
+        # explicit).
         self.assertNotIn(
             f"needs.{SHIM_NAME}",
-            runs_on,
+            runs_on_str,
             f"{WORKFLOW.name} `{SHIM_NAME}:` `runs-on:` reads "
             f"`needs.{SHIM_NAME}.*` -- a job cannot depend on its own "
-            f"outputs, and an actionlint error will fire before this test "
-            f"can.",
+            f"outputs.",
         )
 
 
