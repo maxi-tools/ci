@@ -160,11 +160,14 @@ jobs:
 
       - name: Job summary
         if: always()
+        env:
+          LANE_OUTCOME: ${{ steps.lane.outcome || 'unknown' }}
+          HOSTNAME: ${{ runner.name }}
         run: |
           {
-            echo "## Mac WaterUI lane — $(hostname -s), $(date -u +%Y-%m-%dT%H:%MZ)"
+            echo "## Mac WaterUI lane — ${HOSTNAME}, $(date -u +%Y-%m-%dT%H:%MZ)"
             echo
-            echo "result: ${{ steps.lane.outcome || 'unknown' }}"
+            echo "result: ${LANE_OUTCOME}"
             echo "feature: waterui (declared on the wrapper's merge-gate job's with:)"
             echo "scope: lib unit tests behind #[cfg(all(feature=\"waterui\", target_os=\"macos\"))]"
           } >> "$GITHUB_STEP_SUMMARY"

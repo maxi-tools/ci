@@ -253,7 +253,7 @@ class MacLanesContractTest(unittest.TestCase):
             for env_val in env_block.values():
                 if isinstance(env_val, str) and gate_pat.search(env_val):
                     permitted_gate_sites.append(
-                        f"merge-gate.steps[Aggregate lane results].env"
+                        "merge-gate.steps[Aggregate lane results].env"
                     )
                     break
         self.assertIn(
@@ -306,7 +306,7 @@ class MacLanesContractTest(unittest.TestCase):
         import re
 
         m: "re.Match[str] | None" = re.search(
-            r"^  merge-gate:\n(?:(?:    [^\n]*\n)+)",
+            r"^  merge-gate:\n(?:    [^\n]*\n)+",
             text, flags=re.MULTILINE,
         )
         self.assertIsNotNone(
