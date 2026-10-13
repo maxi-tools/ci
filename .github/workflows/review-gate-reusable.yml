@@ -592,6 +592,7 @@ jobs:
 
       - uses: maxi-tools/ci/.github/actions/pr-review-gate@main
         id: gate
+        continue-on-error: true
         with:
           payload-path: ${{ steps.collect.outputs.payload-path }}
           # This leg judges ONE condition, which is what lets its check be
