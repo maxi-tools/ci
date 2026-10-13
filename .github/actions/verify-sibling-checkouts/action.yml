@@ -205,6 +205,29 @@ runs:
                     )
                     sys.exit(1)
                 name = parts[len(root_parts) - 1]
+                # A line break in a sibling name is a RECORD INJECTION, not
+                # merely an ugly name. TOML basic strings honour `\n`, so
+                # `path = "../foo\nrm-rf-victim"` resolves to a real path
+                # component carrying a real newline. `print(name)` then emits
+                # it as TWO records, and the verify step's `while IFS= read -r
+                # name` reads them as two separate siblings -- both of which
+                # PASS the character whitelist below, because the newline that
+                # separated them is exactly what the whitelist would have
+                # rejected. Both destinations are then unconditionally
+                # `rm -rf`'d. Rejecting here, where the manifest and the raw
+                # path are both still in scope, means the name never reaches
+                # `siblings` and can never enter the record channel at all.
+                if "\n" in name or "\r" in name:
+                    print(
+                        f"::error::{manifest.relative_to(root)} path {raw!r} "
+                        f"resolves to sibling name {name!r}, which contains a "
+                        "line break; a sibling repository name cannot contain "
+                        "one, and emitting it would split it into two records "
+                        "that the verify step would each treat as a separate "
+                        "sibling to wipe and clone",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
                 siblings.setdefault(name, set()).add(str(manifest.relative_to(root)))
         for name in sorted(siblings):
             where = ", ".join(sorted(siblings[name]))
