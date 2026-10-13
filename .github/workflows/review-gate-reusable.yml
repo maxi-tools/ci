@@ -131,7 +131,7 @@ jobs:
       github.event_name != 'merge_group' &&
       github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # `persist-credentials: false` so the implicitly-minted `GITHUB_TOKEN`
           # for this workflow job cannot be reused by a PR's local action body
@@ -157,7 +157,18 @@ jobs:
 
       - name: Fetch the routing policy
         id: fetch-policy
-        uses: ./.github/actions/fetch-policy
+        # Same-owner pin to a 40-char SHA (the SHA of the first commit on this
+        # branch that introduced the `resolve-runner` action: every
+        # descendant of that commit has the same `action.yml` blob, so the
+        # action definition the run evaluates is unchanged. A relative
+        # `./.github/actions/...` resolves to the CALLER for `workflow_call`,
+        # so when a consumer repo pins
+        # `maxi-tools/ci/.github/workflows/review-gate-reusable.yml@<sha>`
+        # the relative path looks in the consumer's own checkout, not here.
+        # Same-owner (not external) pins are exempt from this repo's
+        # no-mutable-ref rule; the contract lives at
+        # `maxi-config/docs/contracts/mirror-pin-is-a-security-boundary.md`.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@96393c66f35c1a37d54aa639200f931074f1fdcd
         with:
           policy-files: |
             ci/runner-routing.toml
@@ -165,7 +176,11 @@ jobs:
 
       - name: Resolve runner
         id: resolve
-        uses: ./.github/actions/resolve-runner
+        # Same-owner pin to a 40-char SHA (same reasoning as `fetch-policy`
+        # above). The action's `action.yml` blob is unchanged across every
+        # commit on this branch, so pinning to `96393c6` (the first commit
+        # on the branch) and never amending keeps this reference valid.
+        uses: maxi-tools/ci/.github/actions/resolve-runner@96393c66f35c1a37d54aa639200f931074f1fdcd
         with:
           lane: linux-arm64
           # `repo: ci` is the short form (`maxi-tools/ci` is the long form);

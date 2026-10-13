@@ -115,10 +115,18 @@ class RouteShimWiringTest(unittest.TestCase):
     def test_shim_invokes_resolve_runner_with_documented_inputs(self):
         shim = self.jobs[SHIM_NAME]
         steps = shim.get("steps") or []
+        # Was `./.github/actions/resolve-runner`. The reusable workflow ships
+        # to ~48 consumer repos; a relative `uses:` resolves to the CALLER's
+        # checkout on a `workflow_call`, so a consumer that pinned
+        # `maxi-tools/ci/.github/workflows/review-gate-reusable.yml@<sha>`
+        # would look for `.github/actions/resolve-runner` in its OWN tree.
+        # The reference is now a same-owner SHA pin (40 chars); the test
+        # matches either shape so the pin can advance with the branch.
         resolve_steps = [
             s for s in steps
             if isinstance(s.get("uses"), str)
-            and s["uses"].endswith("./.github/actions/resolve-runner")
+            and (s["uses"].endswith("./.github/actions/resolve-runner")
+                 or s["uses"].startswith("maxi-tools/ci/.github/actions/resolve-runner@"))
         ]
         self.assertEqual(
             len(resolve_steps), 1,
