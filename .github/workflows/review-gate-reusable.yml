@@ -75,6 +75,70 @@ on:
 permissions: {}
 
 jobs:
+  # The route shim. Lands the saturated-Linux → idle-Mac overflow this
+  # reusable otherwise cannot reach -- the four downstream jobs hardcode
+  # `runs-on: fromJSON(inputs.runs_on)` today, so without this shim a queued
+  # Review Gate job on a Focus PR waits behind every other self-hosted
+  # Linux job even when ten self-hosted Macs are idle. The shim is the
+  # single point where the resolve-runner answer reaches this workflow.
+  #
+  # Trust gate: same-repo only. A fork pull request's run reaches this job
+  # otherwise, and the org's self-hosted fleet would be a target for fork
+  # code (the same reason every other self-hosted job in this file carries
+  # the same-repo `if:`). Skipping here is safe: a skipped dependency
+  # skips its dependents, and a fork PR that skips the whole gate publishes
+  # nothing, which leaves the verdicts pending and blocks rather than
+  # permits -- identical to the existing fork behaviour.
+  #
+  # LANE IS `linux-arm64` UNCONDITIONALLY. A caller that wanted hosted
+  # runners before this shim existed passed `runs_on: '["ubuntu-latest"]'`;
+  # the shim still runs on that input (the caller's intent is honoured for
+  # the shim's OWN runner), but the downstream jobs read the shim's
+  # `outputs.runs_on`, which the resolve-runner populates with
+  # `[self-hosted, Linux, ARM64]` for `lane = "linux-arm64"`. A fork PR
+  # skips the shim, the downstream jobs skip via `needs:`, and the
+  # local `review-gate.yml` (this repo's own call site) loses the explicit
+  # `runs_on: '["ubuntu-latest"]'` override so the shim runs on the
+  # default self-hosted lane; the fork guard above keeps fork code off the
+  # org's fleet exactly as it was on the hosted call site.
+  route-review-gate:
+    name: 'per-run: route to a self-hosted lane (Linux primary, Mac overflow)'
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      runs_on: ${{ steps.resolve.outputs.runs-on }}
+      reason: ${{ steps.resolve.outputs.reason }}
+      lane: ${{ steps.resolve.outputs.lane }}
+      provider: ${{ steps.resolve.outputs.provider }}
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Fetch the routing policy
+        id: fetch-policy
+        uses: ./.github/actions/fetch-policy
+        with:
+          policy-files: |
+            ci/runner-routing.toml
+          token: ${{ github.token }}
+
+      - name: Resolve runner
+        id: resolve
+        uses: ./.github/actions/resolve-runner
+        with:
+          lane: linux-arm64
+          # `repo: ci` is the short form (`maxi-tools/ci` is the long form);
+          # `effective_value()` in resolve-runner reads the policy under
+          # `[repos.<repo>.jobs.<job>]`. PR-B in ci ships the wiring; PR-C
+          # in maxi-config ships the matching overflow policy entries.
+          repo: ci
+          # The heaviest downstream job, so the overflow answer is correct
+          # for all four; the four jobs share the same lane.
+          job: gate
+          policy-path: .maxi-config/ci/runner-routing.toml
+          github-token: ${{ github.token }}
+
   # The preemptive half of the collapse. The caller's wrapper holds one
   # concurrency lane per (PR, event) with `cancel-in-progress: false`, so a
   # review burst queues runs behind the in-flight one instead of cancelling
@@ -118,7 +182,13 @@ jobs:
   # re-run; the id only breaks ties.
   supersede-check:
     name: 'per-run: superseded by a newer run of this lane?'
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    # Routed through `route-review-gate` so a saturated Linux lane can
+    # overflow onto an idle Mac pool. Falls back to the caller's `inputs.runs_on`
+    # ONLY when the shim was skipped (fork pull request) -- in that case the
+    # `needs: route-review-gate` dependency would have skipped this job too,
+    # so the fallback is a defense-in-depth read that never actually evaluates.
+    needs: route-review-gate
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
     timeout-minutes: 5
     permissions:
       actions: read
@@ -228,9 +298,9 @@ jobs:
     # grey pass-equivalent, and a review burst used to leave a dozen of the
     # former on every bot-reviewed PR.
     name: 'per-run: invalidate previous verdicts'
-    needs: supersede-check
+    needs: [route-review-gate, supersede-check]
     if: needs.supersede-check.outputs.superseded != 'true'
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
     timeout-minutes: 5
     permissions:
       actions: read
@@ -367,8 +437,8 @@ jobs:
   # `if:` shape to gate App-token work; see its own App-token step.)
   dedupe:
     name: 'per-run: dedupe bot review threads'
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
-    needs: [supersede-check, invalidate]
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
+    needs: [route-review-gate, supersede-check, invalidate]
     # Both halves are load-bearing and they fail differently, which is why
     # neither is implied by the other:
     #
@@ -425,7 +495,7 @@ jobs:
           pr: ${{ github.event.pull_request.number }}
 
   gate:
-    needs: [supersede-check, invalidate, dedupe]
+    needs: [route-review-gate, supersede-check, invalidate, dedupe]
     # RUNS EVEN IF `dedupe` DID NOT.
     #
     # A `needs:` dependency that is skipped or failed skips the dependent job
@@ -539,7 +609,7 @@ jobs:
     # string is parsed into the label list. `runs-on: ${{ inputs.runs_on }}`
     # alone cannot express a multi-label self-hosted selector -- it would be
     # matched as one literal label named `["self-hosted", "Linux", "X64"]`.
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
     timeout-minutes: 10
     permissions:
       actions: read
