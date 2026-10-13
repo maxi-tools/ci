@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""The two lane decisions that can silently skip testing, RUN not read.
+
+Both were fail-open when they shipped, and both are invisible to
+actionlint: it checks that a workflow parses, not what its shell decides.
+
+  lane-plan `Classify change scope`
+      `docs_only` starts true, so an empty changed-file list -- a failed
+      lookup -- classified as "documentation only" and skipped check and
+      test in every consumer. The same repository refuses exactly this
+      inference elsewhere by name (check-owned-files.py,
+      check-intra-org-pins.py: "an empty list is a failed lookup, not a
+      clean PR").
+
+  rust-ci `Aggregate lane results`
+      failed on `failure` and `cancelled` only, so any other result
+      passed. This job is the SOLE required context under the new
+      ruleset, which makes an unrecognised value a green gate over a
+      red lane.
+
+Each test extracts the step's own `run:` body from the workflow and
+executes it, so the thing under test is the bytes CI runs. (codacy on
+maxi-config#790.)
+
+Run directly: `python3 tests/test_lane_decisions.py`.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import tempfile
+import types
+import unittest
+
+import yaml
+
+import ast
+
+# Module-level helpers for the merge-gate event-filter evaluator. Kept out
+# of the test class so a future widening of the supported GitHub Actions
+# grammar adds a new method here, not a new branch inside a 200-line method.
+class _NullSafe(types.SimpleNamespace):
+    """SimpleNamespace that returns None for missing attributes.
+
+    GitHub Actions returns null on `event.<missing>` and the comparison
+    `null == 'foo'` is false; Python's SimpleNamespace raises AttributeError,
+    which would mask the very case the test is checking.
+    """
+    def __getattr__(self, name: str) -> object:
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return None
+
+    @classmethod
+    def github(cls, event_name: str, event_obj: object) -> "_NullSafe":
+        wrapped = _wrap_dict({
+            "event_name": event_name,
+            "event": event_obj,
+            "repository": "maxi-tools/ci",
+        })
+        if not isinstance(wrapped, _NullSafe):
+            raise ValueError("github() expects a dict-shaped event")
+        return wrapped
+
+
+def _wrap_dict(value: object) -> object:
+    if isinstance(value, dict):
+        return _NullSafe(**{k: _wrap_dict(v) for k, v in value.items()})
+    return value
+
+
+class _Translate:
+    """GitHub Actions expression -> Python expression source.
+
+    `&&` -> `and`, `||` -> `or`, `always()` -> True. The result is a small
+    expression over the supported operators, not arbitrary user input --
+    the test loader reads the bytes straight from the workflow file and the
+    test corpus is the workflow itself.
+    """
+    @staticmethod
+    def gha_to_python(expr: str) -> str:
+        return (expr.replace("&&", " and ")
+                   .replace("||", " or ")
+                   .replace("always()", "True"))
+
+
+class _Walk:
+    """Bounded AST walker for the GitHub Actions grammar we use.
+
+    Dispatches per node type so adding a node kind is a new branch on the
+    class, not a new `isinstance` deep inside a function. The grammar is
+    the union of BoolOp, Compare, Name, Attribute, Constant -- anything
+    else raises ValueError, which fails the test loudly instead of
+    silently reading whatever `eval` happens to allow.
+    """
+    @staticmethod
+    def evaluate(node: ast.AST, ns: dict) -> object:
+        if isinstance(node, ast.Expression):
+            return _Walk.evaluate(node.body, ns)
+        if isinstance(node, ast.BoolOp):
+            return _Walk.boolop(node, ns)
+        if isinstance(node, ast.Compare):
+            return _Walk.compare(node, ns)
+        if isinstance(node, ast.Name):
+            return _Walk.name(node, ns)
+        if isinstance(node, ast.Attribute):
+            return _Walk.attribute(node, ns)
+        if isinstance(node, ast.Constant):
+            return node.value
+        raise ValueError(f"unsupported node: {type(node).__name__}")
+
+    @staticmethod
+    def boolop(node: ast.BoolOp, ns: dict) -> bool:
+        values = [_Walk.evaluate(v, ns) for v in node.values]
+        if isinstance(node.op, ast.And):
+            return all(values)
+        if isinstance(node.op, ast.Or):
+            return any(values)
+        raise ValueError(f"unsupported BoolOp: {type(node.op).__name__}")
+
+    @staticmethod
+    def compare(node: ast.Compare, ns: dict) -> bool:
+        left = _Walk.evaluate(node.left, ns)
+        for op, right_node in zip(node.ops, node.comparators):
+            right = _Walk.evaluate(right_node, ns)
+            if isinstance(op, ast.Eq) and left != right:
+                return False
+            if isinstance(op, ast.NotEq) and left == right:
+                return False
+            left = right
+        return True
+
+    @staticmethod
+    def name(node: ast.Name, ns: dict) -> object:
+        if node.id == "github":
+            return ns["github"]
+        if node.id in ("True", "False", "None"):
+            return {"True": True, "False": False, "None": None}[node.id]
+        raise ValueError(f"unknown name: {node.id!r}")
+
+    @staticmethod
+    def attribute(node: ast.Attribute, ns: dict) -> object:
+        value = _Walk.evaluate(node.value, ns)
+        return getattr(value, node.attr, None)
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+LANE_PLAN = ROOT / ".github/workflows/lane-plan.yml"
+RUST_CI = ROOT / ".github/workflows/rust-ci.yml"
+
+
+def step_run(path: pathlib.Path, job: str, step_name: str) -> str:
+    """The `run:` body of one named step, or fail loudly."""
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    steps = doc["jobs"][job]["steps"]
+    for step in steps:
+        if step.get("name") == step_name:
+            assert "run" in step, f"{step_name} has no run: block"
+            return step["run"]
+    raise AssertionError(
+        f"{path.name} has no step named {step_name!r}; this test reads that "
+        "step directly and a rename must not silently stop testing it")
+
+
+def run_bash(body: str, env: dict) -> tuple[int, str, dict]:
+    """Execute a step body with a real GITHUB_OUTPUT, return its outputs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_file = pathlib.Path(tmp) / "out"
+        out_file.touch()
+        proc = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-c", body],
+            env={"PATH": os.environ.get("PATH", ""),
+                 "GITHUB_OUTPUT": str(out_file), **env},
+            capture_output=True, text=True, timeout=30,
+        )
+        outputs = {}
+        for line in out_file.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                outputs[key] = value
+        return proc.returncode, proc.stdout + proc.stderr, outputs
+
+
+class ClassifyChangeScope(unittest.TestCase):
+    def scope(self, changed_files: str):
+        body = step_run(LANE_PLAN, "lane-plan", "Classify change scope")
+        rc, log, outputs = run_bash(body, {"CHANGED_FILES": changed_files})
+        self.assertEqual(rc, 0, log)
+        return outputs.get("scope"), outputs.get("scope_reason", "")
+
+    def test_an_empty_list_is_a_failed_lookup_not_a_docs_only_pr(self):
+        """THE defect: nothing to classify must not mean nothing to test."""
+        for empty in ("", "\n", "   \n\n"):
+            with self.subTest(value=repr(empty)):
+                scope, reason = self.scope(empty)
+                self.assertEqual(scope, "full")
+                self.assertIn("lookup returned nothing", reason)
+
+    def test_a_docs_only_change_still_skips(self):
+        """The optimisation must survive the fix, or it is not a fix."""
+        scope, reason = self.scope("README.md\ndocs/design.md\nCHANGELOG.md")
+        self.assertEqual(scope, "merge-gate-only")
+        self.assertIn("documentation", reason)
+
+    def test_one_code_path_among_docs_is_full(self):
+        scope, reason = self.scope("README.md\nsrc/main.rs\ndocs/x.md")
+        self.assertEqual(scope, "full")
+        self.assertIn("src/main.rs", reason)
+
+    def test_a_lockfile_is_not_documentation(self):
+        scope, _ = self.scope("Cargo.lock")
+        self.assertEqual(scope, "full")
+
+    def test_a_dotfile_and_a_workflow_are_not_documentation(self):
+        for path in (".github/workflows/rust-ci.yml", "ci/runner-routing.toml"):
+            with self.subTest(path=path):
+                self.assertEqual(self.scope(path)[0], "full")
+
+
+LANES = ("plan", "check", "test", "package", "sign-publish", "release-verify")
+
+
+def all_lanes(outputs: dict | None = None, **results) -> dict:
+    """A full `toJSON(needs)`: every lane `success` unless overridden. Plan
+    outputs default to an ordinary PR verdict (full scope, packaging impact)."""
+    plan_outputs = {"scope": "full", "packaging_impact": "true"}
+    plan_outputs.update(outputs or {})
+    return {name: {"result": results.get(name.replace("-", "_"), "success"),
+                   "outputs": plan_outputs if name == "plan" else {}}
+            for name in LANES}
+
+
+class AggregateLaneResults(unittest.TestCase):
+    """Executes the REAL aggregate step. Since maxi-config#1028 (verifier
+    t_e5bf80a3 criterion a) a skipped lane passes only with a RECORDED
+    reason, and a lane missing from `needs` fails closed."""
+
+    def aggregate(self, needs: dict, **env):
+        body = step_run(RUST_CI, "merge-gate", "Aggregate lane results")
+        base = {"MERGE_GATE_NEEDS": json.dumps(needs),
+                "EVENT_NAME": "pull_request",
+                "GIT_REF": "refs/pull/1/merge",
+                "PLAN_SCOPE": (needs.get("plan") or {}).get("outputs", {}).get("scope", ""),
+                "CI_DEGRADED_UNTIL_VALUE": "2999-01-01"}
+        base.update(env)
+        return run_bash(body, base)
+
+    def test_every_lane_successful_passes(self):
+        rc, log, _ = self.aggregate(all_lanes())
+        self.assertEqual(rc, 0, log)
+
+    def test_an_explained_skip_is_fine(self):
+        # Release lanes off a release ref, package on the planner's
+        # packaging_impact=false, check on the planner's docs-only verdict.
+        rc, log, _ = self.aggregate(all_lanes(
+            outputs={"scope": "merge-gate-only", "packaging_impact": "false"},
+            check="skipped", package="skipped",
+            sign_publish="skipped", release_verify="skipped"))
+        self.assertEqual(rc, 0, log)
+        self.assertIn("recorded reason", log)
+
+    def test_an_unexplained_skip_fails_the_gate(self):
+        for lane, outputs in (("plan", {}), ("package", {}), ("check", {}),
+                              ("sign-publish", None)):
+            with self.subTest(lane=lane):
+                needs = all_lanes(outputs, **{lane.replace("-", "_"): "skipped"})
+                env = {"GIT_REF": "refs/heads/main"} if outputs is None else {}
+                rc, log, _ = self.aggregate(needs, **env)
+                self.assertEqual(rc, 1, log)
+                self.assertIn(f"::error::Required lane {lane!r} was skipped", log)
+
+    def test_failure_and_cancellation_fail_the_gate(self):
+        for result in ("failure", "cancelled"):
+            with self.subTest(result=result):
+                rc, log, _ = self.aggregate(all_lanes(check=result))
+                self.assertEqual(rc, 1)
+                self.assertIn("::error::Required lane 'check'", log)
+
+    def test_an_unrecognised_result_fails_rather_than_passing(self):
+        """THE defect: the old denylist passed anything it did not name."""
+        for result in ("timed_out", "action_required", "neutral", "stale", ""):
+            with self.subTest(result=result):
+                rc, log, _ = self.aggregate(all_lanes(check=result))
+                self.assertEqual(rc, 1, log)
+                self.assertIn("::error::Required lane 'check'", log)
+
+    def test_a_lane_with_no_result_key_fails(self):
+        """A lane that never reported is not a lane that passed."""
+        needs = all_lanes()
+        needs["check"] = {}
+        rc, log, _ = self.aggregate(needs)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("None", log)
+
+    def test_a_lane_missing_from_needs_fails(self):
+        """`needs` empty or partial is a lane that never reported -- it was
+        once read as 'merge-gate-only, fine'; now it fails closed."""
+        for needs in ({}, {"plan": {"result": "success"}}):
+            with self.subTest(needs=sorted(needs)):
+                rc, log, _ = self.aggregate(needs)
+                self.assertEqual(rc, 1, log)
+                self.assertIn("'<missing>'", log)
+
+    # The strict-arm merge_group contract (maxi-kvm merge_group run
+    # 38071103682: a docs-only queue head was ejected on every attempt
+    # because the strict arm rejected the skip the gate's own design
+    # produced). A heavy lane skipped BECAUSE the scope selector's own
+    # output put it out of scope is satisfied in strict; a heavy lane
+    # skipped for any other reason still fails strict.
+    CLOSED_WINDOW = {"CI_DEGRADED_UNTIL_VALUE": "2020-01-01"}
+    # The strict arm is documented to be "satisfied in BOTH windows" on a
+    # scope=merge-gate-only skip. The closed-window test below pins the
+    # closed-arm shape; this one pins the open-arm symmetry so a future
+    # refactor that drops one half can be caught by the test that the
+    # arm's docstring claims to encode.
+    OPEN_WINDOW = {"CI_DEGRADED_UNTIL_VALUE": "2099-01-01"}
+
+    def aggregate_merge_group(self, needs: dict, **env):
+        base = {"EVENT_NAME": "merge_group",
+                "EVENT_ACTION": "checks_requested"}
+        base.update(env)
+        return self.aggregate(needs, **base)
+
+    def test_merge_group_docs_only_scope_skip_passes_strict(self):
+        """scope=merge-gate-only + skipped check/test -> pass in strict:
+        the skip is the gate's own docs-only design on a queue head."""
+        needs = all_lanes(
+            outputs={"scope": "merge-gate-only", "packaging_impact": "false"},
+            check="skipped", test="skipped", package="skipped",
+            sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 0, log)
+
+    def test_merge_group_docs_only_scope_skip_passes_open_window(self):
+        """Same docs-only shape on a merge_group head WITH the degraded
+        window still open -- the strict arm claims BOTH windows are
+        satisfied by an in-scope selector skip; pin that explicitly so a
+        regression that re-ordered the strict-arm branches (the new
+        `plan_scope == 'merge-gate-only' -> pass` branch moves ahead of
+        the historical `degraded_in_window` arm) cannot silently desync
+        the two windows."""
+        needs = all_lanes(
+            outputs={"scope": "merge-gate-only", "packaging_impact": "false"},
+            check="skipped", test="skipped", package="skipped",
+            sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.OPEN_WINDOW)
+        self.assertEqual(rc, 0, log)
+
+    def test_merge_group_code_scope_skip_fails_strict(self):
+        """scope=full + skipped check -> fail in strict: the diff reaches
+        a build, so strict enforcement requires the lane to have run."""
+        needs = all_lanes(check="skipped",
+                          sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 1, log)
+        # The unexplained-skip check runs before the strict merge_group
+        # arm, so the recorded-reason error is the first verdict here;
+        # what matters for the acceptance is the gate FAILS, not which
+        # of the two overlapping checks prints first.
+        self.assertIn("::error::Required lane 'check' was skipped", log)
+
+    def test_merge_group_missing_scope_skip_fails_strict(self):
+        """scope output missing + skipped -> fail in strict: a plan job
+        that fell over before the classifier ran publishes no scope, and
+        an unexplained skip is not merge evidence."""
+        needs = all_lanes(outputs={"scope": ""},
+                          check="skipped", test="skipped",
+                          sign_publish="skipped", release_verify="skipped")
+        rc, log, _ = self.aggregate_merge_group(needs, **self.CLOSED_WINDOW)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("was skipped with no recorded reason", log)
+
+
+# `merge-gate` is the SOLE required context under the post-merge-gate ruleset.
+# The job's `if:` decides whether the rule even exists on a given event --
+# skip it on the wrong event and the ruleset is structurally weaker than the
+# lanes it is supposed to replace. actionlint checks expression syntax, not
+# what it evaluates against. (codacy on maxi-config#790; the same reasoning
+# made this file ship its first two tests.)
+#
+# `always()` is the force-run-on-upstream-failure override, not a boolean
+# value: with it, the job runs even when its needs failed, as long as the
+# rest of the expression is true. Treat it as True in the boolean evaluation
+# so the test reads the EVENT filter, not the failure override -- the
+# override is asserted separately.
+class MergeGateEventFilter(unittest.TestCase):
+    @staticmethod
+    def _if_expr() -> str:
+        doc = yaml.safe_load(RUST_CI.read_text(encoding="utf-8"))
+        expr = doc["jobs"]["merge-gate"]["if"]
+        if not isinstance(expr, str):
+            raise ValueError(f"merge-gate `if:` is not a string: {expr!r}")
+        return expr
+
+    @staticmethod
+    def _evaluates(expr: str, event_name: str, event_obj: object) -> bool:
+        py = _Translate.gha_to_python(expr)
+        ns = {"github": _NullSafe.github(event_name, event_obj)}
+        return bool(_Walk.evaluate(ast.parse(py, mode="eval"), ns))
+
+    @staticmethod
+    def _trust_admits_expr() -> str:
+        """The allowlist inside step 1's `${{ !( ... ) }}` refusal. Trust is
+        step 1 of the job, never its `if:` (maxi-config#1028, verifier
+        t_e5bf80a3 criterion c)."""
+        doc = yaml.safe_load(RUST_CI.read_text(encoding="utf-8"))
+        step = doc["jobs"]["merge-gate"]["steps"][0]
+        if step.get("id") != "trust-admission":
+            raise ValueError("merge-gate step 1 is not the trust admission step")
+        expr = " ".join(str(step["if"]).split())
+        prefix, suffix = "${{ !(", ") }}"
+        if not (expr.startswith(prefix) and expr.endswith(suffix)):
+            raise ValueError(f"trust step if: is not a negated allowlist: {expr!r}")
+        return expr[len(prefix):-len(suffix)].strip()
+
+    def gate_should_run(self, event_name: str, event_obj: object) -> bool:
+        """Publishes a verdict: the job starts AND step 1 admits the run.
+        A fork PR or a lifecycle action starts the job and fails it RED in
+        step 1 -- it does not publish a skipped required context."""
+        return (self._evaluates(self._if_expr(), event_name, event_obj)
+                and self._evaluates(self._trust_admits_expr(), event_name, event_obj))
+
+    def test_pull_request_same_repo_runs(self):
+        """Existing fork-tripwire arm still passes a same-repo PR."""
+        event = {"pull_request": {"head": {"repo": {"full_name": "maxi-tools/ci"}}}}
+        self.assertTrue(self.gate_should_run("pull_request", event))
+
+    def test_pull_request_fork_does_not_run(self):
+        """The fork tripwire still filters a fork PR -- the new merge_group
+        arm must not widen this."""
+        event = {"pull_request": {"head": {"repo": {"full_name": "maxi-tools/attacker"}}}}
+        self.assertFalse(self.gate_should_run("pull_request", event))
+
+    def test_merge_group_checks_requested_runs(self):
+        """The merge-queue caller asks this workflow to emit the required
+        `merge-gate / merge-gate` context on `merge_group` with action
+        `checks_requested`. Without this arm the job is skipped and the
+        ruleset sees no verdict."""
+        event = {"action": "checks_requested"}
+        self.assertTrue(self.gate_should_run("merge_group", event))
+
+    def test_merge_group_other_actions_do_not_run(self):
+        """`merge_group` actions besides `checks_requested` are merge-queue
+        lifecycle events. The aggregate check run must not be created for
+        them: it would be a required-context check run with no upstream
+        lane results to aggregate, and it would block the queue."""
+        for action in ("created", "merged", "pushed", "removed", "deleted"):
+            with self.subTest(action=action):
+                event = {"action": action}
+                self.assertFalse(self.gate_should_run("merge_group", event),
+                                 f"merge_group action={action!r} must not run merge-gate")
+
+    def test_merge_group_with_no_action_does_not_run(self):
+        """Defensive: a malformed merge_group payload without `action` must
+        not mint the required check run."""
+        event = {}
+        self.assertFalse(self.gate_should_run("merge_group", event))
+
+    def test_unrelated_event_names_do_not_run(self):
+        """A `push` or `workflow_dispatch` event must not run merge-gate.
+        The merge-gate is the PR/merge-group aggregate, not a push-triggered one."""
+        for event_name in ("push", "workflow_dispatch", "schedule", "release"):
+            with self.subTest(event_name=event_name):
+                event = {"action": "checks_requested"}  # even with a matching action
+                self.assertFalse(self.gate_should_run(event_name, event))
+
+    def test_if_expression_uses_always_override(self):
+        """The upstream-failure override must still be present in the
+        expression. Without it, a failing `check`/`test` skips merge-gate
+        and the required context vanishes -- which is the failure mode
+        this whole job exists to fix. actionlint cannot catch a deleted
+        `always()`; this test does."""
+        self.assertIn("always()", self._if_expr())
+
+
+if __name__ == "__main__":
+    unittest.main()

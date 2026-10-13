@@ -1,0 +1,306 @@
+name: Verify sibling path-dependency checkouts
+description: >
+  Discover Cargo `path = "../<repo>"` dependencies that resolve outside this
+  checkout, then unconditionally wipe and freshly clone each one at that
+  exact sibling location so the build never depends on what an earlier,
+  unrelated job on the same self-hosted runner happened to leave in _work.
+
+inputs:
+  token:
+    description: >
+      Token for `gh repo clone` reads. Needs contents:read on the org, since
+      the sibling repository is not known until the manifests are parsed.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # WHY THIS STEP EXISTS (maxi-config#286). A self-hosted runner's _work
+    # directory is NOT wiped between jobs. A job whose Cargo.toml carries
+    # `path = "../waterui/backends/apple"` resolves that path against
+    # whatever sits one level above $GITHUB_WORKSPACE on disk -- and until
+    # this step, nothing here ever put anything there or checked that
+    # anything was there. Two failure shapes followed from that gap:
+    #
+    #   1. Absent sibling: `cargo fetch`/`cargo build` fails minutes later
+    #      with "failed to read /path/to/../waterui/.../Cargo.toml", which
+    #      reads as a build defect, not a missing checkout.
+    #   2. Accidental presence: an unrelated EARLIER job on the SAME runner
+    #      checked out (or built into) that same parent directory, and
+    #      leaves a tree there that satisfies cargo's path resolution by
+    #      coincidence. The job then reports green having built against
+    #      content that this job's own workflow never fetched, reviewed, or
+    #      even named -- a false-positive success indistinguishable from a
+    #      correct one until the sibling changes underneath it.
+    #
+    # Both are closed the same way: never trust anything already at the
+    # sibling path. Delete it, clone fresh, verify the clone. A job that
+    # cannot get its own sibling fails here, attributably, before spending
+    # any more runner time; a job that gets one never runs against a
+    # leftover, because there is no code path that skips the clone.
+    #
+    # Discovery walks every Cargo.toml in the checkout (workspace root and
+    # members) for `path = "../..."` entries that resolve outside the
+    # checkout root -- exactly the qodana.yml sibling-checkout logic
+    # (workflows/qodana.yml), reused here because the escape detection is
+    # identical; only the destination and clone depth differ (qodana mounts
+    # read-only under $RUNNER_TEMP for a container, this clones directly to
+    # the path cargo itself will resolve).
+    #
+    # Only Cargo's recognised dependency tables are walked:
+    #   [dependencies], [dev-dependencies], [build-dependencies],
+    #   [workspace.dependencies], [patch.<registry>], and the deprecated
+    #   [replace] block. Anything else -- e.g. [package.metadata.<tool>]
+    #   with its own `path` keys -- is intentionally ignored; treating
+    # those as Cargo path dependencies would `rm -rf` directories Cargo
+    # never reads.
+    - name: Discover sibling path dependencies
+      id: discover
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Discover uses stdlib `tomllib`, which is Python 3.11+. The
+        # org's macOS runners ship python@3.14 and the GitHub-hosted Linux
+        # images ship 3.13; both are fine. A self-hosted NixOS box that
+        # exposes an older `python3` would fail with a bare ImportError at
+        # the top of the embedded script; surface a clear, attributable
+        # error here instead of letting the traceback reach the runner
+        # log, and the lane-plan tool check already gates boxes that have
+        # no `python3` on PATH at all.
+        if ! python3 -c 'import sys, tomllib; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+          echo "::error::verify-sibling-checkouts requires python3 >= 3.11 (tomllib); the runner's python3 is too old. Lane-plan already gates the absence of python3; this gate covers the version."
+          exit 1
+        fi
+        discover="$RUNNER_TEMP/sibling-discover.py"
+        cat > "$discover" <<'PY'
+        import os, pathlib, sys, tomllib
+
+        root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        skip = {
+            ".git", "target", ".worktrees", ".maxi-worktrees",
+            "node_modules", "vendor",
+        }
+
+        def harvest_dep_table(table):
+            """[dependencies] / [dev-dependencies] / [build-dependencies]
+            / [workspace.dependencies] -- a name -> dep-spec table. Each
+            spec is either a string (version) or a table that may carry
+            `path`. Skip string specs."""
+            if not isinstance(table, dict):
+                return
+            for v in table.values():
+                if isinstance(v, dict) and isinstance(v.get("path"), str):
+                    yield v["path"]
+
+        def harvest_patch_table(table):
+            """[patch.<registry>] -- registry name -> crate-name -> spec."""
+            if not isinstance(table, dict):
+                return
+            for reg in table.values():
+                if not isinstance(reg, dict):
+                    continue
+                for v in reg.values():
+                    if isinstance(v, dict) and isinstance(v.get("path"), str):
+                        yield v["path"]
+
+        def harvest_replace_table(table):
+            """[replace] -- crate-name -> spec (single map, not registry-
+            scoped). Same shape as a dependency spec."""
+            if not isinstance(table, dict):
+                return
+            for v in table.values():
+                if isinstance(v, dict) and isinstance(v.get("path"), str):
+                    yield v["path"]
+
+        siblings = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+            if "Cargo.toml" not in filenames:
+                continue
+            manifest = pathlib.Path(dirpath) / "Cargo.toml"
+            try:
+                doc = tomllib.loads(manifest.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, tomllib.TOMLDecodeError) as exc:
+                print(f"::error::cannot read {manifest}: {exc}", file=sys.stderr)
+                sys.exit(1)
+            paths = []
+            # Top-level dependency tables. tomllib parses nested tables as
+            # nested dicts, so `[workspace]` and `[workspace.dependencies]`
+            # both appear under doc["workspace"]; harvest_dep_table is
+            # called on both shapes directly.
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                paths.extend(harvest_dep_table(doc.get(key)))
+            ws = doc.get("workspace")
+            if isinstance(ws, dict):
+                paths.extend(harvest_dep_table(ws.get("dependencies")))
+            # Target-specific dependency tables. `[target.'cfg(...)'.dependencies]`
+            # is parsed as doc["target"][<triple-quoted key>]["dependencies"],
+            # so walk the target map and harvest every {dependencies, dev-
+            # dependencies, build-dependencies} table under it. These are
+            # the tables Cargo consults when the matching cfg is active --
+            # e.g. Apple lanes resolve `[target.'cfg(target_os = "macos")'.
+            # dependencies]`, so missing or stale siblings there would
+            # otherwise surface as cargo-time errors on the lane the issue
+            # documents.
+            target = doc.get("target")
+            if isinstance(target, dict):
+                for t in target.values():
+                    if not isinstance(t, dict):
+                        continue
+                    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                        paths.extend(harvest_dep_table(t.get(key)))
+            # `[patch.<registry>]` may live at doc["patch"] (single
+            # registry block) or under doc["workspace"]["patch"] (the
+            # workspace-wide patch). Either way it's a registry map.
+            for patch_root in (doc.get("patch"), (ws or {}).get("patch")):
+                paths.extend(harvest_patch_table(patch_root))
+            # Deprecated `[replace]` -- Cargo still honours it on 1.95.
+            paths.extend(harvest_replace_table(doc.get("replace")))
+            for raw in paths:
+                # `os.path.normpath` first, then re-check for `..` in the
+                # segment. A `path = "./../foo/crate"` declaration would
+                # be skipped by a raw `startswith("..")` check even though
+                # it normpath()s to `../foo/crate`; without normalisation
+                # the lane retains both original failure modes (missing
+                # manifest, false-positive green against a stale sibling).
+                if not os.path.normpath(raw).split(os.sep)[0].startswith(".."):
+                    # Pure intra-tree path, e.g. `path = "crates/foo"` or
+                    # `path = "./crates/foo"`. Cargo resolves it under
+                    # this checkout and the lane already handles it.
+                    continue
+                # Lexical normalisation. `Path.resolve()` follows symlinks
+                # on disk, which means a leftover sibling at ../waterui
+                # that points at ../waterui-old would resolve to the wrong
+                # repository -- the action would clone the wrong tree and
+                # leave a stale symlink in place for cargo to follow. Decide
+                # the sibling from the manifest, not from the runner.
+                resolved = pathlib.Path(os.path.normpath(manifest.parent / raw))
+                try:
+                    resolved.relative_to(root)
+                    continue
+                except ValueError:
+                    pass
+                # root/../<name> normpath()s away the `..`, so the sibling
+                # is the first path component that departs from the
+                # checkout root's own parts.
+                root_parts = root.parts
+                parts = resolved.parts
+                if len(parts) < len(root_parts):
+                    print(
+                        f"::error::{manifest.relative_to(root)} path {raw} "
+                        f"resolves to {resolved}, which is the checkout's "
+                        "parent or above; a Cargo path dependency must name "
+                        "a sibling of this checkout, not the checkout itself",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                if parts[: len(root_parts)] == root_parts:
+                    continue
+                if parts[: len(root_parts) - 1] != root_parts[:-1]:
+                    print(
+                        f"::error::{manifest.relative_to(root)} path {raw} "
+                        f"escapes to {resolved}, which is not a direct sibling "
+                        "of this checkout",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                name = parts[len(root_parts) - 1]
+                siblings.setdefault(name, set()).add(str(manifest.relative_to(root)))
+        for name in sorted(siblings):
+            where = ", ".join(sorted(siblings[name]))
+            print(f"sibling: {name} (from {where})", file=sys.stderr)
+            print(name)
+        PY
+        # Write names to a file first (see qodana.yml's sibling step for why
+        # the process-substitution alternative hides a discover failure):
+        # `read -r < <(python3 discover.py)` does not apply `set -e` to a
+        # command whose output is only redirected, so a discover script that
+        # exits 1 would hand the read an empty stream and this step would
+        # report "no sibling dependency" for a tree it could not read.
+        names_file="$RUNNER_TEMP/sibling-names"
+        python3 "$discover" > "$names_file"
+        {
+          echo "has_siblings<<SIBLING_EOF"
+          if [ -s "$names_file" ]; then echo "true"; else echo "false"; fi
+          echo "SIBLING_EOF"
+        } >> "$GITHUB_OUTPUT"
+        cp "$names_file" "$RUNNER_TEMP/sibling-names-verified"
+
+    - name: Verify sibling checkouts are present and fresh
+      if: steps.discover.outputs.has_siblings == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        # `read` instead of `mapfile`: macOS runners ship Bash 3.2 by
+        # default, and `mapfile` was added in Bash 4. The Apple lanes are
+        # the documented example for this action, so the portable form
+        # matters more than the brevity.
+        names=()
+        while IFS= read -r name; do
+          names+=("$name")
+        done < "$RUNNER_TEMP/sibling-names-verified"
+        org="${GITHUB_REPOSITORY_OWNER}"
+        checkout_root="$(cd "$GITHUB_WORKSPACE" && pwd)"
+        parent="$(dirname "$checkout_root")"
+        for name in "${names[@]}"; do
+          # A sibling repo name is a GitHub repository name. Reject anything
+          # else before it is interpolated into a path or a clone URL.
+          case "$name" in
+            *[!A-Za-z0-9_.-]*|""|.*|-*|_*|*..*)
+              echo "::error::refusing sibling checkout name: ${name}"
+              exit 1
+              ;;
+          esac
+          dest="$parent/$name"
+          # UNCONDITIONALLY discard whatever is already there. A previous,
+          # unrelated job on this self-hosted runner may have left a tree at
+          # exactly this path -- accepting it on the strength of merely
+          # existing is the false-positive-green failure mode this step
+          # exists to close. Nothing here inspects `dest` before removing it.
+          rm -rf "$dest"
+          echo "::group::checking out ${org}/${name} -> ${dest}"
+          # Explicit HTTPS scheme. `gh repo clone <owner>/<repo>` defers to
+          # git_protocol from the host's gh config, which on a persistent
+          # runner may be SSH -- the resulting clone then authenticates
+          # with the runner's SSH key (broader scope than this job's app
+          # token) instead of with GH_TOKEN. The explicit URL keeps
+          # authentication scoped to the token this step received.
+          # Cleanup-on-failure: a clone that fails midway leaves $dest
+          # with the authenticated remote URL written into a half-
+          # initialised $dest/.git, and a hard set -e exit short-circuits
+          # the post-clone `rm -rf $dest/.git` below. Without this the
+          # runner would carry the token URL until the next job wiped the
+          # path itself. Set AFTER `rm -rf $dest` so a successful path
+          # doesn't trigger the trap on the just-cloned tree; cleared
+          # explicitly once the safe state is reached.
+          cleanup_dest() {
+            rm -rf "$dest"
+          }
+          trap 'cleanup_dest' EXIT
+          if ! gh repo clone "https://github.com/${org}/${name}.git" "$dest" -- --depth=1 --quiet; then
+            echo "::endgroup::"
+            echo "::error::required sibling path dependency '../${name}' " \
+                 "could not be checked out (gh repo clone ${org}/${name} " \
+                 "failed). This build depends on ../${name} via a Cargo.toml " \
+                 "'path' entry; the dependency must exist as a real, " \
+                 "reachable ${org}/${name} repository or the path entry is " \
+                 "wrong."
+            exit 1
+          fi
+          echo "::endgroup::"
+          # The clone URL carried the token. Drop the whole .git directory
+          # (not just .git/config): the clone wrote the authenticated URL
+          # into config, the resolved HEAD ref into HEAD, a wire ref into
+          # refs/, and so on, and `cargo` itself only needs the working
+          # tree. Anything left behind is a place where the token can
+          # leak or where a future job can be misled into thinking this
+          # sibling is an in-tree workspace member.
+          rm -rf "$dest/.git"
+          # Past this point the trap would only destroy verified work, so
+          # disarm it. A later failure in the loop (unrelated to this
+          # clone) still leaves dest behind for inspection.
+          trap - EXIT
+          echo "verified fresh checkout: ../${name}"
+        done

@@ -1,0 +1,138 @@
+# This repository had no CI of its own.
+#
+# Every other file here is a `workflow_call` reusable, so none of them runs on
+# a pull request. A change landed with three review-bot checks -- CodeRabbit,
+# cubic, qlty -- and nothing that read the YAML. Meanwhile ~48 repositories
+# execute these files at a pinned sha.
+#
+# It showed. PR #10 shipped the fan-out guard comparing `user.login` against
+# a bot name, in a file whose own `plan` job pins its owner by NUMERIC ID and
+# says why three lines further up. Nothing here objected. It was caught by
+# Codacy, days later, on maxi-config's mirror of the same file -- by accident
+# of the mirror existing, not by any gate in this repository.
+#
+# HOSTED, not self-hosted, and deliberately. This repository is PUBLIC, which
+# is the entire reason it exists (GitHub will not resolve a `uses:` from a
+# public repository into a private one). Fork pull requests are therefore
+# expected here, and fork code must never reach the org's self-hosted fleet.
+# actionlint takes seconds, so the hosted cost is small and the isolation is
+# worth more than the minutes.
+name: Self-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only. This lane only reads YAML; a token that can write is a token a
+# fork pull request could aim at something.
+permissions:
+  contents: read
+
+concurrency:
+  group: self-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          # Nothing here pushes, so the runner should not carry the credential
+          # into .git/config.
+          persist-credentials: false
+
+      - name: actionlint
+        # Reads every workflow, checks expression syntax, and shellchecks the
+        # `run:` blocks. A malformed `if:` in a reusable is not a local bug --
+        # it is ~48 repositories failing at once.
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          files: ".github/workflows/*.yml"
+          fail-on-error: true
+
+      - name: Check `uses:` references
+        # Two properties actionlint does not cover: that a relative call
+        # resolves inside this repository, and that every external action is
+        # sha-pinned. Both fail somewhere other than here.
+        run: python3 .github/scripts/check_workflow_refs.py
+
+      - name: Smoke-test fanout_ci_pin.py
+        # The fan-out is a real script, not just a doc, and is invoked from
+        # fanout-ci-pin.yml with the org token. A script that crashes on a
+        # bad tip is invisible until a real fan-out runs (which may take a
+        # week), so this step proves the script accepts a valid sha,
+        # rejects an invalid one, and exits cleanly with an empty consumer
+        # list. The plan step is exercised by fanout-ci-pin.yml's weekly
+        # cron, where the org token is present.
+        run: |
+          set -euo pipefail
+          sha=0000000000000000000000000000000000000000
+          if python3 .github/scripts/fanout_ci_pin.py --tip "$sha" --help >/dev/null; then
+            :
+          else
+            echo "ERROR: fanout_ci_pin.py --help exited non-zero" >&2
+            exit 1
+          fi
+          # Bad tip: script must exit non-zero.
+          if python3 .github/scripts/fanout_ci_pin.py --tip "not-a-sha"; then
+            echo "ERROR: fanout_ci_pin.py accepted a non-sha tip" >&2
+            exit 1
+          fi
+          # Good tip --dry-run --json must exit zero and emit JSON.
+          # GITHUB_SHA is the merge commit on a PR merge, and the
+          # pushed commit on a direct push; the fan-out's `--tip` is
+          # always one of those. The checkout may be shallow, so we
+          # cannot assume `git rev-parse` of an arbitrary sha resolves;
+          # the script only validates the SHA FORMAT (40-char hex),
+          # which the env var satisfies.
+          sha="${GITHUB_SHA:?GITHUB_SHA is required}"
+          empty_list="$(mktemp)"
+          trap 'rm -f "$empty_list"' EXIT
+          : > "$empty_list"
+          python3 .github/scripts/fanout_ci_pin.py \
+            --tip "$sha" --consumer-list-file "$empty_list" --dry-run --json
+          echo 'fanout_ci_pin.py accepts, rejects, and exits cleanly on an empty list'
+
+      - name: Run the test suites
+        # Each file directly, by name, with a failure flag -- the same
+        # shape as maxi-config's script-tests lane, for the same reason:
+        # `unittest discover` needs an importable start directory, and a
+        # suite nobody lists here is run by nothing. tests/
+        # test_dedupe_review_threads.py (52 tests) sat unrun from ci#9 to
+        # ci#29 -- the smoke test above was this repository's only
+        # Python check, and it proves the fan-out script parses, not
+        # that it fans out. test_fanout_ci_pin.py is the one that
+        # would have caught --json returning before execution.
+        run: |
+          set -euo pipefail
+          # workspace-guard parses YAML; hosted Python does not guarantee PyYAML.
+          python3 -m venv "$RUNNER_TEMP/moments-python"
+          . "$RUNNER_TEMP/moments-python/bin/activate"
+          python3 -m pip install PyYAML==6.0.3
+          failed=0
+          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py; do
+            echo "== $t"
+            if ! python3 "$t"; then
+              echo "::error file=$t::$t failed"
+              failed=1
+            fi
+          done
+          # Non-vacuity: every tests/test_*.py must be in the list above.
+          for f in tests/test_*.py; do
+            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py " in
+              *" $f "*) ;;
+              *) echo "::error file=$f::$f exists but is not run by this lane; add it to the list"; failed=1 ;;
+            esac
+          done
+          exit "$failed"
+
+      - name: Browser regression for moments gallery
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/moments-browser" --no-save playwright@1.63.0
+          export NODE_PATH="$RUNNER_TEMP/moments-browser/node_modules"
+          "$RUNNER_TEMP/moments-browser/node_modules/.bin/playwright" install chromium
+          node tests/test_moments_gallery_browser.js

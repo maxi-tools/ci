@@ -1,0 +1,922 @@
+# Reusable review gate. Called by the thin wrapper that maxi-config fans out
+# to every repo as .github/workflows/review-gate.yml.
+#
+# The -reusable suffix is load-bearing: maxi-config is itself a fan-out
+# target, so an installed wrapper named review-gate.yml would land on top
+# of this file, fail the ownership-marker check, and take the whole
+# fan-out non-zero.
+#
+# Refuses a PR that has unresolved review threads, or that nobody but its
+# author has reviewed. The second condition is deliberately phrased as
+# NON-AUTHOR reviewers rather than 「has reviews」: every agent lane in this org
+# authenticates as the same account, so a PR can carry several reviews that are
+# all self-review, and a count of reviews would be satisfied by the author
+# reviewing their own work.
+#
+# It has two routes, and either one satisfies it:
+#
+#   A. an APPROVED review of the CURRENT head SHA, from a review bot on the
+#      trusted allowlist (`TRUSTED_REVIEW_BOTS` in the gate -- one list, in one
+#      place) or from a human account that is not the author.
+#      (Maxi decision, 2026-09-28: bots count if they approve.)
+#   B. a counted review from one of the reviewers the roster selector published
+#      in `asked` -- unchanged from before route A existed. It is kept because
+#      nothing in this fleet submits an approval today: measured 2026-09-28
+#      across 604 open PRs in 19 repositories, the review states are COMMENTED
+#      3001, CHANGES_REQUESTED 5, DISMISSED 4, APPROVED 0. A condition that
+#      accepted route A alone would be unsatisfiable on every PR in the org.
+#
+# An APPROVED review is route A's business and route A's only, so an approval
+# of a superseded revision satisfies neither route -- including for a reviewer
+# the roster asked for. Route B stays commit-blind, because a comment is what
+# the reviewers in this fleet post and re-anchoring it would red the org; with
+# no roster published yet it credits a review bot rather than any account.
+#
+# The decision logic is .github/actions/pr-review-gate and its truth table is
+# pinned in tests/test_pr_review_gate.py, which unittest discovery runs.
+
+name: Review gate
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: >
+          Runner label for this job, as a bare label or a JSON array string.
+          A tiny job -- two API calls and a python script.
+        required: false
+        type: string
+        # A JSON array string, not a bare label: the default has to be a
+        # multi-label selector, and `runs-on:` below decodes it. A bare label
+        # would be matched as one literal label named `["self-hosted", ...]`.
+        #
+        # Hosted runners are deliberately not the default: when hosted capacity
+        # is unavailable the gate fails with zero steps on every PR, which reads
+        # on the PR page as "this PR has unresolved threads" rather than "no
+        # runner existed" -- the worst possible misreport for this particular
+        # check.
+        #
+        # There is no selector that unions this fleet's POSIX pools: runner
+        # labels are AND-ed, and the only label common to every box also matches
+        # Windows, where the bash steps below are not portable. Selecting on a
+        # capability label to mean "POSIX box with a toolchain" was rejected as
+        # well -- a label that describes hardware silently starts matching the
+        # wrong machines the day that hardware changes.
+        #
+        # This job is two API calls and a python script; nothing here is arch-
+        # or platform-specific -- so no arch label either. `Linux` alone keeps
+        # Windows out and admits both Linux pools; measured 2026-09-18 the X64
+        # pool was 14/14 busy with 71 jobs queued while ARM64 had a slot idle.
+        # Any caller that wants a different lane can pass `runs_on`; this is a
+        # default, not a pin. Because this file is consumed @main, changing it
+        # takes effect everywhere without a fan-out.
+        default: '["self-hosted", "Linux"]'
+
+permissions: {}
+
+jobs:
+  # The preemptive half of the collapse. The caller's wrapper holds one
+  # concurrency lane per (PR, event) with `cancel-in-progress: false`, so a
+  # review burst queues runs behind the in-flight one instead of cancelling
+  # them. That serialisation covers the head of the burst; this job covers the
+  # OVERFLOW, and it covers it for free.
+  #
+  # A run that reaches a runner spends a slot on a self-hosted pool that is
+  # already exhausted (the org's hosted allowance is gone, so every job here
+  # competes for the same boxes). A run that is SKIPPED by its `if:` never
+  # reaches a runner at all -- GitHub evaluates the condition before
+  # allocation, and a skipped job's check-run concludes SKIPPED, which reads
+  # as a grey pass-equivalent rather than the red CANCELLED the fleet merge
+  # tool refuses. So the question this job exists to answer is "has a newer
+  # run of this lane already started for this head SHA?", and the answer is
+  # cheap: it is the same listing the two publishers below already make, and
+  # it costs nothing when the answer is "no" either, because a skipped job
+  # skips its steps.
+  #
+  # WHEN THE LOOKUP CANNOT BE MADE the job does NOT skip. The listing needs
+  # `actions: read` on the CALLER, and a reusable workflow cannot elevate the
+  # caller's token; during a fan-out there is a window where a consumer has
+  # not granted it yet. An unreadable answer is not evidence that a newer run
+  # exists, so the honest reading is "evaluate", and that is what the `if:`
+  # below does: a failed lookup leaves the output unset, the comparison is
+  # false, and the downstream jobs run exactly as they did before this job
+  # existed. Losing the skip is a far smaller fault than skipping a run that
+  # was entitled to write the verdict.
+  #
+  # KEYED ON THE EVENT, not just the head SHA. The lane split exists because a
+  # comment burst must not be able to take the `pull_request` run off the board
+  # (maxi-ml #2235/#2259/#2263/#2264). A freshness check that ignored the event
+  # would reintroduce exactly that: the comment run that started a second later
+  # would make the code run look stale and skip it. The listing filters on
+  # `event`, so a run is only stale against a NEWER run of its own lane.
+  #
+  # ORDERED BY run_started_at, WITH THE RUN ID AS A TIE-BREAK, for the same
+  # reason the publishers below are: GitHub keeps the run id across a re-run
+  # and increments the attempt, so an operator who resolves the last thread and
+  # re-runs an older run is producing the NEWEST evaluation under an OLDER id.
+  # Comparing ids alone made that re-run a no-op. run_started_at resets on
+  # re-run; the id only breaks ties.
+  supersede-check:
+    name: 'per-run: superseded by a newer run of this lane?'
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      superseded: ${{ steps.freshness.outputs.superseded }}
+    # Same-repo only, like every other self-hosted job in this file. A fork
+    # PR's run reaches this job otherwise, and the fork guard
+    # (tests/test_self_hosted_fork_guard.py) rejects a self-hosted lane that a
+    # fork can reach. Skipping here is safe in a way it is not for the jobs
+    # below: a skipped dependency skips its dependents, and a fork PR that
+    # skips the whole gate publishes nothing, which leaves the verdicts
+    # pending and blocks rather than permits. The downstream jobs' own
+    # same-repo checks stay, because each of them can also be reached through
+    # a path this one does not cover.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Check gh is on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A warning, not a failure. This job's only product is a signal that
+          # the downstream jobs may ignore, and a missing `gh` is an unreadable
+          # listing, which the contract above says evaluates rather than skips.
+          # Exiting non-zero here would skip `invalidate`, `dedupe` and `gate`
+          # through `needs:` and take the verdict off the board for a run that
+          # was entitled to write it -- the exact outcome the fail-open branch
+          # in the next step exists to prevent. (codacy, on the PR that added
+          # this.)
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::warning::gh is absent on ${RUNNER_NAME:-this runner}; this lane cannot tell whether a newer run exists, so it will evaluate"
+          fi
+
+      - name: Is a newer run of this lane already evaluating this head?
+        id: freshness
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          echo "superseded=false" >> "$GITHUB_OUTPUT"
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "::warning::no pull request head sha in the payload; evaluating rather than skipping"
+            exit 0
+          fi
+          # FAILS OPEN, deliberately, and for the same reason the publishers
+          # below do: the listing needs `actions: read` on the CALLER, which a
+          # reusable workflow cannot elevate, and there is a fan-out window
+          # where a consumer has not granted it yet. An unreadable listing is
+          # not evidence of a newer run, so the honest reading is "evaluate".
+          # The workflow is named by ID, not by the filename in GITHUB_WORKFLOW_REF.
+          #
+          # That variable names the workflow file of the run, and inside a
+          # reusable workflow the run's file is the CALLEE -- review-gate-
+          # reusable.yml, which lives in maxi-tools/ci and does not exist in the
+          # caller's repository. A listing built from it 404s on every consumer,
+          # and a 404 here is indistinguishable from "the caller has not granted
+          # actions: read", so the fail-open branch below would fire on every
+          # run and the skip would never happen. The run's own record carries
+          # the workflow id of the CALLER's workflow, which is what the listing
+          # has to be made against. (maxi-reviewer, on the PR that added this.)
+          workflow_id=""
+          if ! workflow_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.workflow_id' 2>/dev/null)" || [ -z "$workflow_id" ]; then
+            echo "::warning::could not read the workflow id for run $GITHUB_RUN_ID (the caller needs actions: read); evaluating rather than skipping"
+            exit 0
+          fi
+          runs=""
+          if ! runs="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?head_sha=$HEAD_SHA&event=$EVENT_NAME&per_page=100" \
+            --jq '.workflow_runs[] | "\(.run_started_at) \(.id)"' 2>/dev/null)"; then
+            echo "::warning::could not list review-gate runs for $HEAD_SHA (the caller needs actions: read); evaluating rather than skipping"
+            exit 0
+          fi
+          [ -n "$runs" ] || exit 0
+          freshest="$(printf '%s\n' "$runs" | sort -k1,1 -k2,2n | tail -n 1 | awk '{ print $2 }')"
+          if [ -n "$freshest" ] && [ "$freshest" != "$GITHUB_RUN_ID" ]; then
+            note="superseded by run $freshest; run $GITHUB_RUN_ID for $EVENT_NAME on $HEAD_SHA will be skipped"
+            echo "$note"
+            echo "$note" >> "$GITHUB_STEP_SUMMARY"
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Both contexts are invalidated HERE, in one job that runs before either leg,
+  # rather than by each leg for itself. A leg that has not started cannot mark
+  # its own context pending, and on a saturated pool one leg routinely starts
+  # while the other queues -- so a stale verdict for the queued condition would
+  # stand, presented as current, for the whole queue depth.
+  #
+  # Deliberately not `always()`-guarded work: if this job cannot post, the legs
+  # still run and still publish their own verdicts. It removes a stale-read
+  # window; it is not part of the decision.
+  invalidate:
+    # `per-run:` for the same reason as the gate legs below: this job's check
+    # run is one run's row, and a PR routinely shows several of them.
+    #
+    # SKIPPED, not cancelled, when a newer run of this lane is already
+    # evaluating the same head. `needs:` makes the skip transitive: a skipped
+    # dependency skips its dependents unless they opt out, and none of the
+    # three jobs below opt out of a skipped `supersede-check`. The `if:` is
+    # what makes the skip a decision rather than an accident -- a
+    # `supersede-check` that FAILED (gh absent, listing refused) must not take
+    # the verdict off the board, so this only fires on the explicit
+    # "superseded" output and not on a missing one. A skipped job needs no
+    # runner and concludes SKIPPED, which is the whole point: the fleet merge
+    # tool scores a cancelled check-run as "not passed" and a skipped one as a
+    # grey pass-equivalent, and a review burst used to leave a dozen of the
+    # former on every bot-reviewed PR.
+    name: 'per-run: invalidate previous verdicts'
+    needs: supersede-check
+    if: needs.supersede-check.outputs.superseded != 'true'
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    steps:
+      # Checked, not provisioned: gh arrives with the runner image, so a box
+      # without it is a box to fix rather than a job to patch. The check stays
+      # because this job's whole purpose is to write statuses with gh, and the
+      # write itself is `continue-on-error` -- so gh's absence would otherwise
+      # be swallowed there and read as a gate that simply chose not to publish.
+      - name: Check gh is on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh is absent on ${RUNNER_NAME:-this runner}; this lane cannot mark the verdicts pending"
+            exit 1
+          fi
+
+      - name: Mark both verdicts pending
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "::warning::no pull request head sha in the payload; not posting a status"
+            exit 0
+          fi
+          # Suppress this write if a FRESHER run for the same head sha exists.
+          #
+          # Ordered by run_started_at, not by run id. GitHub keeps the run id
+          # across a re-run and increments the attempt instead -- the same
+          # behaviour the fleet's stalled-run tooling relies on -- so an operator
+          # who resolves the last thread and re-runs an older run is producing
+          # the NEWEST evaluation while carrying an older id. Comparing ids
+          # alone made that re-run a no-op and left review-gate/* stuck on the
+          # verdict it was meant to replace, which matters most once these
+          # contexts are required. run_started_at resets on re-run, so it
+          # orders attempts correctly; the id only breaks ties.
+          #
+          # FAILS OPEN, deliberately. The lookup needs `actions: read` on the
+          # CALLER, and a reusable workflow cannot elevate the caller's token.
+          # Wrappers gain that permission through per-repo pull requests from
+          # the fan-out, while every repo consumes this file at @main the moment
+          # it lands -- so there is a window where consumers cannot make this
+          # call at all. Under `set -e` a failed lookup would
+          # abort this step BEFORE the publish below, and `continue-on-error`
+          # would hide it: the gate would quietly stop invalidating and keep
+          # a stale verdict standing. Losing the staleness check is a far
+          # smaller fault than losing the write, so an unreadable lookup
+          # publishes and says so.
+          workflow_file="${GITHUB_WORKFLOW_REF%%@*}"
+          workflow_file="${workflow_file##*/}"
+          runs=""
+          if ! runs="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&per_page=100" \
+            --jq '.workflow_runs[] | "\(.run_started_at) \(.id)"' 2>/dev/null)"; then
+            echo "::warning::could not list review-gate runs for $HEAD_SHA (the caller needs actions: read); publishing without a staleness check"
+            runs=""
+          fi
+          if [ -n "$runs" ]; then
+            freshest="$(printf '%s\n' "$runs" | sort -k1,1 -k2,2n | tail -n 1 | awk '{ print $2 }')"
+            if [ -n "$freshest" ] && [ "$freshest" != "$GITHUB_RUN_ID" ]; then
+              echo "run $freshest started later than $GITHUB_RUN_ID; skipping stale invalidation"
+              exit 0
+            fi
+          fi
+          # One description for every event, because every event takes the same
+          # path: invalidate, then gate, then a real verdict. It deliberately
+          # does not name a cause -- a `deleted` review comment reaches here
+          # too, and "unresolved thread opened" would be false for it. Anything
+          # that reads as "no evaluation is coming" invites a redundant re-run
+          # while the gate job is merely queued.
+          for context in review-gate/threads review-gate/non-author-review; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state="pending" \
+              -f context="$context" \
+              -f description="re-evaluating" \
+              -f target_url="$RUN_URL" >/dev/null
+            echo "posted $context=pending for $HEAD_SHA"
+          done
+
+  # Dedupe bot review threads that hit the same lines in the same round.
+  # When two or more review bots flag the same code, every thread still
+  # has to be replied to and resolved before the gate below goes green.
+  # This job posts the duplicate-of reply and resolves the LATER
+  # thread, so the count the gate sees reflects the underlying findings
+  # rather than the multi-bot coverage of each one.
+  #
+  # Runs BEFORE the gate job so its count step sees the post-dedupe
+  # state. The dedupe does its own GraphQL reads, so it does not share
+  # state with the gate; the only ordering is "dedupe finished before
+  # the count is taken".
+  #
+  # NO `continue-on-error` ON THE RUN STEP -- AND NO LONGER CLAIMS TO BE
+  # LOOSEN-ONLY.
+  #
+  # This job historically carried `continue-on-error: true` on its run
+  # step on the grounds that it could only make the gate LOOSER. The
+  # premise was false. A flaky GraphQL call, a missing `python3` on the
+  # runner, a script crash with an uncaught exception -- any of those
+  # failed the step under `set -e`, the `continue-on-error` swallowed
+  # it, and the step showed as a green tick with nothing in the summary
+  # to read. The gate's `needs: dedupe` was satisfied (the job
+  # "succeeded"), the gate ran, and the verdict was published against a
+  # dedupe that did no work. That is the silent-no-op defect the
+  # composite action was rewritten to make impossible: its shell now
+  # writes one of three explicit lines to the summary
+  # (`deduped N threads` / `nothing to dedupe` / `dedupe unavailable:
+  # <reason>`) and exits non-zero on the failure path.
+  #
+  # The contract the new shape enforces: this step's GREEN tick carries
+  # a line, and the only way to get a green tick without a line is to
+  # reach into the composite and undo it. Removing `continue-on-error`
+  # on this calling step is what closes the gap -- a non-zero exit from
+  # the composite now fails THIS step, which fails the JOB, which
+  # causes `gate` (with `needs: [invalidate, dedupe]`) to skip. The
+  # gate skipping on a dedupe failure is strictly safer than the gate
+  # running with a dedupe that published no verdict: a `pending` on
+  # `review-gate/threads` blocks a merge, an empty dedupe with a green
+  # tick does not.
+  #
+  # FORK PRs are still skipped on this job via the `if:` below -- the
+  # dedupe needs `pull-requests: write`, a fork PR's read-only
+  # `GITHUB_TOKEN` cannot carry it, and running on a fork would either
+  # silently no-op or fail outright, both worse than skipping. The gate's
+  # `needs: dedupe` is satisfied on a skipped dedupe, so fork PRs get the
+  # same green-or-red the gate always was. (maxi-review uses the same
+  # `if:` shape to gate App-token work; see its own App-token step.)
+  dedupe:
+    name: 'per-run: dedupe bot review threads'
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    needs: [supersede-check, invalidate]
+    # Both halves are load-bearing and they fail differently, which is why
+    # neither is implied by the other:
+    #
+    #   superseded   a skipped `supersede-check` skips this job through
+    #                `needs:` alone, but a SUCCEEDED one does not, and that is
+    #                the case this exists for. Without the comparison a
+    #                superseded run would still dedupe -- spending a runner and
+    #                posting replies on a PR whose verdict a newer run is about
+    #                to write.
+    #   fork         a fork PR's token is read-only, so the dedupe (which needs
+    #                `pull-requests: write`) cannot run there. Skipping rather
+    #                than failing is what lets `gate` still run: its `if:` opts
+    #                out of a skipped `dedupe` and not of a failed one.
+    if: needs.supersede-check.outputs.superseded != 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      # WRITE: the dedupe posts replies (addPullRequestReviewThreadReply)
+      # and resolves threads (resolveReviewThread). The gate job stays on
+      # `read` -- see the job-level rationale above.
+      pull-requests: write
+    steps:
+      # Composite action in this same repo, mirroring the
+      # collect-pr-review-state and pr-review-gate steps the `gate` job
+      # uses below. The script is co-located with action.yml at
+      # maxi-tools/ci/.github/actions/dedupe-pr-review-threads, so the
+      # reference below resolves at @main without a cross-repo checkout --
+      # which a reusable workflow's job GITHUB_TOKEN cannot make anyway
+      # (it is scoped to the consumer repo and 404s against
+      # maxi-tools/maxi-config). Measured 2026-09-19 on maxi-core#4348
+      # (run 35443912643, job 105914866589): the prior shape's
+      # `actions/checkout` of maxi-config answered `Not Found`, the run
+      # step then died with `No such file or directory` and exit 127, and
+      # the JOB failed -- so `gate: needs: [dedupe]` skipped the gate
+      # and the fix for that morning's org-wide startup failure would
+      # have shipped a gate that publishes no verdict at all, in 42
+      # repos.
+      #
+      # NO `continue-on-error` on this step: the step's contract is that
+      # a green tick carries an explicit summary line, and that
+      # `dedupe unavailable: <reason>` is the only honest sentence the
+      # failure path can write. A non-zero exit from the composite makes
+      # THIS step red, which is the whole point -- see the job header
+      # above for the consequences for the gate.
+      - name: Dedupe bot review threads
+        id: dedupe
+        if: ${{ !cancelled() }}
+        uses: maxi-tools/ci/.github/actions/dedupe-pr-review-threads@main
+        with:
+          github-token: ${{ github.token }}
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          pr: ${{ github.event.pull_request.number }}
+
+  gate:
+    needs: [supersede-check, invalidate, dedupe]
+    # RUNS EVEN IF `dedupe` DID NOT.
+    #
+    # A `needs:` dependency that is skipped or failed skips the dependent job
+    # unless it opts out, and `dedupe` is skipped by its own `if:` on every
+    # FORK pull request. So since that job landed the gate has not run on a
+    # fork at all -- the exact opposite of the "fork contributors get the same
+    # green-or-red the gate always was" the dedupe's own header claims. The
+    # `continue-on-error` above on `invalidate` covers the failure path on
+    # that side; only this `if:` covers the skip, and a lost runner or a
+    # timeout defeats both of them.
+    #
+    # It also runs when `invalidate` failed, in the same direction and for
+    # the same reason: `invalidate` only writes `pending`, and a gate that
+    # reaches a real verdict is strictly better than one that skips because
+    # the placeholder could not be written.
+    #
+    # A SUPERSEDED run skips this job too, and unlike the two cases above that
+    # is decided by the OUTPUT rather than by the dependency's conclusion. A
+    # skipped `supersede-check` would already skip this job through `needs:`,
+    # but the interesting case is a succeeded one: the freshness job ran, found
+    # a newer run of this lane, and said so. Running the gate anyway would
+    # spend a runner to compute a verdict the staleness guards below would then
+    # refuse to publish -- the same work, twice, with the second copy
+    # guaranteed to throw its answer away. Skipping keeps the runner for the
+    # run that is actually going to write the statuses.
+    #
+    # A `dedupe` FAILURE, on the other hand, skips this job. That is the
+    # correct direction: since the dedupe composite was rewritten to fail
+    # the step on mechanism unavailability (no more `continue-on-error`),
+    # a failed dedupe means `dedupe unavailable: <reason>` was written to
+    # the dedupe job's step summary and the gate cannot claim to have
+    # inspected a post-dedupe state. Skipping the gate keeps
+    # `review-gate/threads` `pending`, which blocks a merge; running it
+    # on a dedupe that did not run would publish a verdict without the
+    # evidence the dedupe normally contributes, which is a strictly worse
+    # outcome.
+    #
+    # This job's verdict is the only thing in this file that decides anything.
+    # Nothing upstream of it may be able to take it off the board -- except a
+    # newer run of the same lane, which is entitled to.
+    if: ${{ !cancelled() && needs.supersede-check.outputs.superseded != 'true' }}
+    # The check name IS the spec.
+    #
+    # "review gate" told a reader nothing, so both humans and review bots read
+    # it as "needs an approving human" -- it does not; it needs resolved threads
+    # and one non-author review, which the bots themselves satisfy, either by
+    # approving the current head from the trusted allowlist or by being the
+    # reviewer the roster asked for.
+    #
+    # Three attempts to fix that with WORDING all failed in practice, including
+    # on readers who had just been told what the gate meant. The reason is
+    # structural, not lexical: a passing-state name has to be NEGATED to be
+    # acted on, and negating "A + B" leaves you guessing which of A or B is
+    # false. The guess resolves toward the more salient noun, which is
+    # "review". An `::error::` annotation naming the failing half was added and
+    # is not read, because `gh pr checks` and the PR checks list show the NAME,
+    # and the name is where people stop.
+    #
+    # So: one condition per check, each named as the ACTION it wants. Red on
+    # `resolve-review-threads` has exactly one reading, and the sibling check
+    # staying green rules out the other on sight -- nothing left to negate, so
+    # no guess left to resolve wrongly.
+    #
+    # A matrix rather than two copies of the job: a job IS a check, `name:`
+    # takes the matrix context, and fail-fast off keeps the two conditions
+    # independent. Letting a red thread check cancel the reviewer check would
+    # destroy the very signal that makes the sibling informative.
+    #
+    # These names are pinned as required checks in some consumers' rulesets:
+    # renaming here and updating those rulesets are one change, not two.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - condition: threads
+            check: 'per-run: resolve-review-threads'
+            status_context: review-gate/threads
+            ok_description: no unresolved review threads
+            fail_description: unresolved review threads - resolve them
+          - condition: non-author-review
+            check: 'per-run: awaiting-non-author-review-bots-included'
+            status_context: review-gate/non-author-review
+            ok_description: reviewed by a non-author
+            fail_description: no non-author review yet - resolves itself when an allowlisted review bot approves this head, or any review bot the roster asked for posts
+    # `per-run:` is load-bearing, not decoration.
+    #
+    # This gate judges the PR's CURRENT review state, so it re-runs on every
+    # review and review-comment event, and one head SHA collects five to eight
+    # runs. Each lands in its own check suite, GitHub's rollup aggregates check
+    # runs across ALL suites for the SHA rather than taking the newest, and
+    # there is no mechanism that supersedes a check run from an earlier RUN --
+    # re-running a workflow replaces its own check runs, a new run does not
+    # replace a previous run's. So `gh pr checks` legitimately shows this check
+    # twice on one PR, once `fail` and once `pass`, same name, same SHA.
+    # Reading that list, "is this PR green?" has no answer, and stale rows get
+    # re-investigated as live failures.
+    #
+    # That is not fixable at the check-run level; it is how the rollup works.
+    # The fix already in this file is the COMMIT STATUS -- statuses are
+    # last-write-wins per context, so `review-gate/threads` always carries the
+    # newest verdict. See the long note on the publish step below.
+    #
+    # What IS fixable is the name. `per-run:` tells a reader that duplicates
+    # are expected here and that the row is one run's opinion rather than the
+    # gate's answer, and it makes these visually distinct from the
+    # authoritative `review-gate/threads` status -- which previously looked
+    # like a typo of `review-gate / threads` rather than a different kind of
+    # thing.
+    name: ${{ matrix.check }}
+    # Same decode as lane-check.yml: a bare label passes through, a JSON array
+    # string is parsed into the label list. `runs-on: ${{ inputs.runs_on }}`
+    # alone cannot express a multi-label self-hosted selector -- it would be
+    # matched as one literal label named `["self-hosted", "Linux", "X64"]`.
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      # For the commit status posted at the end of this job. See the step's own
+      # comment for why the verdict is published as a STATUS as well as being
+      # carried by this job's conclusion.
+      statuses: write
+    steps:
+      # The gate needs exactly three things: gh, jq and python3. Nothing else
+      # -- no checkout, no toolchain, no build. That short list is why it can
+      # be pointed at any POSIX lane in the fleet, and this step is what makes
+      # that claim checkable instead of hopeful.
+      #
+      # It checks and no longer provisions: these tools arrive with the runner
+      # image, so a box missing one is a box to fix, not a job to patch.
+      #
+      # A step still stands here because naming the absent tool is the point:
+      # without it gh's absence surfaces as a bare "command not found" several
+      # steps in, and python3's as an unexplained non-zero exit out of the
+      # verdict action -- which is the failure this gate keeps being misread
+      # through.
+      - name: Check the gate's tools are on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in gh jq python3; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::${missing[*]} absent on ${RUNNER_NAME:-this runner}; the review gate cannot run"
+            exit 1
+          fi
+
+      # The tools preflight and the two paginated GraphQL reads moved into a
+      # composite action, so this file holds ONE copy of them across both
+      # matrix legs. Their reasoning -- why gh/jq/python3 and nothing else, why
+      # the nix shim is a Linux-only fallback, why EVERY page is checked for
+      # GraphQL errors -- moved with them unchanged, and is still pinned by
+      # tests/test_review_gate_workflow.py against the action's own file.
+      - uses: maxi-tools/ci/.github/actions/collect-pr-review-state@main
+        id: collect
+        with:
+          github-token: ${{ github.token }}
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          pr: ${{ github.event.pull_request.number }}
+
+      - uses: maxi-tools/ci/.github/actions/pr-review-gate@main
+        id: gate
+        with:
+          payload-path: ${{ steps.collect.outputs.payload-path }}
+          # This leg judges ONE condition, which is what lets its check be
+          # named for the action it wants rather than a two-part passing state.
+          condition: ${{ matrix.condition }}
+
+      # Publish the verdict as a COMMIT STATUS as well, because a check run
+      # cannot express "this superseded the last answer" and a status can.
+      #
+      # THE PROBLEM. This gate judges the PR's CURRENT review state, not a
+      # commit, so it re-runs on every review and review-comment event. Bots
+      # post in bursts, so one head SHA collects five to eight runs -- and the
+      # early ones legitimately fail ("no review from anyone other than the
+      # author") or get cancelled while pending, both of which are RED. Each
+      # run lands in its own check suite, and GitHub's status rollup aggregates
+      # across ALL of them rather than taking the newest. One early red
+      # therefore sticks to the SHA permanently, and once these contexts are
+      # required that blocks a merge until the stale run is re-run by hand.
+      #
+      # WHY A STATUS FIXES IT. Statuses are last-write-wins per context: a
+      # later POST to the same context replaces the earlier verdict outright.
+      # A superseded run's red is overwritten by the run that superseded it,
+      # and a cancelled run never reaches this step at all, so it leaves the
+      # previous verdict standing instead of adding a red of its own.
+      #
+      # NOT `pull_request_review_thread` instead. That is a GitHub App webhook,
+      # not a workflow trigger; adding it makes GitHub reject the whole file
+      # and create zero jobs, which is how this gate ran nowhere in the org
+      # once already.
+      #
+      # continue-on-error, deliberately: this workflow is referenced by every
+      # repo in the org at @main, so a failure here -- a fork PR's read-only
+      # token, an API blip -- must not be able to turn a green gate red. It is
+      # safe to swallow only because the `invalidate` job has already written
+      # `pending` for this context, and `needs:` orders it strictly before this
+      # job: a suppressed failure leaves a non-passing state, not a stale
+      # success.
+      #
+      # TWO KNOWN LIMITS OF A STATUS THAT A CHECK RUN DOES NOT HAVE. Neither is
+      # fixed here, and a ruleset that requires these contexts should be set
+      # knowing both:
+      #
+      #   FORK PULL REQUESTS cannot publish this context at all -- GitHub
+      #   downgrades the pull_request GITHUB_TOKEN to read-only for forks
+      #   whatever permissions are requested -- so a fork PR leaves both
+      #   contexts pending. A repository that needs fork PRs to be mergeable
+      #   should require the check run as well as, or instead of, the status.
+      #
+      # A SECOND limit was listed here -- two open PRs at one head SHA sharing
+      # this context, because a status belongs to the commit rather than to the
+      # pull request, with the last writer deciding for both. It is CLOSED, by
+      # the guard in the publish step below; the reasoning lives with the
+      # guard. Tracked at maxi-tools/maxi-config#625.
+      #
+      # While a ruleset names the check run, this status is additive.
+      - name: Publish the verdict as a commit status
+        # NOT always(): that includes cancellation, and a cancelled run would post
+        # `failure` over a valid verdict -- the exact damage this step exists to stop,
+        # committed by the step itself. !cancelled() runs on success and failure only.
+        #
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The PR HEAD sha, not github.sha -- on a pull_request event the
+          # latter is the ephemeral merge commit, which no ruleset evaluates.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          STATUS_CONTEXT: ${{ matrix.status_context }}
+          OK_DESCRIPTION: ${{ matrix.ok_description }}
+          FAIL_DESCRIPTION: ${{ matrix.fail_description }}
+          # Empty unless a condition passed on a human's assertion rather than
+          # on evidence -- today only `review-infra-unavailable`. See below.
+          GATE_WAIVER: ${{ steps.gate.outputs.waiver }}
+          # Which pull request this run is entitled to speak for. The shared-SHA
+          # guard below needs it to tell "the open PRs at this commit" from
+          # "the open PRs at this commit that are not me".
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "::warning::no pull request head sha in the payload; not posting a status"
+            exit 0
+          fi
+          # Three outcomes, not two. Reporting an interrupted evaluation as `failure`
+          # states a review verdict the gate never reached; `error` says the check did
+          # not complete, which is a different sentence and the true one. Both block a
+          # merge, so nothing is loosened by telling them apart.
+          case "$GATE_OUTCOME" in
+            success)
+              state=success
+              # A waived pass is still a pass, but it must not be DESCRIBED as
+              # the thing it waived. Reporting "reviewed by a non-author" on a
+              # PR nobody reviewed is the same class of defect as the silent
+              # reviewer skip that issue the private tracker traced: a green tick asserting
+              # something other than what happened, indistinguishable on the PR
+              # page from the real thing. The label is one of a closed set the
+              # gate allow-lists before publishing it, not free text.
+              if [ -n "${GATE_WAIVER:-}" ]; then
+                desc="waived by label: $GATE_WAIVER"
+              else
+                desc="$OK_DESCRIPTION"
+              fi ;;
+            failure)
+              state=failure
+              desc="$FAIL_DESCRIPTION" ;;
+            *)
+              state=error
+              desc="gate evaluation did not complete (outcome: ${GATE_OUTCOME:-unknown})" ;;
+          esac
+          # Suppress this write if a FRESHER run for the same head sha exists.
+          #
+          # Ordered by run_started_at, not by run id. GitHub keeps the run id
+          # across a re-run and increments the attempt instead -- the same
+          # behaviour the fleet's stalled-run tooling relies on -- so an operator
+          # who resolves the last thread and re-runs an older run is producing
+          # the NEWEST evaluation while carrying an older id. Comparing ids
+          # alone made that re-run a no-op and left review-gate/* stuck on the
+          # verdict it was meant to replace, which matters most once these
+          # contexts are required. run_started_at resets on re-run, so it
+          # orders attempts correctly; the id only breaks ties.
+          #
+          # FAILS OPEN, deliberately. The lookup needs `actions: read` on the
+          # CALLER, and a reusable workflow cannot elevate the caller's token.
+          # Wrappers gain that permission through per-repo pull requests from
+          # the fan-out, while every repo consumes this file at @main the moment
+          # it lands -- so there is a window where consumers cannot make this
+          # call at all. Under `set -e` a failed lookup would
+          # abort this step BEFORE the publish below, and `continue-on-error`
+          # would hide it: the gate would quietly stop invalidating and keep
+          # a stale verdict standing. Losing the staleness check is a far
+          # smaller fault than losing the write, so an unreadable lookup
+          # publishes and says so.
+          workflow_file="${GITHUB_WORKFLOW_REF%%@*}"
+          workflow_file="${workflow_file##*/}"
+          runs=""
+          if ! runs="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&per_page=100" \
+            --jq '.workflow_runs[] | "\(.run_started_at) \(.id)"' 2>/dev/null)"; then
+            echo "::warning::could not list review-gate runs for $HEAD_SHA (the caller needs actions: read); publishing without a staleness check"
+            runs=""
+          fi
+          if [ -n "$runs" ]; then
+            freshest="$(printf '%s\n' "$runs" | sort -k1,1 -k2,2n | tail -n 1 | awk '{ print $2 }')"
+            if [ -n "$freshest" ] && [ "$freshest" != "$GITHUB_RUN_ID" ]; then
+              echo "run $freshest started later than $GITHUB_RUN_ID; skipping stale verdict"
+              exit 0
+            fi
+          fi
+          # FAIL CLOSED WHEN THIS COMMIT IS NOT THIS PULL REQUEST'S ALONE.
+          #
+          # A status belongs to the COMMIT. Two open PRs whose heads are the
+          # same commit share `review-gate/threads` and
+          # `review-gate/non-author-review`, statuses are last-write-wins per
+          # context, and so the run that posts last decides for BOTH. Push a
+          # second branch at the head of a PR that is red, open a throwaway PR
+          # from it, and that PR -- which has no review threads at all, and
+          # which the first review bot to look at satisfies -- publishes
+          # `success` over the red one. One extra branch, one extra PR, no race
+          # to win, durable until the two heads diverge. (maxi-tools/maxi-config#625.)
+          #
+          # The staleness guard immediately above cannot see this and is not
+          # broken: the throwaway PR's run genuinely IS the freshest run for
+          # this SHA. It is a newer evaluation -- of a different pull request.
+          #
+          # "It needs push access to post the status" is not a mitigation.
+          # Push access is precisely the population this gate exists to
+          # constrain: the gate's whole job is to stop someone who can already
+          # merge from merging their own unreviewed work.
+          #
+          # So: if any OTHER open PR has this head, publish `error` and no
+          # verdict. Three things make that the right shape rather than a
+          # bigger evaluation:
+          #
+          #   `error`, not `failure`, for the same reason the case above draws
+          #   that line -- the gate reached no verdict FOR THIS COMMIT, which
+          #   is not the sentence "this PR failed review". Both block a merge,
+          #   so telling them apart loosens nothing.
+          #
+          #   Every sharing PR's run computes the same `error` from the same
+          #   commit, so last-write-wins stops mattering: there are no longer
+          #   two answers for the race to choose between. That invariance, not
+          #   the ordering, is what closes the hole.
+          #
+          #   It blocks the innocent PR too, and that is the correct
+          #   direction, the same one the soft-supersede branch below takes:
+          #   the worst outcome becomes "two PRs wait until their heads
+          #   diverge", not "an unreviewed PR shows green".
+          #
+          # `.head.sha == env.HEAD_SHA` IS LOAD-BEARING, NOT BELT AND BRACES.
+          # That endpoint lists the open PRs ASSOCIATED with a commit, which
+          # includes every PR whose branch merely CONTAINS it -- so a stacked
+          # child counts, and an unfiltered count would publish `error` on a
+          # perfectly ordinary PR the moment someone branched off it. Measured
+          # on this repo: with #631 and #632 at a1271e7 and #636 stacked on top
+          # of #631, the unfiltered query returned all three and the filtered
+          # one returned exactly the two whose head IS that commit. Without the
+          # filter this guard would redden the normal case, which is a worse
+          # outcome than the bypass it closes. (cubic, on the PR that landed
+          # this.)
+          #
+          # ONLY THE VERDICT PUBLISHER NEEDS THIS. The `invalidate` job writes
+          # to the same shared contexts and is deliberately left alone: it
+          # writes `pending`, `pending` blocks a merge, and this step is the
+          # only place in this file that can write `success`. Guarding a writer
+          # that cannot produce a passing state buys nothing and costs every
+          # run an API call.
+          #
+          # FAILS CLOSED, unlike the staleness lookup above, and the difference
+          # is not a change of heart. That lookup fails open because
+          # `actions: read` is a scope a caller may genuinely not have granted
+          # yet -- consumers take this file at @main before their wrapper is
+          # updated. This lookup reads `pull-requests`, which this job has
+          # ALREADY spent: the collect step's GraphQL reads need it, and without
+          # them `steps.gate.outcome` is never `success`, so no caller can reach
+          # a passing publish without the scope this call wants. An unreadable
+          # answer here is therefore not a missing grant, it is an unanswered
+          # question about whose commit this is -- and a verdict may not be
+          # published without it. Retried first, because one API blip must not
+          # redden every PR in every consumer.
+          other_open_pulls_at_head() {
+            local raw="" attempt="" number="" n=0
+            for attempt in 1 2 3; do
+              if raw="$(gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls?per_page=100" \
+                --jq '.[] | select(.state == "open" and .head.sha == env.HEAD_SHA) | .number' 2>/dev/null)"; then
+                # Unquoted on purpose: the lookup emits one PR number per line
+                # and word splitting on whitespace is exactly the parse wanted.
+                for number in $raw; do
+                  [ "$number" = "${PR_NUMBER:-}" ] || n=$(( n + 1 ))
+                done
+                printf '%s' "$n"
+                return 0
+              fi
+              [ "$attempt" = 3 ] || sleep $(( attempt * 3 ))
+            done
+            printf 'failed'
+          }
+          others="$(other_open_pulls_at_head)"
+          if [ "$others" = failed ]; then
+            state=error
+            desc="could not check whether other open PRs share this head SHA"
+            echo "::warning::could not list the open pull requests at $HEAD_SHA; refusing to publish a verdict for a commit that may not be this PR's alone (maxi-tools/maxi-config#625)"
+          elif [ "$others" -gt 0 ]; then
+            state=error
+            desc="head SHA shared with $others other open PR(s); one commit status cannot decide for all of them"
+            echo "::warning::$HEAD_SHA is the head of $others open pull request(s) other than #${PR_NUMBER:-?}; publishing error rather than a verdict that would decide for all of them (maxi-tools/maxi-config#625)"
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" \
+            -f context="$STATUS_CONTEXT" \
+            -f description="$desc" \
+            -f target_url="$RUN_URL" >/dev/null
+          echo "posted $STATUS_CONTEXT=$state for $HEAD_SHA"
+
+          # The guard above is a check-then-write too, and one PR lifecycle
+          # removed from the race the block below handles. A PR opened AFTER
+          # that lookup and before this POST is not in the count this run used,
+          # so a `success` written here is inherited by a PR that never earned
+          # it. The run-freshness re-check below catches that only once the new
+          # PR's own run has STARTED, which is seconds to minutes later.
+          #
+          # So ask the cheap question again, and if the answer CHANGED, take
+          # the context to `error`. Only from a `success`: `failure` and
+          # `error` already block, and rewriting them would spend an API call
+          # to change nothing. This does not close the race -- nothing here can
+          # -- it keeps it falling the same way as everything else in this
+          # step: the residual failure is "blocked until the heads diverge",
+          # never "an unreviewed PR shows green". (cubic, on the PR that landed
+          # this.)
+          #
+          # An unreadable answer HERE does not withdraw, where an unreadable
+          # answer before the write refuses to publish at all. The asymmetry is
+          # the evidence, not the appetite: before the write there was no
+          # answer, so a verdict could not be justified; here a successful
+          # lookup seconds ago said this commit was this PR's alone, and a blip
+          # is not evidence that changed. Withdrawing on no evidence would turn
+          # every API hiccup into a red gate. The cost of being wrong is also
+          # bounded: a PR opened in this window triggers its OWN gate run,
+          # whose `invalidate` job writes `pending` over anything standing
+          # here. This check shortens that window; it is not what closes it.
+          if [ "$state" = success ]; then
+            after_others="$(other_open_pulls_at_head)"
+            if [ "$after_others" = failed ]; then
+              echo "::warning::could not re-check the open PRs at $HEAD_SHA after publishing; leaving the verdict this run's earlier successful lookup justified"
+            elif [ "$after_others" -gt 0 ]; then
+              echo "::warning::the open PRs at $HEAD_SHA changed while $GITHUB_RUN_ID was publishing; withdrawing the verdict (maxi-tools/maxi-config#625)"
+              gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+                -f state="error" \
+                -f context="$STATUS_CONTEXT" \
+                -f description="head SHA became shared while this verdict was publishing" \
+                -f target_url="$RUN_URL" >/dev/null
+            fi
+          fi
+
+          # The check above is a check-then-write, and it cannot be made atomic:
+          # the statuses API has no compare-and-swap, so a run that starts
+          # between that lookup and this POST has already written its `pending`
+          # and this run has just overwritten it with an older verdict. The
+          # newer gate normally corrects that when it finishes -- but if it is
+          # cancelled, or sits queued, the overwrite is the last word and a
+          # `success` can stand over an event that opened an unresolved thread.
+          #
+          #
+          # So re-check AFTER writing, and if a newer run appeared, put the
+          # context back to `pending` rather than trying to re-derive a verdict
+          # this run is no longer entitled to give. That does not close the race
+          # -- nothing here can -- it changes which way it falls: the worst
+          # outcome becomes "stuck pending", which BLOCKS a merge, instead of
+          # "stale green", which permits one. Only one of those can let an
+          # unreviewed change through, and it is not this one.
+          if [ -n "$runs" ]; then
+            after=""
+            if after="$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&per_page=100" \
+              --jq '.workflow_runs[] | "\(.run_started_at) \(.id)"' 2>/dev/null)" && [ -n "$after" ]; then
+              newest="$(printf '%s\n' "$after" | sort -k1,1 -k2,2n | tail -n 1 | awk '{ print $2 }')"
+              if [ -n "$newest" ] && [ "$newest" != "$GITHUB_RUN_ID" ]; then
+                echo "run $newest started while $GITHUB_RUN_ID was publishing; yielding the context back to pending"
+                gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+                  -f state="pending" \
+                  -f context="$STATUS_CONTEXT" \
+                  -f description="superseded; re-evaluating" \
+                  -f target_url="$RUN_URL" >/dev/null
+              fi
+            fi
+          fi

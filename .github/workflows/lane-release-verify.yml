@@ -1,0 +1,109 @@
+# Reusable release-verify lane for maxi-tools Rust CI.
+name: CI lane / release-verify
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      should_run:
+        required: true
+        type: boolean
+      skip_reason:
+        required: false
+        type: string
+        default: lane skipped/deferred by workflow policy
+      artifact_name:
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+jobs:
+  lane-release-verify:
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    permissions:
+      contents: read
+    steps:
+      # TRUST ADMISSION -- step 1 of this self-hosted job, never a job-level
+      # `if:` (maxi-tools standing rule). A job-level guard turns an untrusted
+      # run into a SKIPPED lane, and `skipped` is precisely the result an
+      # aggregate can be talked into reading as green. Here the untrusted run
+      # goes RED before checkout, before any token is minted, before any PR
+      # content exists on the runner. Every later step has an implicit
+      # `success()` (or names `steps.trust-admission.outcome`), so nothing
+      # after this one runs once it fires.
+      #
+      # Trusted: a same-repo pull request, an admitted merge-queue head
+      # (`checks_requested` -- only someone allowed to merge can admit one),
+      # a workflow_dispatch by the owner's numeric id (874012, the id the
+      # trusted-actor policy pins; logins can be reassigned, ids cannot), and
+      # push / schedule (callers' push trigger is `branches: [main,
+      # release/**]`, post-merge code; a schedule runs the default branch). Everything else -- including any trigger added to a
+      # caller later -- fails here: an ALLOWLIST of trusted shapes, negated, so
+      # an unknown event is untrusted by construction.
+      - name: Trust admission
+        id: trust-admission
+        if: >-
+          ${{ !(
+          github.event_name == 'push' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository) ||
+          (github.event_name == 'merge_group' &&
+          github.event.action == 'checks_requested') ||
+          (github.event_name == 'workflow_dispatch' &&
+          github.event.sender.id == 874012)
+          ) }}
+        shell: bash
+        env:
+          TRUST_EVENT: ${{ github.event_name }}
+          TRUST_ACTION: ${{ github.event.action }}
+          TRUST_SENDER: ${{ github.event.sender.login }}
+        run: |
+          echo "::error::Untrusted ${TRUST_EVENT} run (action=${TRUST_ACTION:-none}, sender=${TRUST_SENDER:-unknown}): this self-hosted job only admits pushes and schedules, same-repo pull requests, admitted merge-queue heads (checks_requested) and owner dispatches."
+          exit 1
+
+      - name: Report skipped lane
+        if: ${{ !inputs.should_run }}
+        run: |
+          {
+            echo "## lane-release-verify summary"
+            echo "- lane skipped/deferred: ${{ inputs.skip_reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        timeout-minutes: 10
+        if: ${{ inputs.should_run }}
+        with:
+          persist-credentials: false
+
+      - name: Download package artifacts
+        if: ${{ inputs.should_run && inputs.artifact_name != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: release-artifacts
+
+      - name: Verify release artifacts
+        if: ${{ inputs.should_run }}
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ARTIFACT_NAME" ]; then
+            test -d release-artifacts
+            echo "verified package artifact: $ARTIFACT_NAME"
+          fi
+          echo "release verification lane reached a trusted release ref"
+
+      - name: Lane summary
+        if: ${{ inputs.should_run }}
+        run: |
+          {
+            echo "## lane-release-verify summary"
+            echo "- release-verify lane ran"
+          } >> "$GITHUB_STEP_SUMMARY"

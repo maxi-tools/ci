@@ -1,0 +1,65 @@
+{
+  "schema": "maxi-tools.moments-gallery.v1",
+  "title": "HUD desktop e2e — 2026-09-18",
+  "run": {
+    "repo": "maxi-tools/voicemaci",
+    "ref": "wt/moments-gallery-survey",
+    "box": "maxibookpro24",
+    "date": "2026-09-18T09:00:00Z",
+    "lane": "hud-desktop-e2e"
+  },
+  "scenarios": [
+    {
+      "id": "warmup",
+      "label": "warmup",
+      "description": "cold start; timing not asserted",
+      "audio": "scenarios/warmup/input.wav",
+      "claims": [
+        { "name": "transcript_committed", "held": true },
+        { "name": "recording_window_visible", "held": true }
+      ],
+      "moments": [
+        {
+          "image": "scenarios/warmup/frame-00000.png",
+          "facts": "scenarios/warmup/frame-00000.json",
+          "timestamp_ms": 0,
+          "label": "start"
+        },
+        {
+          "image": "scenarios/warmup/frame-00250.png",
+          "facts": "scenarios/warmup/frame-00250.json",
+          "timestamp_ms": 250
+        }
+      ]
+    },
+    {
+      "id": "samantha-normal",
+      "label": "samantha-normal",
+      "description": "the quick brown fox jumps over the lazy dog",
+      "audio": "scenarios/samantha-normal/input.wav",
+      "claims": [
+        { "name": "transcript_committed", "held": true },
+        { "name": "first_partial_before_audio_end", "held": true },
+        { "name": "recording_window_visible", "held": true },
+        { "name": "non_black_frames", "held": false }
+      ],
+      "moments": [
+        {
+          "image": "scenarios/samantha-normal/frame-00250.png",
+          "facts": "scenarios/samantha-normal/frame-00250.json",
+          "timestamp_ms": 250
+        },
+        {
+          "image": "scenarios/samantha-normal/frame-00500.png",
+          "facts": "scenarios/samantha-normal/frame-00500.json",
+          "timestamp_ms": 500
+        },
+        {
+          "image": "scenarios/samantha-normal/frame-00750.png",
+          "facts": "scenarios/samantha-normal/frame-00750.json",
+          "timestamp_ms": 750
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,444 @@
+# Reusable package lane for maxi-tools Rust CI.
+name: CI lane / package
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      should_run:
+        required: true
+        type: boolean
+      skip_reason:
+        required: false
+        type: string
+        default: lane skipped/deferred by workflow policy
+      checkout_submodules:
+        description: >-
+          Recursively initialize Git submodules before Cargo runs. The same
+          input lane-check and lane-test already honour; without it here a
+          caller that opts in (maxi-libs passes it because esp-sr-rs,
+          esp-dsp-rs and libopus-rs build scripts read headers out of git
+          submodules) still packages against an empty submodule tree and
+          `cargo build --release` dies in the build script (maxi-libs main
+          run 36145394613: `esp_wn_iface.h file not found`).
+        required: false
+        type: boolean
+        default: false
+      skip_swift_build:
+        description: Skip repository Swift build scripts in Rust-only lanes.
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      artifact_name:
+        description: Cargo release artifact uploaded by the package lane.
+        value: ${{ jobs.lane-package.outputs.artifact_name }}
+
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+# Callers set CARGO_NET_GIT_FETCH_WITH_CLI at their workflow level, but env
+# does not cross the reusable-workflow boundary: without it here, cargo
+# fetches git deps with libgit2, which cannot use the app-token insteadOf
+# rewrite, and private git dependencies fail to authenticate.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: always
+  # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
+  # (e.g. a shared farm cache in the runner service .env) can never redirect
+  # build output or make concurrent jobs serialize on one build-dir flock,
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Fleet
+  # policy: cross-run reuse belongs in sccache; Cargo target dirs stay
+  # workspace-local and disposable.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  lane-package:
+    # Use the org pin even if another job changes the runner's global default.
+    env:
+      RUSTUP_TOOLCHAIN: '1.98.1'
+    # Same as lane-check.yml. Not a required context anywhere today, but kept
+    # on the job for the same reason, so the row stays present and honest.
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    # Backstop against a wedged job holding a runner for GitHub's 6h default.
+    # Packaging builds release artifacts, so it gets the most headroom of the
+    # rust lanes; see lane-check.yml for the incident.
+    timeout-minutes: 90
+    outputs:
+      artifact_name: ${{ steps.artifact-key.outputs.name }}
+    permissions:
+      contents: read
+    steps:
+      # TRUST ADMISSION -- step 1 of this self-hosted job, never a job-level
+      # `if:` (maxi-tools standing rule). A job-level guard turns an untrusted
+      # run into a SKIPPED lane, and `skipped` is precisely the result an
+      # aggregate can be talked into reading as green. Here the untrusted run
+      # goes RED before checkout, before any token is minted, before any PR
+      # content exists on the runner. Every later step has an implicit
+      # `success()` (or names `steps.trust-admission.outcome`), so nothing
+      # after this one runs once it fires.
+      #
+      # Trusted: a same-repo pull request, an admitted merge-queue head
+      # (`checks_requested` -- only someone allowed to merge can admit one),
+      # a workflow_dispatch by the owner's numeric id (874012, the id the
+      # trusted-actor policy pins; logins can be reassigned, ids cannot), and
+      # push / schedule (callers' push trigger is `branches: [main,
+      # release/**]`, post-merge code; a schedule runs the default branch). Everything else -- including any trigger added to a
+      # caller later -- fails here: an ALLOWLIST of trusted shapes, negated, so
+      # an unknown event is untrusted by construction.
+      - name: Trust admission
+        id: trust-admission
+        if: >-
+          ${{ !(
+          github.event_name == 'push' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository) ||
+          (github.event_name == 'merge_group' &&
+          github.event.action == 'checks_requested') ||
+          (github.event_name == 'workflow_dispatch' &&
+          github.event.sender.id == 874012)
+          ) }}
+        shell: bash
+        env:
+          TRUST_EVENT: ${{ github.event_name }}
+          TRUST_ACTION: ${{ github.event.action }}
+          TRUST_SENDER: ${{ github.event.sender.login }}
+        run: |
+          echo "::error::Untrusted ${TRUST_EVENT} run (action=${TRUST_ACTION:-none}, sender=${TRUST_SENDER:-unknown}): this self-hosted job only admits pushes and schedules, same-repo pull requests, admitted merge-queue heads (checks_requested) and owner dispatches."
+          exit 1
+
+      # maxi-tray#460: maximoji-apple honours MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+      # and requires unset or exactly `1`. The GHA `cond && '1' || ''` OFF
+      # spelling writes an empty string, which that crate treats as a hard
+      # error, not "don't skip". A skipped step leaves the variable unset.
+      - name: Map skip_swift_build onto MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+        if: ${{ inputs.skip_swift_build }}
+        shell: bash
+        run: echo "MAXIMOJI_APPLE_SKIP_SWIFT_BUILD=1" >> "$GITHUB_ENV"
+
+      - name: Report skipped lane
+        if: ${{ !inputs.should_run }}
+        run: |
+          {
+            echo "## lane-package summary"
+            echo "- lane skipped/deferred: ${{ inputs.skip_reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Repos with native system-library deps (e.g. alsa-sys behind a midi
+      # feature) declare them in ci/apt-packages.txt — one package per line,
+      # '#' comments allowed. Absent file means no extra packages. The
+      # install logic lives in .github/actions/install-apt-packages and is
+      # shared with lane-check.yml and lane-test.yml; one implementation
+      # in one place is the deduplication that closes maxi-config#174.
+      - name: Install repo-declared system packages
+        if: ${{ inputs.should_run && runner.os == 'Linux' }}
+        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
+
+      # Required by the optional-secret contract from maxi-config#368: callers
+      # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
+      # public-only lanes) must still produce release artifacts when
+      # packaging_impact is true, even without an App-token. The
+      # credential-dependent steps below this point are gated on
+      # has_credentials; cargo build --release still runs on the runner's
+      # default toolchain.
+      - name: Detect credentials
+        id: credentials
+        if: ${{ inputs.should_run }}
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
+        shell: bash
+        run: |
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
+            echo "has_credentials=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_credentials=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-package in credential-free mode (public release build only, no App-token mint, no private dependency fetch)."
+            {
+              echo "## lane-package summary"
+              echo "- Lane: lane-package"
+              echo "- Credentials: absent; credential-free mode (no App-token mint, no private policy fetch)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Generate org repo token
+        # Skipped entirely in credential-free mode (#368). Forks and external
+        # contributors who did not forward APP_ID / APP_PRIVATE_KEY have no
+        # credentials to mint a token with, and the action refuses an empty
+        # app-id.
+        if: ${{ inputs.should_run && steps.credentials.outputs.has_credentials == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          # Deliberately still `app-id` rather than `client-id`.
+          #
+          # This is a `workflow_call` workflow: it sees only the secrets its
+          # CALLER passes, and the wrapper that consumers vendor forwards
+          # `APP_ID` by name. Flipping to `client-id` takes effect in every
+          # consumer the moment this file lands on main, while their wrappers
+          # still forward only `APP_ID` -- an empty client-id and a failing
+          # token step fleet-wide. The org secret existing does not help; a
+          # called workflow cannot read a secret nobody handed it.
+          #
+          # Order of operations: thread `APP_CLIENT_ID` through the wrapper
+          # template first, let the fan-out deliver it, then flip the call
+          # sites.
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          # Scoped deliberately. Without a `permission-*` input this mint
+          # inherits the whole App installation rather than the read this lane
+          # needs, which is a large over-grant handed to a job that only reads
+          # files. Always state the permissions.
+          #
+          # The reasoning, the incident and the scope tables are recorded
+          # privately in maxi-config.
+          permission-contents: read
+
+      # Checkout comes after the token mint so a submodule fetch could use the
+      # app token, but the action's `token` input is `required: true` -- when
+      # it is expression-conditioned on `checkout_submodules` (falling back to
+      # `''` for ordinary non-submodule PRs), a false `checkout_submodules`
+      # hands the action an explicit empty string, which the action treats as
+      # "input not supplied" and fails before the build even starts (maxi-mux
+      # #384 run 36271068585 attempt 1, job 108499800720; all prior lanes
+      # green). Submodules here are public today, so an unauthenticated fetch
+      # reaches them fine, and the action's own default (falling back to the
+      # workflow's ambient GITHUB_TOKEN) already satisfies the required
+      # input -- exactly the same as lane-check.yml and lane-test.yml, which
+      # never pass `token` at all. Omit it here too instead of re-deriving a
+      # conditional that can produce an empty string again.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        timeout-minutes: 10
+        if: ${{ inputs.should_run }}
+        with:
+          persist-credentials: false
+          submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
+
+      - name: Scrub checkout credentials
+        if: ${{ inputs.should_run && inputs.checkout_submodules }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule foreach --recursive 'git config --local --unset-all http.https://github.com/.extraheader || :'
+          git config --local --unset-all http.https://github.com/.extraheader || :
+
+      # should_run is true on main and on release refs even when the change
+      # has no packaging impact (rust-ci.yml). check and test already no-op
+      # when the root manifest is absent; this lane did not, so a non-Rust
+      # consumer push died at `cargo fetch` with "could not find Cargo.toml"
+      # (maxi-nix main, 2026-09-26). Same absence gate as lane-check.yml: a
+      # Rust repo whose fetch fails still runs and still reports red. Detect
+      # only when should_run, because that is the only time this lane checks
+      # the tree out -- a skipped checkout must not be inspected.
+      - name: Detect Rust workspace
+        id: workspace
+        if: ${{ inputs.should_run }}
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml at repo root; skipping Rust lanes (non-Rust repository)."
+            {
+              echo "## lane-package summary"
+              echo "- Lane: lane-package"
+              echo "- Workspace: absent (no root Cargo.toml); Rust steps skipped"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+
+      - name: Install Rust toolchain
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: '1.98.1'
+
+      # Fails fast, with an attributable error, when a Cargo `path =
+      # "../<repo>"` dependency does not resolve to a real checkout beside
+      # this one -- and equally, refuses to let such a checkout survive from
+      # an earlier unrelated job on this same self-hosted runner. See the
+      # action for the two failure shapes this closes (maxi-config#286).
+      #
+      # Referenced by its owning repository, not by `./.github/actions/...`.
+      # `uses: ./...` inside a reusable workflow that consumers call via
+      # `uses: maxi-tools/ci/.github/workflows/lane-package.yml@<sha>` would
+      # resolve relative to the CONSUMER's checkout (the actions/checkout
+      # step populated GITHUB_WORKSPACE with the consumer), and consumers
+      # do not vend this action. Same-owner refs are exempted from the
+      # external-pin SHA requirement in check_workflow_refs.py.
+      #
+      # The lane-package lane runs `cargo build --release --workspace`
+      # separately from lane-check/lane-test (a different job, possibly a
+      # different runner), so it must do its own sibling verify rather than
+      # rely on lane-check having already done it.
+      - name: Verify sibling path-dependency checkouts
+        if: ${{ inputs.should_run && steps.credentials.outputs.has_credentials == 'true' }}
+        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Fetch maxi-config rust-lane policy
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
+        # One implementation, in .github/actions/fetch-policy. This block
+        # existed in four near-identical copies until #462, which is how #460
+        # fixed a live bug in a file nothing runs. Its reasoning -- the
+        # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
+        # the success condition -- moved into the action unchanged, along with
+        # why that action is referenced by its full owner/repo path.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@main
+        with:
+          policy-files: |
+            scripts/select-rust-toolchain.sh
+            scripts/emit-runner-paths.sh
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Expose installed macOS native build tools
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' && runner.os == 'macOS' }}
+        shell: bash
+        run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
+      - name: Verify installed Rust toolchain before cache restore
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
+      - name: Cache Rust dependencies
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Verify installed Rust toolchain after cache restore
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
+      - name: Configure git for private deps
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Persistent runners can retain this job-owned directory after a
+          # cancellation or host loss. Remove it before writing the new token
+          # so an expired equal-length insteadOf rewrite cannot win.
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rust-lane"
+          gitconfig="$RUNNER_TEMP/rust-lane/.gitconfig-ci"
+          cat > "$gitconfig" <<GITEOF
+          [url "https://x-access-token:${GH_APP_TOKEN}@github.com/maxi-tools/"]
+            insteadOf = https://github.com/maxi-tools/
+            insteadOf = git@github.com:maxi-tools/
+            insteadOf = ssh://git@github.com/maxi-tools/
+          [http]
+            lowSpeedLimit = 1000
+            lowSpeedTime = 300
+          GITEOF
+          # Abort a stalled fetch instead of hanging forever — see lane-check.yml
+          # for the incident. git has no default stall timeout, so a dead HTTPS
+          # connection parks `git remote-https` at 0% CPU indefinitely.
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
+      - name: Fetch private dependencies
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' }}
+        run: |
+          if [ -f Cargo.lock ]; then
+            cargo fetch --locked
+          else
+            cargo fetch
+          fi
+
+      - name: Remove private dependency auth
+        if: always() && steps.trust-admission.outcome == 'skipped'
+        run: |
+          # Unconditional by design: `rm -rf` succeeds when absent, and a
+          # deferred lane must still clear residue from an interrupted run.
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          # Keep later `git config --global` calls writable while making the
+          # credential scope empty. This file is a sibling under the
+          # runner-provided $RUNNER_TEMP, not inside the removed directory.
+          (umask 077 && : > "$RUNNER_TEMP/gitconfig-empty")
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig-empty" >> "$GITHUB_ENV"
+
+      - name: Build release artifacts
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        run: cargo build --workspace --release
+
+      - name: Build release artifact identity
+        id: artifact-key
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          segment() {
+            printf '%s' "$1" \
+              | tr '[:upper:]' '[:lower:]' \
+              | tr -cs 'a-z0-9._-' '-' \
+              | sed 's/^-//;s/-$//'
+          }
+          trust=trusted
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            trust=untrusted-pr
+          fi
+          toolchain="$(rustc -V)"
+          toolchain="${toolchain#rustc }"
+          toolchain="${toolchain%% *}"
+          repo="$(segment "$GITHUB_REPOSITORY")"
+          commit="$(segment "$GITHUB_SHA")"
+          target="$(segment "${RUNNER_OS}-${RUNNER_ARCH}")"
+          toolchain="$(segment "$toolchain")"
+          name="cargo-target-v1--${repo}--${commit}--${target}--${toolchain}--default--workspace--release--${trust}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Upload release artifacts
+        # Only lane-sign-publish and lane-release-verify consume this artifact,
+        # and rust-ci gates both on `refs/heads/main` or `refs/heads/release/*`.
+        # On a pull request neither runs, so the upload has no consumer: the name
+        # is keyed by commit SHA (so it is not a cache reused across runs), it is
+        # tagged `untrusted-pr`, retained one day, and downloaded by nothing.
+        #
+        # Shipping the whole target/release/ tree on every PR across every repo
+        # is a large, continuous draw on shared artifact storage, and storage
+        # pressure turns `if-no-files-found: error` into a red required check on
+        # PRs whose code is fine.
+        #
+        # The lane still BUILDS on pull requests; that is the PR-time packaging
+        # verification and it is unchanged. This only stops publishing a tree
+        # nobody fetches.
+        if: ${{ inputs.should_run && steps.workspace.outputs.has_workspace == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact-key.outputs.name }}
+          path: |
+            target/release/
+            !target/release/deps/
+            !target/release/build/
+            !target/release/incremental/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Lane summary
+        if: ${{ inputs.should_run }}
+        run: |
+          {
+            echo "## lane-package summary"
+            if [ -z "${ARTIFACT_NAME:-}" ]; then
+              echo "- Workspace: absent (no root Cargo.toml); Rust package steps skipped"
+            else
+              echo "- package-bundle lane ran"
+              if [ "$GITHUB_REF" = "refs/heads/main" ] || case "$GITHUB_REF" in refs/heads/release/*) true;; *) false;; esac; then
+                echo "- Uploaded artifact: ${ARTIFACT_NAME}"
+              else
+                echo "- Built ${ARTIFACT_NAME}; upload skipped (no consumer off main/release)"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

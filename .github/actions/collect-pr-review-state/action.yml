@@ -1,0 +1,278 @@
+name: Collect PR review state
+description: >
+  Read a pull request's reviews and review threads into payload.json, failing
+  closed on anything that cannot be trusted.
+
+  Split out of review-gate-reusable.yml so the gate's two conditions can be
+  reported as two separate checks without this collection existing twice in
+  source. Each condition still gets its own job -- a job IS a check, and the
+  check name is the only part of a verdict that reliably gets read -- so the
+  two reads do run once per condition. That is the price of a name that cannot
+  be misread, on a job that is two GraphQL queries and a python script.
+
+  The tools preflight deliberately did NOT move here. It provisions gh, and the
+  caller posts a pending status with gh BEFORE reaching this action; a
+  composite action cannot run earlier than the step that invokes it, so
+  bundling the two would leave that post unprovisioned on the NixOS lane, where
+  gh is absent from the default profile. (codex, #379.)
+
+inputs:
+  github-token:
+    description: "Token for the two GraphQL reads. Needs scope: pull-requests read."
+    required: true
+  owner:
+    description: Repository owner login.
+    required: true
+  repo:
+    description: Repository name.
+    required: true
+  pr:
+    description: Pull request number.
+    required: true
+
+outputs:
+  payload-path:
+    description: >
+      Path to the JSON payload this action wrote. Callers should pass THIS to
+      the gate rather than re-spelling the filename: composite steps inherit
+      the caller's working directory, so two independent relative paths agree
+      only while that stays true. (coderabbit, #379.)
+    value: ${{ steps.collect.outputs.payload-path }}
+
+runs:
+  using: composite
+  steps:
+    # No checkout: the action is referenced by its full owner/repo path, so
+    # the logic that judges a PR always comes from maxi-config's main and is
+    # never supplied by the pull request under test.
+    - name: Collect reviews and review threads
+      id: collect
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        OWNER: ${{ inputs.owner }}
+        REPO: ${{ inputs.repo }}
+        PR: ${{ inputs.pr }}
+      run: |
+        set -euo pipefail
+        if [ -z "${PR:-}" ]; then
+          echo "::error::no pull request number in the event payload"
+          exit 1
+        fi
+
+        # Both queries paginate. A reviewThreads page caps at 100, and a busy
+        # PR exceeds that; judging only the first page would report a clean
+        # PR while later pages held unresolved conversations -- the exact
+        # shape of failure this gate exists to prevent.
+        gh api graphql --paginate --slurp \
+          -f owner="$OWNER" -f repo="$REPO" -F pr="$PR" \
+          -f query='
+            query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$pr){
+                  author{login}
+                  isDraft
+                  headRefName
+                  # For the review-infra-unavailable waiver the gate honours.
+                  # Unpaginated at 100 deliberately: truncation can only LOSE
+                  # the waiver label, which makes the gate enforce -- the safe
+                  # direction. Paginating a second connection alongside
+                  # reviewThreads would need a second cursor and buys nothing.
+                  labels(first:100){nodes{name}}
+                  reviewThreads(first:100,after:$endCursor){
+                    pageInfo{hasNextPage endCursor}
+                    nodes{
+                      isResolved
+                      isOutdated
+                      comments(first:1){nodes{author{login} path url}}
+                    }
+                  }
+                }
+              }
+            }' > threads.json
+
+        gh api graphql --paginate --slurp \
+          -f owner="$OWNER" -f repo="$REPO" -F pr="$PR" \
+          -f query='
+            query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$pr){
+                  reviews(first:100,after:$endCursor){
+                    pageInfo{hasNextPage endCursor}
+                    # `__typename` and `commit{oid}` are what the gate
+                    # approval path reads: `Bot` versus `User` decides whether
+                    # the reviewer had to be on the trusted allowlist, and the
+                    # commit decides whether the approval is of the revision
+                    # that would merge. Both are ADDITIVE -- a payload without
+                    # them still evaluates, and simply cannot credit an
+                    # approval (see HeadAnchoredApprovals in pr_review_gate.py).
+                    nodes{ author{login __typename} state commit{oid} }
+                  }
+                }
+              }
+            }' > reviews.json
+
+        # Assert both queries actually returned a pull request before shaping
+        # anything. jq turns a missing field into null without complaint, and
+        # null flows onward as an empty list -- which would present a PR full
+        # of unresolved threads as having none.
+        # GraphQL answers 200 with partial .data AND a non-empty .errors
+        # array. An error touching a nullable field -- thread metadata, one
+        # review's author -- survives the shaping below and the gate would
+        # pass on a collection that is explicitly untrustworthy. Reject any
+        # errors on ANY page, the way scripts/verify_fanout.sh already does.
+        #
+        # EVERY page, not just the first: --paginate --slurp yields an array,
+        # and checking .[0] alone would judge one page of many.
+        for f in threads.json reviews.json; do
+          jq -e 'all(.[]; (.errors // []) | length == 0)' "$f" > /dev/null \
+            || { echo "::error::$f contains GraphQL errors; refusing to judge this PR"; \
+                 jq -c '[.[] | .errors // empty]' "$f"; exit 1; }
+          jq -e 'all(.[]; .data.repository.pullRequest != null)' "$f" > /dev/null \
+            || { echo "::error::$f has a page with no pullRequest"; exit 1; }
+        done
+
+        # Fetch the PR's HEAD SHA so the roster status can be looked up.
+        # `review-roster` is a commit status, not a pull-request property,
+        # and the GraphQL `pullRequest.Commits` edge is its own paginated
+        # connection that would force a second cursor for no benefit. The
+        # REST shape gives us the head SHA directly and is the same API the
+        # gate's own status publisher below uses.
+        #
+        # Fails closed on a missing PR: a non-existent pullRequest is a
+        # malformed payload, the same shape the GraphQL checks above refuse.
+        gh api "repos/$OWNER/$REPO/pulls/$PR" --jq '.head.sha' > head_sha.txt
+        HEAD_SHA="$(tr -d '\r\n[:space:]' < head_sha.txt)"
+        if [ -z "$HEAD_SHA" ]; then
+          echo "::error::could not determine the head SHA for PR #$PR"
+          exit 1
+        fi
+
+        # Fetch all commit statuses for the head SHA. This endpoint returns
+        # statuses newest first (including repeated contexts), not one entry
+        # per context. A roster can be older than the first page of unrelated
+        # statuses. gh --paginate follows every REST Link page; --slurp wraps
+        # the pages in an array, so flatten them before picking the newest
+        # review-roster status. The API has no per-context status endpoint.
+        #
+        # FAILS OPEN on a roster lookup failure: the gate has an explicit
+        # `roster=absent` fallback (the pre-roster rule), and an unreadable
+        # status endpoint must not strand every gate run in the org on a
+        # transient API blip. The two GraphQL reads above are the load-
+        # bearing ones; this is a one-step optimisation on a path that
+        # already has a defined absence fallback.
+        #
+        # A genuine roster the script cannot parse still fails closed: the
+        # gate's parse_roster raises Malformed on an `asked=...` or `band=...`
+        # description it cannot shape-match, and that propagates through
+        # evaluate(). An UNRELATED status description ("reviewed by a
+        # non-author", etc.) returns None and lands on `roster=absent`.
+        if ! gh api --paginate --slurp \
+            "repos/$OWNER/$REPO/commits/$HEAD_SHA/statuses?per_page=100" \
+            > roster_statuses.json 2>/dev/null; then
+          echo "::warning::could not read commit statuses for $HEAD_SHA; gate will fall back to roster=absent"
+          ROSTER_DESCRIPTION=""
+        else
+          ROSTER_DESCRIPTION="$(
+            jq -r --arg ctx 'review-roster' \
+              '[.[][] | select(.context == $ctx)][0].description // ""' \
+              roster_statuses.json
+          )"
+        fi
+
+        jq -n --slurpfile t threads.json --slurpfile r reviews.json \
+              --arg head_sha "$HEAD_SHA" '
+          {
+            author:  ($t[0][0].data.repository.pullRequest.author.login // null),
+            isDraft: ($t[0][0].data.repository.pullRequest.isDraft // false),
+            # The revision an approval has to be OF to count. Read from the
+            # same REST call the roster lookup below uses, so the gate
+            # head-anchored comparison and this field cannot disagree about
+            # which commit "the head" is. A missing value is not defaulted
+            # to an empty string: the gate treats a non-string as "no head
+            # known" and declines to credit an approval, which is the safe
+            # direction (see HeadAnchoredApprovals in pr_review_gate.py).
+            headSha: $head_sha,
+            # The fan-out bypasses maxi-config fan-out branches, whose reviewers
+            # are deliberately suppressed at source. `// null` rather than
+            # `// ""`: a branch name we could not read must not become a value
+            # that could be prefix-matched, and the gate treats a non-string as
+            # "not a fan-out branch" -- i.e. it still enforces.
+            headRefName: ($t[0][0].data.repository.pullRequest.headRefName // null),
+            # Names only, and only strings. A label list we could not read
+            # becomes [], which the gate treats as "no waiver applied" -- i.e.
+            # it still enforces. Fail closed, like every other field here.
+            labels: [ $t[0][0].data.repository.pullRequest.labels.nodes[]?
+                      | .name | select(type == "string") ],
+            threads: [ $t[0][] | .data.repository.pullRequest.reviewThreads.nodes[]
+                       | { isResolved, isOutdated,
+                           author: (.comments.nodes[0].author.login // null),
+                           path:   (.comments.nodes[0].path // null),
+                           url:    (.comments.nodes[0].url // null) } ],
+            # `isBot` is GraphQL __typename == "Bot" -- the actor TYPE, not
+            # the login spelling. The two do not agree in this org
+            # (`maxi-reviewer` arrives bare over GraphQL and `maxi-reviewer[bot]`
+            # over REST), and the allowlist is only meaningful if the gate can
+            # tell a bot from an account. `null` when the type could not be
+            # read, which the gate treats as "not a human" rather than
+            # defaulting the other way.
+            reviews: [ $r[0][] | .data.repository.pullRequest.reviews.nodes[]
+                       | { author: (.author.login // null),
+                           state,
+                           commit: (.commit.oid // null),
+                           isBot: (if (.author.__typename? // null) == null then null
+                                   else (.author.__typename == "Bot") end) } ]
+          }' > payload.json
+
+        # Embed the parsed roster (or the absence of one) into the payload
+        # as `roster`. The gate reads this field; absence means "no roster
+        # was published for this head SHA" and the gate falls back to the
+        # pre-roster rule with `roster=absent` in its output.
+        #
+        # The parsing lives here, in the collector, rather than in the
+        # gate -- the gate is a pure function of its payload. Putting the
+        # parser in the collector keeps a parse failure a step away from
+        # the gate's verdict logic and lets `tests/test_pr_review_gate.py`
+        # cover the parser's truth table independently of any I/O.
+        if [ -n "$ROSTER_DESCRIPTION" ]; then
+          echo "review-roster status present for $HEAD_SHA; parsing it into payload.roster"
+          # Write the description to a file so jq reads the description as
+          # data, not as a literal argument. An attacker-chosen roster
+          # description is one PR comment away from a `gh` argument; the
+          # file indirection keeps it in jq's input channel.
+          printf '%s' "$ROSTER_DESCRIPTION" > roster_desc.txt
+          if ! ROSTER_PARSED="$(
+            jq -R -r '
+              def parse:
+                # Two wire formats. The current one is
+                # `asked=[names] skipped=<n> [unknown=<n>]`. The previous one,
+                # still published on every head not re-reviewed since the
+                # shortening, is `band=<band> asked=[names] skipped=[names]
+                # profiles=<state>`. Both yield the same object: asked names,
+                # and skipped as a count (the length of the name list).
+                if test("^asked=\\[[^\\]]*\\]\\s+skipped=\\S+(\\s+unknown=[0-9]+)?\\s*$") then
+                  capture("^asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=(?<skipped>\\S+)(\\s+unknown=(?<unknown>[0-9]+))?\\s*$")
+                  | { asked: (.asked | split(",") | map(select(length > 0))),
+                      skipped: (if (.skipped | test("^[0-9]+$")) then (.skipped | tonumber)
+                                else (.skipped | gsub("[\\[\\]]"; "") | split(",") | map(select(length > 0)) | length) end) }
+                elif test("^band=[a-z]+\\s+asked=\\[[^\\]]*\\]\\s+skipped=\\[[^\\]]*\\]\\s+profiles=\\S+\\s*$") then
+                  capture("^band=[a-z]+\\s+asked=\\[(?<asked>[^\\]]*)\\]\\s+skipped=\\[(?<skipped>[^\\]]*)\\]\\s+profiles=\\S+\\s*$")
+                  | { asked: (.asked | split(",") | map(select(length > 0))),
+                      skipped: (.skipped | split(",") | map(select(length > 0)) | length) }
+                else
+                  error("malformed review-roster description: " + .)
+                end;
+              parse
+            ' < roster_desc.txt
+          )"; then
+            echo "::error::review-roster description for $HEAD_SHA is not in the expected shape: $ROSTER_DESCRIPTION"
+            exit 1
+          fi
+          jq --argjson r "$ROSTER_PARSED" '. + {roster: $r}' payload.json > payload.json.tmp \
+            && mv payload.json.tmp payload.json
+        else
+          echo "no review-roster status for $HEAD_SHA; payload omits roster (gate will report roster=absent)"
+        fi
+
+        echo "collected $(jq '.threads|length' payload.json) thread(s), $(jq '.reviews|length' payload.json) review(s)"
+        echo "payload-path=$PWD/payload.json" >> "$GITHUB_OUTPUT"

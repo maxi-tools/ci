@@ -1,0 +1,30 @@
+# Nothing was watching the pinned actions in this repository, and it showed.
+#
+# `lane-release-verify.yml` and `lane-sign-publish.yml` -- the two lanes that
+# verify and sign releases -- ran `actions/download-artifact` at v4.3.0 from
+# 2025-04-24 while maxi-config's copy of the same lane sat on a 2026-03-11
+# pin. Eleven months stale, in the copy ~48 consumers actually execute,
+# found by hand-diffing two repositories (PR #14).
+#
+# Sha-pinning is the right supply-chain control and it stays. Its cost is
+# that a pin never moves on its own, so something has to propose the bump.
+# That is this file. It is the standard answer and it costs nothing to keep.
+#
+# Grouped into one pull request per week rather than one per action: every
+# such pull request here is a change to code that runs in ~48 repositories,
+# and reviewing eight of them separately is how the eighth stops being read.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      # The repository's own convention; a bare "Bump x" reads as noise in a
+      # log where every other line states a reason.
+      prefix: "ci"

@@ -1,0 +1,204 @@
+name: Fan-out ci pin
+
+# Triggered by every push to main AND weekly on Monday. The push hook is
+# the canonical "a fix landed" signal; the weekly cron is the
+# backstop for cases where a consumer closed the fan-out PR without
+# merging and is still behind.
+
+# A PR on main that affects only `docs/`, `*.md`, `README*` does NOT
+# need a fan-out: it changes no workflow bytes. The push paths below
+# scope the run to workflow files and to the fan-out script itself.
+
+# Fan-out PRs are the inert-detector: every consumer a fix has not
+# reached has an open PR on it, named `ci: advance pin to <sha>...`.
+# See docs/contracts/first-party-pin-scheme.md for the rule and the
+# failure mode this contract addresses.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/scripts/fanout_ci_pin.py'
+      - 'docs/contracts/first-party-pin-scheme.md'
+  schedule:
+    # Mondays 09:00 UTC, an hour before distribute-pr-green.yml so a
+    # fan-out burst is not parallel with another fleet write.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      tip:
+        description: 'Override the tip sha (default: current main HEAD)'
+        required: false
+      dry_run:
+        description: 'Print the plan without opening PRs'
+        type: boolean
+        default: false
+      consumer_repo:
+        description: 'Limit the fan-out to these owner/repo names, comma-separated'
+        required: false
+
+concurrency:
+  group: fanout-ci-pin
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fanout:
+    # workflow_dispatch is a trigger, not a trust statement:
+    # `gh workflow run --ref` accepts any branch, so anyone with write
+    # access could have this fleet job execute their branch's script
+    # beside an org token. The gate below matches the
+    # distribute-*.yml pattern in maxi-config.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      (github.event.sender.id == 874012 && github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve tip sha
+        id: tip
+        # Push hook: the tip is the new HEAD. Schedule/dispatch: the
+        # caller may override; otherwise read main.
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.tip }}" ]; then
+            echo "sha=${{ inputs.tip }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate fleet write token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          permission-contents: write
+          permission-pull-requests: write
+          # workflows:write is REQUIRED. The previous comment here said the
+          # Contents API treats .github/workflows/ like any other path and
+          # so this was not needed. It was never measured, because until
+          # ci#29 this workflow never pushed anything. The first real run
+          # (35498817540, 2026-09-20) measured it: all 49 consumers failed
+          # with "refusing to allow a GitHub App to create or update
+          # workflow `.github/workflows/review-gate.yml` without
+          # `workflows` permission". maxi-config's distribute-maxi-review.yml
+          # grants the same permission for the same file.
+          permission-workflows: write
+
+      - name: Run fan-out
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TIP_SHA: ${{ steps.tip.outputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          # EXTRA_REPOS lets dispatch limit the fan-out to a single
+          # consumer for testing. Each value is owner/repo.
+          EXTRA_REPOS_JSON: ${{ toJSON(inputs.consumer_repo) }}
+        run: |
+          set -euo pipefail
+          args=(--tip "$TIP_SHA")
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          # Decode the optional consumer list. A workflow_dispatch input
+          # is a STRING -- there is no array input type -- so toJSON()
+          # yields a JSON string, and the first cut of this loop iterated
+          # it character by character: dispatch 35504357184 with
+          # consumer_repo=maxi-tools/maxi-kvm ran against 19 "consumers"
+          # named m, a, x, i, -, ... and reported 19 unreadable. The
+          # comment above it described an array type that does not
+          # exist. Accept a comma-separated string (the real shape) and,
+          # defensively, a JSON list should the input ever become one.
+          # An unset input serialises as "null".
+          # Decoded into a variable FIRST: a failure inside `< <(...)` is
+          # invisible to `set -e`, and an empty consumer list means the
+          # whole inventory -- so a typo in the dispatch box would have
+          # fanned out to ~48 repositories. `$(...)` under set -e aborts.
+          # "null" is the push/schedule case (no inputs at all); '""' is a
+          # dispatch with the box left blank. Both mean the whole inventory.
+          if [ -n "$EXTRA_REPOS_JSON" ] && [ "$EXTRA_REPOS_JSON" != "null" ] && [ "$EXTRA_REPOS_JSON" != '""' ]; then
+            names="$(printf '%s' "$EXTRA_REPOS_JSON" | python3 -c '
+          import json, re, sys
+          v = json.load(sys.stdin)
+          # A string that is itself JSON-list text (someone typed
+          # ["a/b","c/d"] into the box) is opened before splitting.
+          if isinstance(v, str) and v.lstrip().startswith("["):
+              v = json.loads(v)
+          items = v if isinstance(v, list) else [v]
+          names = [n.strip() for item in items for n in str(item).split(",")]
+          names = [n for n in names if n]
+          # Every name must be owner/repo. This is the check that would
+          # have refused "m", "a", "x", "i" ... on 35504357184.
+          bad = [n for n in names if not re.fullmatch(r"[\w.-]+/[\w.-]+", n)]
+          if bad:
+              sys.exit(f"consumer_repo: not owner/repo: {bad}")
+          for n in names:
+              print(n)
+          ')"
+            n_consumers=0
+            while IFS= read -r r; do
+              if [ -n "$r" ]; then
+                args+=(--consumer-repo "$r")
+                n_consumers=$((n_consumers + 1))
+              fi
+            done <<< "$names"
+            if [ "$n_consumers" -eq 0 ]; then
+              echo "::error::consumer_repo was given but decoded to nothing; refusing to fall back to the whole inventory"
+              exit 1
+            fi
+          fi
+          # --json selects the report format: one JSON row per consumer,
+          # AFTER execution, each with an `outcome`. Until ci#29 the
+          # script returned on --json before opening anything, so every
+          # run of this workflow since ci#24 planned ~48 consumers,
+          # opened no PR, and ended "fan-out completed". The rows are
+          # written to a file, not only to the summary, so the next
+          # step judges the same bytes the summary shows.
+          args+=(--json)
+          python3 .github/scripts/fanout_ci_pin.py "${args[@]}" \
+            | tee "$RUNNER_TEMP/fanout-rows.jsonl" "$GITHUB_STEP_SUMMARY"
+
+      - name: Post-summary check
+        if: ${{ !inputs.dry_run }}
+        # Judges the rows the fan-out wrote. Every consumer must end in
+        # one accounted-for outcome; `failed` and `unreadable` fail this
+        # run (the script already exits 1 on them, `pipefail` carries
+        # that through `tee`, and this step names them); and a run that
+        # examined ZERO consumers is not an all-clear -- the default
+        # inventory is ~48 repositories, so an empty row set means the
+        # inventory was not read, not that nothing was behind.
+        env:
+          EXTRA_REPOS_JSON: ${{ toJSON(inputs.consumer_repo) }}
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/fanout-rows.jsonl" "$EXTRA_REPOS_JSON" <<'PY'
+          import collections, json, sys
+          rows = [json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')]
+          counts = collections.Counter(r['outcome'] for r in rows)
+          print(f"fan-out: {len(rows)} consumer row(s): "
+                + (', '.join(f'{n} {o}' for o, n in sorted(counts.items())) or 'none'))
+          ok = {'opened', 'reused', 'already', 'opt-out', 'no-pin', 'not-a-sha'}
+          bad = [r for r in rows if r['outcome'] not in ok]
+          for r in bad:
+              print(f"::error::{r['consumer']}: {r['outcome']} -- {r['detail']}")
+          for r in rows:
+              if r['outcome'] == 'opened':
+                  print(f"opened {r['consumer']}: {r['pr_url']}")
+          explicit = sys.argv[2] not in ('', 'null', '[]', '""')
+          if not rows and not explicit:
+              print('::error::zero consumers examined on an inventory run; this is not an all-clear')
+              sys.exit(1)
+          sys.exit(1 if bad else 0)
+          PY

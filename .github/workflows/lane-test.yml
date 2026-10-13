@@ -1,0 +1,432 @@
+# Reusable test lane for maxi-tools Rust CI.
+name: CI lane / test
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      advisory:
+        required: false
+        type: boolean
+        default: false
+      checkout_submodules:
+        required: false
+        type: boolean
+        default: false
+      skip_swift_build:
+        description: Skip repository Swift build scripts in Rust-only lanes.
+        required: false
+        type: boolean
+        default: false
+      repo_policy:
+        # Forwarded for parity with lane-check.yml: the test lane has no
+        # house-style-only step to skip, but consumers still set
+        # `repo_policy: fork-upstream` on the wrapper and the value travels
+        # here unchanged so the contract test can verify the threading.
+        required: false
+        type: string
+        default: standard-rust
+
+      scope:
+        description: >-
+          lane-plan's classification of the change: `full`, or
+          `merge-gate-only` when every changed path is documentation or
+          metadata. The lane skips itself on `merge-gate-only` -- see the
+          `if:` on the job for why the skip lives here and not on the caller.
+        required: false
+        type: string
+        default: full
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+# Callers set CARGO_NET_GIT_FETCH_WITH_CLI at their workflow level, but env
+# does not cross the reusable-workflow boundary: without it here, cargo
+# fetches git deps with libgit2, which cannot use the app-token insteadOf
+# rewrite, and private git dependencies fail to authenticate.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: always
+  # Pin the target dir to the job workspace so a runner-level CARGO_TARGET_DIR
+  # (e.g. a shared farm cache in the runner service .env) can never redirect
+  # build output or make concurrent jobs serialize on one build-dir flock,
+  # where the cpu-liveness guard kills the lock-waiter at 0% CPU. Fleet
+  # policy: cross-run reuse belongs in sccache; Cargo target dirs stay
+  # workspace-local and disposable.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  MAXI_TRAY_SKIP_SWIFT_BUILD: ${{ inputs.skip_swift_build && '1' || '' }}
+
+jobs:
+  lane-test:
+    # Use the org pin even if another job changes the runner's global default.
+    env:
+      RUSTUP_TOOLCHAIN: '1.98.1'
+    # Same as lane-check.yml, including WHY the guard lives on this job rather
+    # than on the caller: a skipped caller job never creates the nested check
+    # run, and `merge-gate / test / lane-test` is a REQUIRED context in many
+    # consumer repositories. Skipped is accepted there; absent can never merge.
+    #
+    # THE SAME RULE COVERS THE OTHER TWO SKIPS. A docs-only change
+    # (`inputs.scope == 'merge-gate-only'`, classified by lane-plan) and a
+    # maxi-config fan-out PR (branch prefix AND distributor id, both halves,
+    # per maxi-config ci/fanout-identity.toml) do not need this lane either.
+    # Measured 2026-09-19: one distribute run touched 48 consumer PRs; with
+    # all 35 runners busy the resulting queue stalled unrelated work for 15+
+    # minutes, and nothing reclaims it -- `timeout-minutes` bounds EXECUTION,
+    # not queue time. A fan-out PR carries a byte-for-byte copy of a payload
+    # already tested on the canon, so building it in every consumer
+    # re-derives one answer ~48 times. A head ref is chosen by whoever
+    # pushes the branch, so the prefix alone would let anyone skip CI by
+    # naming a branch; the numeric id is the half that cannot be claimed.
+    # ci#20 and ci#10 put those skips on the CALLER's `check`/`test` jobs,
+    # which is the placement this comment warns against: under the fleet's
+    # rulesets (44 repos require `merge-gate / check / lane-check` and
+    # `merge-gate / test / lane-test` by name, measured 2026-09-20) a skipped
+    # caller leaves those contexts ABSENT and the PR can never merge. The
+    # pin fan-out would have shipped that to every consumer on its next
+    # advance. Here, the check run exists with conclusion `skipped`, which
+    # satisfies a required-status-check rule, and `merge-gate`'s aggregate
+    # step treats `skipped` as fine.
+    #
+    # The fan-out half tests `github.event_name` explicitly rather than
+    # leaning on a null `pull_request` object coercing to false on push and
+    # workflow_dispatch. The `github` context inside a reusable workflow is
+    # the caller's, so the same predicate works here unchanged.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      inputs.scope != 'merge-gate-only' &&
+      !(github.event_name == 'pull_request' &&
+        startsWith(github.event.pull_request.head.ref, 'maxi-config-sync/') &&
+        github.event.pull_request.user.id == 264883562)
+    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    continue-on-error: ${{ inputs.advisory }}
+    # Backstop against a wedged job holding a runner for GitHub's 6h default.
+    # Tests get more headroom than check; see lane-check.yml for the incident.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      # TRUST ADMISSION -- step 1 of this self-hosted job, never a job-level
+      # `if:` (maxi-tools standing rule). A job-level guard turns an untrusted
+      # run into a SKIPPED lane, and `skipped` is precisely the result an
+      # aggregate can be talked into reading as green. Here the untrusted run
+      # goes RED before checkout, before any token is minted, before any PR
+      # content exists on the runner. Every later step has an implicit
+      # `success()` (or names `steps.trust-admission.outcome`), so nothing
+      # after this one runs once it fires.
+      #
+      # Trusted: a same-repo pull request, an admitted merge-queue head
+      # (`checks_requested` -- only someone allowed to merge can admit one),
+      # a workflow_dispatch by the owner's numeric id (874012, the id the
+      # trusted-actor policy pins; logins can be reassigned, ids cannot), and
+      # push / schedule (callers' push trigger is `branches: [main,
+      # release/**]`, post-merge code; a schedule runs the default branch). Everything else -- including any trigger added to a
+      # caller later -- fails here: an ALLOWLIST of trusted shapes, negated, so
+      # an unknown event is untrusted by construction.
+      - name: Trust admission
+        id: trust-admission
+        if: >-
+          ${{ !(
+          github.event_name == 'push' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository) ||
+          (github.event_name == 'merge_group' &&
+          github.event.action == 'checks_requested') ||
+          (github.event_name == 'workflow_dispatch' &&
+          github.event.sender.id == 874012)
+          ) }}
+        shell: bash
+        env:
+          TRUST_EVENT: ${{ github.event_name }}
+          TRUST_ACTION: ${{ github.event.action }}
+          TRUST_SENDER: ${{ github.event.sender.login }}
+        run: |
+          echo "::error::Untrusted ${TRUST_EVENT} run (action=${TRUST_ACTION:-none}, sender=${TRUST_SENDER:-unknown}): this self-hosted job only admits pushes and schedules, same-repo pull requests, admitted merge-queue heads (checks_requested) and owner dispatches."
+          exit 1
+
+      # maxi-tray#460: maximoji-apple honours MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+      # and requires unset or exactly `1`. The GHA `cond && '1' || ''` OFF
+      # spelling writes an empty string, which that crate treats as a hard
+      # error, not "don't skip". A skipped step leaves the variable unset.
+      - name: Map skip_swift_build onto MAXIMOJI_APPLE_SKIP_SWIFT_BUILD
+        if: ${{ inputs.skip_swift_build }}
+        shell: bash
+        run: echo "MAXIMOJI_APPLE_SKIP_SWIFT_BUILD=1" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        # See lane-check.yml: checkout is where jobs wedge, because git has no
+        # default stall timeout. A shallow clone takes seconds.
+        timeout-minutes: 10
+        with:
+          persist-credentials: false
+          submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
+
+      # See lane-check.yml: repositories whose correctness is wholly outside
+      # Rust ship the standard Rust CI wrapper regardless (every Rust
+      # consumer in the org installs it at .github/workflows/ci.yml), so the
+      # lane itself must no-op cleanly when there is no Cargo.toml. The skip
+      # is conditional on ABSENCE, not on failure -- a Rust repo whose
+      # fetch fails for some other reason still runs the lane and still
+      # reports red, which is the difference between a quiet skip and a
+      # green check on broken CI. See lane-check.yml for the full rationale.
+      - name: Detect Rust workspace
+        id: workspace
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml at repo root; skipping Rust lanes (non-Rust repository)."
+            {
+              echo "## lane-test summary"
+              echo "- Lane: lane-test"
+              echo "- Workspace: absent (no root Cargo.toml); Rust steps skipped"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Required by the optional-secret contract from maxi-config#368: callers
+      # without APP_ID / APP_PRIVATE_KEY (forks, external contributors,
+      # public-only lanes) must still run cargo test on a public-only
+      # toolchain. The credential-dependent steps below this point are gated
+      # on has_credentials; cargo test --workspace --all-targets and the
+      # repo-local hook are not.
+      - name: Detect credentials
+        id: credentials
+        env:
+          HAS_APP_ID: ${{ secrets.APP_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
+        shell: bash
+        run: |
+          if [ "$HAS_APP_ID" = "true" ] && [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
+            echo "has_credentials=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_credentials=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APP_ID or APP_PRIVATE_KEY not forwarded by the caller; running lane-test in credential-free mode (public Rust tests only, no private policy fetch)."
+            {
+              echo "## lane-test summary"
+              echo "- Lane: lane-test"
+              echo "- Credentials: absent; credential-free mode (no App-token mint, no private policy fetch)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Repos with native system-library deps (e.g. alsa-sys behind a midi
+      # feature) declare them in ci/apt-packages.txt — one package per line,
+      # '#' comments allowed. Absent file means no extra packages. The
+      # install logic lives in .github/actions/install-apt-packages and is
+      # shared with lane-check.yml and lane-package.yml; one implementation
+      # in one place is the deduplication that closes maxi-config#174.
+      - name: Install repo-declared system packages
+        if: runner.os == 'Linux'
+        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
+
+      - name: Generate org repo token
+        # Skipped entirely in credential-free mode (#368). Forks and external
+        # contributors who did not forward APP_ID / APP_PRIVATE_KEY have no
+        # credentials to mint a token with, and the action refuses an empty
+        # app-id.
+        if: steps.credentials.outputs.has_credentials == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          # Deliberately still `app-id` rather than `client-id`.
+          #
+          # This is a `workflow_call` workflow: it sees only the secrets its
+          # CALLER passes, and the wrapper that consumers vendor forwards
+          # `APP_ID` by name. Flipping to `client-id` takes effect in every
+          # consumer the moment this file lands on main, while their wrappers
+          # still forward only `APP_ID` -- an empty client-id and a failing
+          # token step fleet-wide. The org secret existing does not help; a
+          # called workflow cannot read a secret nobody handed it.
+          #
+          # Order of operations: thread `APP_CLIENT_ID` through the wrapper
+          # template first, let the fan-out deliver it, then flip the call
+          # sites.
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          # Scoped deliberately. Without a `permission-*` input this mint
+          # inherits the whole App installation rather than the read this lane
+          # needs, which is a large over-grant handed to a job that only reads
+          # files. Always state the permissions.
+          #
+          # The reasoning, the incident and the scope tables are recorded
+          # privately in maxi-config.
+          permission-contents: read
+
+      # Fails fast, with an attributable error, when a Cargo `path =
+      # "../<repo>"` dependency does not resolve to a real checkout beside
+      # this one -- and equally, refuses to let such a checkout survive from
+      # an earlier unrelated job on this same self-hosted runner. See the
+      # action for the two failure shapes this closes (maxi-config#286).
+      #
+      # Referenced by its owning repository, not by `./.github/actions/...`.
+      # `uses: ./...` inside a reusable workflow that consumers call via
+      # `uses: maxi-tools/ci/.github/workflows/lane-test.yml@<sha>` would
+      # resolve relative to the CONSUMER's checkout (the actions/checkout
+      # step populated GITHUB_WORKSPACE with the consumer), and consumers
+      # do not vend this action. Same-owner refs are exempted from the
+      # external-pin SHA requirement in check_workflow_refs.py.
+      - name: Verify sibling path-dependency checkouts
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
+        uses: maxi-tools/ci/.github/actions/verify-sibling-checkouts@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Rust toolchain
+        if: steps.workspace.outputs.has_workspace == 'true'
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: '1.98.1'
+          components: rustfmt, clippy
+
+      - name: Fetch maxi-config rust-lane policy
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
+        # One implementation, in .github/actions/fetch-policy. This block
+        # existed in four near-identical copies until #462, which is how #460
+        # fixed a live bug in a file nothing runs. Its reasoning -- the
+        # partial-clone hangs, why plain HTTP GETs, why a non-empty body is
+        # the success condition -- moved into the action unchanged, along with
+        # why that action is referenced by its full owner/repo path.
+        # Public consumers cannot resolve maxi-tools/maxi-config (it is
+        # private). This copy must name maxi-tools/ci, which owns the same
+        # action. A mirror from maxi-config that copies the private path
+        # makes every public fork's lane fail at job setup.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@main
+        with:
+          policy-files: |
+            scripts/select-rust-toolchain.sh
+            scripts/emit-runner-paths.sh
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Expose installed macOS native build tools
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true' && runner.os == 'macOS'
+        shell: bash
+        run: bash .maxi-config/scripts/emit-runner-paths.sh /opt/homebrew/bin /usr/local/bin
+      - name: Verify installed Rust toolchain before cache restore
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh before-cache
+      - name: Cache Rust dependencies
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Verify installed Rust toolchain after cache restore
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
+        shell: bash
+        run: bash .maxi-config/scripts/select-rust-toolchain.sh after-cache
+      - name: Configure git for private deps
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Persistent runners can retain this job-owned directory after a
+          # cancellation or host loss. Remove it before writing the new token
+          # so an expired equal-length insteadOf rewrite cannot win.
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rust-lane"
+          gitconfig="$RUNNER_TEMP/rust-lane/.gitconfig-ci"
+          cat > "$gitconfig" <<GITEOF
+          [url "https://x-access-token:${GH_APP_TOKEN}@github.com/maxi-tools/"]
+            insteadOf = https://github.com/maxi-tools/
+            insteadOf = git@github.com:maxi-tools/
+            insteadOf = ssh://git@github.com/maxi-tools/
+          [http]
+            lowSpeedLimit = 1000
+            lowSpeedTime = 300
+          GITEOF
+          # Abort a stalled fetch instead of hanging forever — see lane-check.yml
+          # for the incident. git has no default stall timeout, so a dead HTTPS
+          # connection parks `git remote-https` at 0% CPU indefinitely.
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/rust-lane/.gitconfig-ci" >> "$GITHUB_ENV"
+      - name: Fetch private dependencies
+        if: steps.workspace.outputs.has_workspace == 'true' && steps.credentials.outputs.has_credentials == 'true'
+        run: |
+          if [ -f Cargo.lock ]; then
+            cargo fetch --locked
+          else
+            cargo fetch
+          fi
+
+      - name: Remove private dependency auth
+        if: always() && steps.trust-admission.outcome == 'skipped'
+        run: |
+          rm -rf "$RUNNER_TEMP/rust-lane"
+          # Point at an empty real file, not /dev/null: later steps (e.g. the
+          # clippy-policy checkout) run `git config --global`, and git cannot
+          # take a lock on /dev/null ("could not lock config file").
+          # This is a sibling under the runner-provided $RUNNER_TEMP, not a
+          # child of the rust-lane directory removed above.
+          (umask 077 && : > "$RUNNER_TEMP/gitconfig-empty")
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig-empty" >> "$GITHUB_ENV"
+
+      - name: lane-test summary
+        run: |
+          {
+            echo "## lane-test summary"
+            echo "- Lane: lane-test summary"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test workspace
+        if: steps.workspace.outputs.has_workspace == 'true'
+        run: cargo test --workspace --all-targets
+
+      # A repository whose correctness is not fully expressed by `cargo test`
+      # declares the rest in ci/lane-test.sh. It runs inside this lane, with
+      # the toolchain installed, the dependencies fetched and the target dir
+      # already warm from the step above, and its exit status is the lane's.
+      #
+      # This exists because `cargo test` passing is not always evidence that a
+      # crate works. One crate in this fleet exports a UniFFI surface that is
+      # validated at BINDGEN time, not at compile time: an exported
+      # `-> Result<T, String>` compiles clean, tests clean, and then aborts
+      # uniffi-bindgen with "unknown throw type: Some(String)". It shipped a
+      # Swift-facing API from which no Swift could be produced, green in CI the
+      # entire time, because nothing ever ran the generator.
+      #
+      # It hangs off lane-test rather than lane-check deliberately. `cargo test
+      # --workspace --all-targets` has already codegen'd every crate type, so a
+      # hook that needs real artefacts — a cdylib to introspect, a binary to
+      # run — finds them instead of paying to build them a second time.
+      # lane-check only ever runs `cargo clippy`, which produces none.
+      #
+      # No `continue-on-error`, and no advisory escape: this step is part of
+      # `merge-gate / test / lane-test`, which is a required context on every
+      # gated repo, so a hook that fails turns the gate red. A check that
+      # cannot fail is decoration.
+      #
+      # Absent file means no repo-local checks, which is every repo today.
+      - name: Repo-local lane-test checks
+        if: steps.workspace.outputs.has_workspace == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          hook="ci/lane-test.sh"
+          if [ ! -f "$hook" ]; then
+            echo "no $hook in this repository; nothing repo-local to run"
+            exit 0
+          fi
+          # Invoked through `bash` rather than executed, so a hook that lost
+          # its mode bit (a Windows checkout, a patch applied by hand) runs
+          # instead of failing the lane with "Permission denied".
+          #
+          # The flags are imposed here, not left to the hook. A hook that
+          # forgets `set -e` reports success from its last command while an
+          # earlier one failed, which is precisely the "green check that cannot
+          # fail" this step exists to avoid. Hooks may still set them again;
+          # they are idempotent.
+          echo "::group::$hook"
+          bash -euo pipefail "$hook"
+          echo "::endgroup::"
+          echo "- repo-local checks: \`$hook\` passed" >> "$GITHUB_STEP_SUMMARY"

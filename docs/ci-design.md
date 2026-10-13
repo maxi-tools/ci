@@ -1,0 +1,188 @@
+# Shared CI: design and usage
+
+Interfaces, data flow and the trust boundary for the workflows in this
+repository. Kept out of `README.md` so the repository front page stays plain;
+this file is the reference for callers inside the organization.
+
+## Why this repository is public
+
+GitHub will not resolve a `uses:` from a **public** repository into a **private**
+one. That holds even when the private repository's Actions access is set to
+"accessible from repositories in the organization" — which `maxi-config`'s
+already is. The run fails at workflow parse time: no jobs are created, no log is
+produced, and the only signal is a check-run annotation reading
+*"This run likely failed because of a workflow file issue."*
+
+Measured before this repository existed: **720 runs across the four public
+consumers, every one `failure`, every one producing zero jobs**, while the
+identical wrapper succeeded in private consumers. Visibility was the only
+variable.
+
+So the workflows live here, in public, where any consumer can resolve them.
+
+## What is here, and what is deliberately not
+
+This repository holds **mechanism**. It holds no policy, no inventory and no
+credentials.
+
+```
+.github/workflows/
+  rust-ci.yml                  lane composition (workflow_call only)
+  lane-plan.yml                routing + packaging-impact router
+  lane-check.yml               fmt + clippy
+  lane-test.yml                cargo test + repo-local ci/lane-test.sh
+  lane-package.yml             release build + artifact
+  lane-sign-publish.yml        trusted release refs only
+  lane-release-verify.yml      trusted release refs only
+  review-gate-reusable.yml     unresolved threads + non-author review
+.github/actions/
+  fetch-policy/                pulls policy files over the Contents API
+  collect-pr-review-state/     two paginated GraphQL reads
+  pr-review-gate/              the verdict logic and its truth table
+  moments-gallery/             static HTML gallery from a moments manifest
+```
+
+Everything these workflows *decide with* stays in the private `maxi-config`
+repository and is read **at run time**, authenticated by the caller's App token:
+
+| Data | Read by | How |
+| --- | --- | --- |
+| `ci/runner-routing.toml` | `resolve-runner` | sparse checkout in `lane-plan` |
+| `ci/packaging-paths.toml` | `plan-packaging-impact.sh` | sparse checkout in `lane-plan` |
+| `scripts/select-rust-toolchain.sh` | check / test / package | `fetch-policy`, Contents API |
+| `scripts/emit-runner-paths.sh` | check / test / package | `fetch-policy`, Contents API |
+| `hooks/clippy-strict-lints.sh` | `lane-check` | `fetch-policy`, Contents API |
+
+`resolve-runner` itself also stays private, because `lane-plan` checks it out
+alongside the policy it reads rather than referencing it as an action.
+
+None of the routing data is embedded in this repository, and none of it is
+reachable without a token that already has read access to it.
+
+## Consuming these
+
+Pin to a sha. `@main`, tags, and bare branches are not a security boundary, and
+the role they have on the mirror's fork guard is load-bearing. See
+`docs/contracts/first-party-pin-scheme.md` for the rule and the
+inert-detector (`fanout-ci-pin.yml`) that this contract wires in.
+
+```yaml
+jobs:
+  merge-gate:
+    uses: maxi-tools/ci/.github/workflows/rust-ci.yml@<sha>
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    with:
+      repo_policy: standard-rust
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+```
+
+**A permissions map here is a FLOOR, not a request.** GitHub validates the
+permissions of the whole nested call graph when it creates the run — before
+any job `if:` is evaluated — so a scope declared inside a lane is a scope
+every caller has to grant on every event, including the events where that lane
+is skipped, and no caller-side change can lower it. A caller that grants less
+gets `startup_failure`: zero jobs, no log, and a check-run annotation about a
+workflow file issue.
+
+The three scopes above are exactly what the graph uses, and nothing here
+writes: `contents: read` is what the checkout needs, and `lane-plan` adds
+`pull-requests: read` and `actions: read`. This example used to carry
+`contents: write`, `id-token: write` and `pages: write` on top, because
+`lane-sign-publish` declared them — while its steps are a checkout with
+`persist-credentials: false`, an artifact download and two `echo`es, none of
+which touches a write scope. Every consumer of `rust-ci.yml` therefore had to
+grant the trio on every event. A write scope returns to the lane with the step
+that needs it (`contents: write` for a release asset, `id-token: write` for
+keyless signing) and to this example with it.
+
+`tests/test_ci_design_permissions.py` computes the floor from the call graph
+and fails if these examples and the lanes disagree, in either direction.
+
+**Name the secrets; do not use `secrets: inherit`.** `inherit` forwards every
+organization secret the calling repository can see to a workflow whose source is
+world-readable. These workflows declare two secrets and use two.
+
+The review gate takes no secrets at all — it runs on the caller's `GITHUB_TOKEN`:
+
+```yaml
+jobs:
+  review-gate:
+    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@<sha>
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      statuses: write
+```
+
+The same floor rule, and the same reason the map is not `read`: the gate's
+`dedupe` leg resolves duplicate bot threads, so it declares
+`pull-requests: write`, and a caller that grants `pull-requests: read` fails
+the run at creation rather than at that leg. `statuses: write` has to be
+granted by the caller too — a reusable workflow cannot elevate the token it is
+handed, and the two `review-gate/*` verdicts are commit statuses.
+
+### This repository runs the gate on itself
+
+`.github/workflows/review-gate.yml` calls `review-gate-reusable.yml` at a
+pinned sha, so `review-gate/threads` and `review-gate/non-author-review` are
+published on this repository's own pull requests and not only on the ones that
+consume it. It passes `runs_on: '["ubuntu-latest"]'` instead of taking the
+callee's self-hosted default: this repository is public and takes fork pull
+requests, and fork-reachable runs do not belong on the org's self-hosted fleet
+— the trade `self-check.yml` documents for its own lane. The pin is a sha
+rather than a relative `./`, so that a pull request cannot supply the gate that
+judges it.
+
+### How a fix reaches you
+
+Every push to `maxi-tools/ci` `main` that touches a workflow file or a
+composite action triggers `.github/workflows/fanout-ci-pin.yml`. That
+workflow opens a `ci: advance pin to <sha>` PR on every consumer whose pin
+is behind the new tip. The fan-out PR is the **inert-detector**: it exists
+on the consumer the moment the change lands on ci, and stays open until
+the consumer merges it (or closes it with a reason). Consumers that close
+without merging are recorded in `OPT_OUTS` in `.github/scripts/fanout_ci_pin.py`
+so the next run skips them deliberately.
+
+`ci-pin-staleness-check.yml` is the backstop: a weekly read-only audit
+that opens an issue on this repository listing consumers that are more
+than one tip behind. The fan-out PR is the primary detector; this audit
+is what catches consumers that ignored the fan-out.
+
+### Merge queue
+
+`rust-ci.yml` is also called by the merge-queue template in `maxi-config`
+on the GitHub `merge_group` event. The `merge-gate` job's `if:` accepts
+both `pull_request` from a same-repo PR and `merge_group` with
+`action == 'checks_requested'` so the queue reads the same required
+aggregate verdict it would read on a PR run. `merge_group` is
+GitHub-internal -- only the merge-queue system itself can trigger it --
+so the same-repo fork guard does not apply; the action guard is the
+filter, because `created`/`merged`/`pushed`/`removed`/`deleted` are
+merge-queue lifecycle events and must not mint a required-context check
+run. Tests in `tests/test_lane_decisions.py:MergeGateEventFilter` cover
+the event filter.
+
+## Trust boundary
+
+The source being readable is not what makes any of this safe. The gates here are
+identity gates, and they are stated plainly rather than hidden:
+
+- The lane chain runs for **same-repository** pull requests only.
+- `workflow_dispatch` is pinned to the owner **by numeric user id**, because
+  logins can be reassigned and ids cannot.
+- The fan-out bypass in `pr-review-gate` requires the branch prefix **and** the
+  App identity that opens those branches. The prefix alone is not sufficient,
+  because a head ref is attacker-chosen.
+- Fork pull requests reaching self-hosted runners are governed at organization
+  level, not by any `if:` in these files.
+
+Write access to this repository is equivalent to code execution in every
+consumer, so it is protected accordingly: reviewed pull requests only, no
+force-push, no branch deletion.

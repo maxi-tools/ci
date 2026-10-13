@@ -1,0 +1,1255 @@
+#!/usr/bin/env python3
+"""Decide whether a pull request has cleared the review bar.
+
+Two conditions, both required:
+  1. ZERO unresolved review threads.
+  2. At least one reviewer that is not the pull request author: an APPROVAL of
+     the current head from a trusted review bot or from a non-bot account, or
+     a counted review from a reviewer the roster assigned.
+
+Either condition can be judged on its own via --only, so each can be reported
+as its OWN check whose name states the action it wants. One check covering both
+cannot: its name has to describe the passing state, and a reader who sees that
+name go red has to negate a conjunction, which leaves them guessing which half
+failed. Three successive renames failed to stop readers guessing "it wants a
+human approval" -- the more salient of the two nouns -- so the name stopped
+being the place to fix it. See the workflow that calls this.
+
+Condition 2 is not the same as 「has reviews」. Every agent lane in this org
+authenticates as the same account, so a PR can accumulate a pile of reviews
+that are all self-review; counting reviews would be satisfied by the author
+reviewing their own work. Counting DISTINCT NON-AUTHOR reviewers is not.
+
+Condition 2 has TWO routes, and either one satisfies it:
+
+  A. AN APPROVAL OF THE CURRENT HEAD. An APPROVED review whose commit is the
+     pull request's head SHA, from either a review bot on the trusted
+     allowlist (TRUSTED_REVIEW_BOTS -- one list, see below) or from any
+     account that is not a bot and not the author. (Maxi decision 2026-09-28:
+     bots count if they approve.) Route A does not consult the roster, and
+     that is the point: the allowlist is the trust decision for a bot, so a
+     trusted reviewer is credited even when the selector spelled its login
+     differently.
+
+  B. THE ROSTER'S ASSIGNED REVIEWERS. Unchanged: when the selector published a
+     non-empty `asked` set, a counted review from one of them satisfies.
+
+Which review goes to which route is not a detail. An APPROVED review belongs to
+route A and ONLY to route A, which is what makes "an approval of a superseded
+revision does nothing" true even for a reviewer the roster asked for. Every
+other counted state belongs to route B, which is deliberately commit-blind --
+re-anchoring route B would red the entire org, because a comment is the only
+thing reviewers in this fleet post (measured 2026-09-28: 3001 COMMENTED, 5
+CHANGES_REQUESTED, 0 APPROVED across 604 open pull requests in 19
+repositories). That measurement is also why route B survives route A: a
+condition satisfied only by an approval would be red on every pull request in
+the fleet, which is the opposite of what the decision is for.
+
+Condition 2 has one escape hatch a human can reach for: the
+`review-infra-unavailable` label, for when no reviewer can be summoned at all.
+It waives condition 2 and nothing else, and it names itself in the commit
+status so the merge is recorded as waived rather than as reviewed. See
+REVIEW_INFRA_LABEL for why it is honoured here and not by the reviewer.
+
+Exit 0 = gate passes. Exit 1 = gate fails, OR the input cannot be trusted.
+
+That second half matters as much as the first. A gate that passes when its
+input is missing, empty or malformed reports healthy for the most broken PR
+there is, which is worse than having no gate at all: it manufactures
+confidence. Every validation below therefore fails closed.
+"""
+
+import json
+import os
+import re
+import sys
+
+# A review in these states is not a review signal: PENDING has not been
+# submitted, and DISMISSED has been explicitly retracted.
+COUNTED_STATES = {'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'}
+
+#: The review bots whose APPROVAL satisfies condition 2, and the ONLY such list
+#: in the fleet. (Maxi decision, 2026-09-28: bots count if they approve.)
+#:
+#: ONE PLACE, deliberately. The trust decision used to be spread across
+#: whatever the roster happened to spell (`REVIEWER_TABLE` in maxi-config's
+#: maxi-review/select-roster.py, mapped through LABEL_TO_LOGIN below) plus each
+#: reviewer's own idea of its login. When those disagree the gate silently
+#: discards a real review: measured on maxi-core#4786 (2026-09-28), the roster
+#: asked for `qlty`, the review arrived as `qltysh[bot]`, and
+#: `review-gate/non-author-review` was red on a PR whose assigned reviewer had
+#: posted. A list here, consumed by the approval path, is what stops that class
+#: of mismatch from being a gate failure. Nothing else may carry a second copy;
+#: a caller that needs "is this reviewer trusted" imports this.
+#:
+#: Entries are bare slugs -- the spelling GraphQL returns for a Bot actor,
+#: which is what the collector reads. `is_trusted_review_bot` strips the
+#: `[bot]` suffix on both sides, so the REST spelling matches the same row.
+#:
+#: What is NOT here matters as much: `github-actions`, `github-advanced-security` and
+#: `maxi-tools-auth` are automation that posts to review threads, not reviewers
+#: that read a diff. `github-actions[bot]` in particular submits EMPTY
+#: COMMENTED reviews on this org's PRs, and teaching the gate to credit those
+#: as a look is the one thing the quiet-PR design notes rule out by name.
+TRUSTED_REVIEW_BOTS = frozenset({
+    # The roster's reviewers, via LABEL_TO_LOGIN below.
+    'maxi-reviewer',
+    'coderabbitai',
+    'copilot-pull-request-reviewer',
+    'claude-review',
+    'cubic-dev-ai',
+    'codacy-production',
+    'qodana',
+    'gemini-review',
+    # qlty, under BOTH spellings: the roster's label is `qlty` and the table
+    # maps it to `qlty[bot]`, while the reviews in this fleet arrive as
+    # `qltysh[bot]` (maxi-core#4786, above). ci#64 fixes the roster-side
+    # mapping; the approval path must not depend on which spelling an
+    # operator's roster happens to carry in the meantime.
+    'qlty',
+    'qltysh',
+    # The local coder-model reviewer (qwen-coder-review) and the Codex
+    # connector (chatgpt-codex-connector) both submit real reviews on this
+    # org's pull requests; neither is in the roster table yet.
+    'qwen-coder-review',
+    'chatgpt-codex-connector',
+})
+
+
+#: GitHub's REST spellings for Bot actors carry the suffix `[bot]`, while
+#: GraphQL returns the bare slug. Both spellings must reach the same answer
+#: on either side of the trust check, so every strip / endswith goes through
+#: this single constant.
+BOT_SUFFIX = '[bot]'
+
+
+def _strip_bot_suffix(login):
+    """Login without the `[bot]` suffix, or the login unchanged if it lacks one."""
+    return login.removesuffix(BOT_SUFFIX) if isinstance(login, str) else login
+
+
+def is_trusted_review_bot(login):
+    """Is this login a review bot the gate credits without the roster?
+
+    Bracketed and bare spellings both answer yes for the same bot: the
+    collector reads GraphQL, which returns a Bot actor's bare slug, while a
+    REST port would return `login[bot]`.
+    """
+    return isinstance(login, str) and _strip_bot_suffix(login) in TRUSTED_REVIEW_BOTS
+
+
+def is_bot_actor(login, declared):
+    """Is the author of this review a bot? True, False, or None for unknown.
+
+    `declared` is the collector's own reading -- GraphQL's `__typename`, i.e.
+    `Bot` versus `User`/`Organization` -- and is authoritative when present.
+
+    When it is absent the login's spelling decides, and only in ONE direction:
+    a bracketed `[bot]` login is a bot, and a bare slug is UNKNOWN, not human.
+    The unknown case must not fall through to "a human approved this": the
+    allowlist is what makes a bot's approval trustworthy, and an unreadable
+    actor type read as a human would hand every non-allowlisted automation the
+    path the allowlist exists to gate.
+    """
+    if isinstance(declared, bool):
+        return declared
+    if isinstance(login, str) and login.endswith(BOT_SUFFIX):
+        return True
+    return None
+
+# Head-branch prefix the maxi-config fan-out opens its pull requests on --
+# $sync_branch_prefix in maxi-config's scripts/sync-maxi-review.sh, which names
+# every branch it pushes 「maxi-config-sync/<manifest>」. Matched as a PREFIX and
+# not by equality on purpose: the manifest name is the second segment, so a
+# third manifest added later is covered without touching this file.
+#
+# RETIREMENT SCHEDULE (T4, maxi-config#735): this bypass is the only thing
+# stopping the fan-out from waiting forever for a reviewer that the roster
+# selector (T3, maxi-config#728, merged 2026-09-19) will deliberately skip.
+# It stays in place until T3 has been live on every repo for 14 days -- a
+# date set to 2026-10-03 -- so a PR whose head SHA lacks a `review-roster`
+# status still passes the gate on a fan-out branch. After 2026-10-03 the
+# selector is the single source of truth and this bypass can be removed
+# alongside the FANOUT_AUTHORS half of the security guard below. The fan-out
+# branch's `asked` list collapses to `[maxi-lint]` per the selector's
+# fast-path, and the rest of the reviewers are listed in `skipped` with
+# their canon reason -- the gate consumes that list directly once the
+# roster is required.
+FANOUT_BRANCH_PREFIX = 'maxi-config-sync/'
+
+# The SECOND producer writing to the same consumers: maxi-tools/ci's
+# fanout-ci-pin.yml, which advances each consumer's pinned `uses:` sha on
+# `ci/fanout-pin`. Same App, different branch, and it was not enrolled --
+# so on 2026-09-20 its 49 open PRs were structurally unmergeable: every
+# review lane suppresses this author, and this bypass demanded a prefix
+# those branches do not carry. (maxi-config#784.)
+#
+# Mirrors ci/fanout-identity.toml, INCLUDING its two shapes: a namespace
+# ending in `/` is a prefix, a whole branch name is matched by equality.
+# `ci/fanout-pin` is one branch per consumer (ci#32), so prefix-matching
+# it would also accept `ci/fanout-pinned`. Lists rather than scalars
+# because the next producer must extend one, not add a third test
+# nobody can find. (codacy, #789.)
+FANOUT_BRANCH_PREFIXES = (FANOUT_BRANCH_PREFIX,)
+FANOUT_BRANCH_NAMES = ('ci/fanout-pin',)
+
+
+def is_fanout_branch(head_ref):
+    '''Does this head ref belong to a declared fan-out producer?
+
+    The AUTHOR half is checked separately and is mandatory; see below.
+    '''
+    return (isinstance(head_ref, str)
+            and (head_ref.startswith(FANOUT_BRANCH_PREFIXES)
+                 or head_ref in FANOUT_BRANCH_NAMES))
+
+# ...and the identity that opens them. The prefix alone is NOT sufficient: a
+# branch name is attacker-chosen, so 「starts with maxi-config-sync/」 would let
+# anyone who can push a branch here name their way out of the review gate. Both
+# halves are required together.
+#
+# Spelled WITHOUT the 「[bot]」 suffix, which is not cosmetic. collect-pr-review-
+# state reads `author{login}` over GraphQL, and GraphQL returns a Bot actor's
+# bare slug -- verified against a live fan-out PR (maxi-kvm#24):
+#     author: { login: 「maxi-tools-auth」, __typename: 「Bot」 }
+# The REST API spells the same actor 「maxi-tools-auth[bot]」, so both are
+# accepted: if the collection step is ever ported to REST the bypass keeps
+# working. Accepting the bracketed form costs nothing, because 「[」 and 「]」 are
+# not legal in a GitHub login and no real account can ever claim it.
+FANOUT_AUTHORS = frozenset({'maxi-tools-auth', 'maxi-tools-auth[bot]'})
+
+# Dependabot, whose pull requests have no reviewer to summon.
+#
+# `secrets.APP_ID` / `APP_PRIVATE_KEY` are ordinary Actions secrets, and a
+# Dependabot-triggered run gets the DEPENDABOT secrets scope instead. The org
+# holds none, so those arrive as empty strings and every app-token step in the
+# review lanes dies on 「The 'client-id' ... input must be set to a non-empty
+# string」 -- maxi-review's `lint-gate` and `review` among them. Those two ARE
+# the non-author reviewers a bot-authored PR ever gets. So condition 2 is not
+# merely unmet on a Dependabot PR, it is unsatisfiable: no push can fix it,
+# because the next push is Dependabot's too.
+#
+# This is the same shape as maxi-core ci.yml's `dependabot-fallback`, and for
+# the reason stated there: without it, a stricter gate turns 「dependency PRs
+# merge with no review signal」 into 「dependency PRs can never merge」.
+#
+# BOTH halves again, and the same GraphQL/REST split as FANOUT_AUTHORS -- the
+# collection step reads GraphQL, which gives a Bot actor's bare slug. Verified
+# on a live Dependabot PR (maxi-kvm#4):
+#     GraphQL author.login 「dependabot」   REST user.login 「dependabot[bot]」
+# Both accepted so a port of the collection step to REST cannot silently strand
+# every dependency PR; the bracketed form is unspoofable either way.
+DEPENDABOT_BRANCH_PREFIX = 'dependabot/'
+DEPENDABOT_AUTHORS = frozenset({'dependabot', 'dependabot[bot]'})
+
+
+# The escape hatch for "the review infrastructure is genuinely unavailable".
+#
+# It is honoured HERE, on condition 2, and deliberately nowhere else. Its
+# predecessor -- `maxi-review-override` -- was honoured by the REVIEWER instead,
+# through maxi-reviewer's `bypass_label` default, and never by this gate. That
+# inverted its own purpose: `maxi-reviewer[bot]` is one of the non-author
+# reviewers this condition accepts, so the label removed a reviewer from the
+# pool while leaving intact the requirement that the pool be non-empty. A PR
+# carrying it was strictly LESS mergeable, in exactly the situation it was
+# reached for. Measured on maxi-config#536; see issue #555.
+#
+# So the capability moved to the half that is load-bearing. maxi-review.yml now
+# passes `bypass_label: ""`, the reviewer never self-disables, and this label
+# says what a human actually needs to say: "no reviewer can be summoned, stop
+# asking for one."
+#
+# Condition 2 ONLY, for the same reason as the Dependabot waiver below it:
+# reviewer availability has nothing to do with whether the threads a reviewer
+# already opened are resolved. Waiving both would discard a signal that is
+# still perfectly measurable.
+#
+# This one is an ASSERTION, not a structural fact about the PR -- unlike draft,
+# fan-out and Dependabot, which the gate can see for itself. That is why it is
+# the only waiver that names itself in the commit-status description: a PR that
+# merged under it must not be recorded as "reviewed by a non-author", which is
+# a claim about work that did not happen.
+REVIEW_INFRA_LABEL = 'review-infra-unavailable'
+
+#: Prefix marking a line where a condition passed on a human's ASSERTION rather
+#: than on anything the gate could see for itself. `waiver_label` parses it and
+#: main() publishes it as a step output, so review-gate-reusable.yml can put the
+#: label in the commit-status description instead of the passing state's
+#: wording. A status reading "reviewed by a non-author" on a PR nobody reviewed
+#: is the same class of defect as the silent skip this waiver replaces: a green
+#: tick that means something other than what it says.
+#:
+#: Not applied to the draft, fan-out or Dependabot waivers. Those are structural
+#: facts about the PR that a reader can re-derive from the PR itself, and
+#: marking them would change the status description on every gate run in ~31
+#: repos to fix a problem they do not have.
+WAIVED_PREFIX = 'WAIVED:'
+
+
+#: Reviewer-family category that the cross-family rule refuses to credit when
+#: the producer family's `unknown`. The premise: a producer-side Hermes
+#: worktree (`wt/<slug>`) might have been written by either Claude or Codex,
+#: and the gate cannot tell. The reviewers the rule refuses to credit are
+#: the model-runner review bots -- the only two logins whose family could
+#: be claude or codex. Every other trusted review bot is `other`; their
+#: review cannot possibly be a same-family self-verification (no claude
+#: or codex model posts under `coderabbitai[bot]` etc.), so they remain
+#: accepted. Codacy HIGH RISK, maxi-config#1116, 2026-10-16:
+#: "Derive the producer family from trusted producer metadata, or make
+#: unknown-family handling fail closed so condition 2 cannot be satisfied
+#: by a potentially same-family reviewer when producer identity is
+#: unavailable." This is the second half of that finding.
+RESTRICTED_UNDER_UNKNOWN = frozenset({'claude-review', 'chatgpt-codex-connector'})
+
+
+def is_restricted_under_unknown(login):
+    """True for logins the rule refuses to credit when the producer family is unknown.
+
+    Restricted = in `RESTRICTED_UNDER_UNKNOWN` AND stripped `[bot]` is the
+    same login. Both spellings of the same account are restricted: GraphQL
+    returns the bare slug, REST would return `claude-review[bot]` or
+    `chatgpt-codex-connector[bot]`, and the restricted set must accept
+    either.
+    """
+    if not isinstance(login, str) or not login.strip():
+        return False
+    return _strip_bot_suffix(login) in RESTRICTED_UNDER_UNKNOWN
+
+
+#: Producer / reviewer FAMILIES for the cross-family rule.
+#:
+#: The producers and reviewers in this fleet come from two model families
+#: (Claude and Codex); the same shape is described in operators' producer
+#: scripts (~/.claude/skills/hermes-operator/scripts/xfam.py +
+#: producer_families.py), with families `claude|codex|other`. The gate
+#: subscribes to that scheme but never has the producer-side database in its
+#: payload, so it derives the producer family from the one field it does
+#: have: `headRefName`. The two CLI-spawned branch shapes the maximini bridge
+#: names (claude/<slug> and codex/<slug>) map directly to a producer family;
+#: everything else is `unknown`, which is treated as "no conflict"
+#: rather than "claude" or "codex", because a wrong attribution would block
+#: PRs that have nothing to do with either CLI.
+#:
+#: Reviewer families come from the reviewer's login. The trusted review bots
+#: in `TRUSTED_REVIEW_BOTS` above are split into the two families that
+#: correspond to a model-runner posting as a review; everything else is
+#: `other`. Mapping `chatgpt-codex-connector` to `codex` and `claude-review`
+#: to `claude` mirrors the registered reviewers in
+#: `maxi-review/reviewer-registry.toml`: a same-family reviewer is the
+#: cross-family rule's central concern, and the registry is the source of
+#: truth for which login maps to which family.
+#:
+#: The cross-family rule says: when the producer family is `claude` or
+#: `codex`, an APPROVAL or a counted review from a reviewer of the SAME
+#: family does NOT satisfy condition 2. That blocks a reviewer run by the
+#: same model that wrote the code from green-ticking its own output. A
+#: producer family of `unknown` means the gate cannot tell which family
+#: produced the work, and the rule degrades to "no conflict", so unknown
+#: producers fall back to the pre-existing roster/bot fallback.
+FAMILY_CLAUDE = 'claude'
+FAMILY_CODEX = 'codex'
+FAMILY_OTHER = 'other'
+FAMILY_UNKNOWN = 'unknown'
+
+#: Reviewer login (after stripping `[bot]`) -> family. Only the two model
+#: families a same-family bug actually exists for are split out; every other
+#: trusted review bot -- coderabbit, codacy, cubic, gemini, copilot,
+#: qodana, qlty/qltysh, qwen-coder-review, maxi-reviewer -- is `other`,
+#: because a reviewer from any of those is not a same-family collision
+#: with anything the producer-side rule cares about.
+REVIEWER_FAMILY_OF = {
+    'claude-review': FAMILY_CLAUDE,
+    'chatgpt-codex-connector': FAMILY_CODEX,
+}
+
+
+def reviewer_family_of_login(login):
+    """The family a reviewer's login belongs to, or FAMILY_OTHER.
+
+    `login` is taken as-written, with the `[bot]` suffix removed. Returns
+    `FAMILY_OTHER` for every reviewer not on the family map: a human
+    account's family is `other` rather than `unknown` because a human
+    approval can satisfy condition 2 even when the producer family is
+    known -- same-family rule is about reviewer automation, not about any
+    possible source of APPROVED.
+    """
+    if not isinstance(login, str) or not login.strip():
+        return FAMILY_OTHER
+    return REVIEWER_FAMILY_OF.get(_strip_bot_suffix(login), FAMILY_OTHER)
+
+
+def producer_family_of(head_ref):
+    """The producer's model family, derived from `headRefName`.
+
+    Branches named `claude/<slug>` are CLAUDE CLI sessions and imply
+    `FAMILY_CLAUDE`; `codex/<slug>` similarly implies `FAMILY_CODEX`.
+    Anything else returns `FAMILY_UNKNOWN`, which is the gate's "could not
+    determine" answer and the cross-family rule's "no conflict" answer.
+
+    `wt/<slug>` (Hermes worktree) heads do NOT imply a family here: the
+    gate does not have the Hermes export, and a card that ran on Codex and
+    produced `wt/t_xxx` looks the same as one that ran on anything else.
+    If a future change makes that export reachable from the gate, this
+    function is where it lands.
+    """
+    if not isinstance(head_ref, str) or not head_ref:
+        return FAMILY_UNKNOWN
+    head = head_ref + '/'
+    if head.startswith(FAMILY_CLAUDE + '/'):
+        return FAMILY_CLAUDE
+    if head.startswith(FAMILY_CODEX + '/'):
+        return FAMILY_CODEX
+    return FAMILY_UNKNOWN
+
+
+#: Prefix marking the cross-family review FAIL line. `_CROSSFAM_PREFIX` is
+#: what `failure_annotations` keys off to surface the new failure type on
+#: the PR checks page; the FAIL line itself follows with the reviewer(s)
+#: that were dropped and the producer family that produced the head.
+#:
+#: Kept as a module constant so a future reviewer that needs to know
+#: whether a gate verdict was about cross-family (rather than missing
+#: reviewer, malformed payload, ...) can answer that question without
+#: parsing free-form log prose.
+_CROSSFAM_PREFIX = 'CROSSFAM'
+
+
+#: The second route to condition 2, said once so the two FAIL branches cannot
+#: describe it differently. Both a human reading the log and a triage worker
+#: reading an `::error::` annotation get the same sentence.
+_APPROVAL_HELP = ('  An APPROVED review of this head SHA also satisfies this check:'
+                  ' from a review bot on the trusted allowlist, or from a human'
+                  ' account that is not the author.')
+
+
+#: The roster the maxi-review selector publishes for every pull request, as a
+#: commit status with context `review-roster`. The selector is the
+#: generalisation of the fan-out bypass da0941c landed: instead of one
+#: head_ref/author pair hard-coded into this gate, the selector picks the
+#: reviewer set per PR and publishes the decision. The gate consumes the
+#: roster's `asked` set as its required non-author reviewers -- a roster that
+#: skips CodeRabbit on a trivial PR no longer leaves this gate waiting forever
+#: for a review that was never requested.
+#:
+#: Status description format (single line, from
+#: maxi-review/select-roster.py:summary):
+#:
+#:     asked=[a,b,...] skipped=<n> [unknown=<n>]
+#:
+#: The gate consumes the `asked` NAMES and the `skipped` COUNT. A review
+#: counts only when its author is in `asked`; `skipped` is printed as a
+#: length on the passing line and never matched against an author. `band`
+#: and `profiles` are not on this line: GitHub caps the description at 140
+#: characters, and the step summary prints both from the JSON. An operator
+#: who needs to know WHY a reviewer was skipped follows the status's
+#: target_url into the run.
+#:
+#: A head not re-reviewed since the shortening still carries the previous
+#: wire format, which this parser also accepts:
+#:
+#:     band=<band> asked=[a,b,...] skipped=[c,d,...] profiles=<state>
+#:
+#: `skipped` there is a name list; the gate only ever reads the length, so
+#: the parser normalises it to a count. Dropping the line would fail the
+#: gate closed on every such head.
+ROSTER_CONTEXT = 'review-roster'
+
+#: Roster description regex. Tolerates whitespace between the fields and an
+#: optional trailing newline the collector may append after the description.
+#: The selector emits the fields on one line with single spaces between them,
+#: but a hand-edited description with a final `\n` would otherwise fail to
+#: match. The selector never emits whitespace around `=`; matching `\s+`
+#: between the fields is enough to survive a copy-paste through a markdown
+#: renderer, which is how a human-readable status gets re-pasted into the
+#: runner.
+#:
+#: Asked names are bracket-delimited and comma-separated and may be empty.
+#: They are the selector's `reviewer_label` values (`coderabbit`), not the
+#: reviewer's login (`coderabbitai[bot]`): the roster publishes labels and
+#: the reviews arrive as logins, and the two are not the same string for
+#: most reviewers. `LABEL_TO_LOGIN` below maps one to the other before the
+#: gate intersects. A `login[bot]` arriving in `asked` is still accepted,
+#: because the comparison strips the suffix on both sides. `skipped` is a count:
+#: one or more digits. A description that still carries the old
+#: comma-separated name list parses too -- the count is the number of names
+#: -- so a status published before this change does not fail the gate closed.
+#:
+#: Two shapes match. The current one starts at `asked=`. The previous one
+#: starts at `band=` and ends at `profiles=`; its `skipped` group is the
+#: name list, which parse_roster counts. A description that starts with
+#: either prefix and matches neither is a corruption and fails closed.
+ROSTER_DESCRIPTION_RE = re.compile(
+    r'^(?:band=[a-z]+\s+)?'
+    r'asked=\[([^\]]*)\]\s+'
+    r'skipped=([^\s]+)'
+    r'(?:\s+unknown=(\d+))?'
+    r'(?:\s+profiles=\S+)?'
+    r'\s*$'
+)
+
+
+#: Roster label -> the login a review by that reviewer arrives under.
+#:
+#: The selector publishes `reviewer_label` in `asked` (select-roster.py
+#: writes `entry['reviewer']`, and every `asked` entry sets that from
+#: `reviewer_label`). The collector reads `author{login}` over GraphQL,
+#: which returns the actor's bare slug -- the same string as the table's
+#: `reviewer_key` with the `[bot]` suffix removed. Intersecting the two
+#: raw strings matches only the reviewers whose label happens to equal
+#: their login, which is one of ten. A clean PR whose only review came
+#: from CodeRabbit then reads as unreviewed, and the gate stays red on the
+#: one reviewer the roster asked for. (maxi-dist#312, #310, #859.)
+#:
+#: Copied from `REVIEWER_TABLE` in maxi-config maxi-review/select-roster.py,
+#: which is the source of truth: the roster cannot name a reviewer that is
+#: not in that table, and a reviewer added there without a row here is the
+#: unmapped case `roster_logins` fails closed on, naming the label. The
+#: values keep the `[bot]` suffix the table spells them with; the
+#: comparison strips it, so the GraphQL bare slug and the REST bracketed
+#: spelling both match.
+#:
+#: `maxi-lint` is not a reviewer. The fan-out fast-path collapses `asked`
+#: to that one label, and the gate never reaches the roster on a fan-out
+#: branch (the author+prefix bypass returns first). Mapping it would turn
+#: a lint label into a login that no review can ever carry.
+LABEL_TO_LOGIN = {
+    'maxi-reviewer': 'maxi-reviewer[bot]',
+    'qwen-coder-local': 'qwen-coder-review',
+    'coderabbit': 'coderabbitai[bot]',
+    'copilot': 'copilot-pull-request-reviewer[bot]',
+    'claude-review': 'claude-review',
+    'cubic': 'cubic-dev-ai[bot]',
+    'codacy': 'codacy-production',
+    'qlty': 'qlty[bot]',
+    'qodana': 'qodana',
+    'gemini': 'gemini-review',
+}
+
+#: The bare-suffix logins LABEL_TO_LOGIN points at, precomputed once so
+#: `roster_logins` does not rebuild the set on every label it inspects.
+KNOWN_LOGINS = frozenset(_strip_bot_suffix(value) for value in LABEL_TO_LOGIN.values())
+
+
+def roster_logins(asked):
+    """The logins a roster's `asked` labels correspond to.
+
+    Returns the set of logins with the `[bot]` suffix removed, so a review
+    collected over GraphQL (bare slug) and one collected over REST
+    (`login[bot]`) both match. Raises Malformed when a label has no row in
+    `LABEL_TO_LOGIN`: an unmapped label would otherwise match nothing and
+    read as "nobody reviewed", which is the silent miss this mapping
+    exists to close. The message names the label.
+    """
+    logins = set()
+    for label in asked:
+        bare = _strip_bot_suffix(label)
+        login = LABEL_TO_LOGIN.get(bare)
+        if login is None:
+            # A label that already IS a login still resolves: the roster
+            # publishes labels, but a hand-edited status or an older
+            # publisher could spell the login, and refusing a name the
+            # table itself uses would fail the gate on a roster that
+            # named its reviewer correctly.
+            if bare in KNOWN_LOGINS:
+                login = bare
+            else:
+                raise Malformed(
+                    'review-roster asked for ' + repr(label)
+                    + ', which is not a known reviewer label'
+                )
+        logins.add(_strip_bot_suffix(login))
+    return logins
+
+
+def _skipped_count(roster):
+    """The number of skipped reviewers, whether the payload carries a count or a list.
+
+    The selector publishes a count, because the description is capped at 140
+    characters and the gate only ever prints the length. A payload built
+    before that change, or a test, still carries the name list. Both answer
+    the same question.
+    """
+    skipped = roster.get('skipped')
+    if isinstance(skipped, int):
+        return skipped
+    if isinstance(skipped, list):
+        return len(skipped)
+    return 0
+
+
+def parse_roster(description):
+    """Parse a `review-roster` status description into asked names and a skip count.
+
+    Returns None when the description cannot be trusted to be a roster --
+    a None roster tells the gate to behave exactly as it did before T3,
+    failing closed to the old "any non-author review" rule.
+
+    Raises Malformed when the description LOOKS like a roster (the prefix
+    matches) but the body is unparseable. That is the dangerous shape: a
+    selector that is publishing the wrong thing in the right slot, which an
+    `ignored` rule would silently turn into a green gate.
+
+    `asked` is a list of names. `skipped` is a count: the selector publishes
+    a number because GitHub caps the description at 140 characters and the
+    gate only ever reads the length. A description that still carries the
+    old comma-separated name list parses as well, and the count is the
+    number of names, so a status published before the change does not fail
+    closed. That includes the complete previous wire format, which starts
+    with `band=` and ends with `profiles=` and is still published on every
+    head not re-reviewed since the shortening.
+    """
+    if not isinstance(description, str) or not description.strip():
+        return None
+    match = ROSTER_DESCRIPTION_RE.match(description.strip())
+    if not match:
+        # Decide between "this is not a roster description" and "this is a
+        # corrupted roster description". The selector publishes either the
+        # current `asked=` line or the previous `band=` line, so a
+        # description that starts with neither is an unrelated context or
+        # human editing -- "not a roster". A description that starts with
+        # one of those prefixes and then fails to match is a corruption
+        # and must fail closed.
+        stripped = description.lstrip()
+        if stripped.startswith('asked=') or stripped.startswith('band='):
+            raise Malformed(
+                'review-roster description is not in the expected shape: '
+                + repr(description)
+            )
+        return None
+
+    def _split(raw):
+        return [name for name in raw.split(',') if name]
+
+    skipped_raw = match.group(2).strip('[]')
+    if skipped_raw.isdigit():
+        skipped = int(skipped_raw)
+    else:
+        skipped = len(_split(skipped_raw))
+
+    return {'asked': _split(match.group(1)),
+            'skipped': skipped}
+
+
+class Malformed(Exception):
+    pass
+
+
+def _require(cond, msg):
+    if not cond:
+        raise Malformed(msg)
+
+
+def load(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise Malformed('could not read ' + path + ': ' + str(exc))
+    _require(raw.strip(), 'payload is empty (the collection step produced nothing)')
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise Malformed('payload is not valid JSON: ' + str(exc))
+
+
+#: The condition selectors --only accepts. THREADS and REVIEWER each judge one
+#: half; ALL judges both and is what a caller gets by default.
+ONLY_THREADS = 'threads'
+ONLY_REVIEWER = 'non-author-review'
+ONLY_ALL = 'all'
+ONLY_CHOICES = (ONLY_ALL, ONLY_THREADS, ONLY_REVIEWER)
+
+
+def evaluate(doc, only=ONLY_ALL):
+    """Return (ok, lines). Raises Malformed on input that cannot be judged.
+
+    `only` selects which condition to judge; the unselected one is not
+    evaluated and contributes neither a verdict nor a line. Validation of the
+    payload is NOT narrowed with it -- a malformed thread list still fails the
+    reviewer-only check, because a payload we cannot trust is not a payload we
+    can draw half a conclusion from.
+    """
+    _require(only in ONLY_CHOICES, 'unknown condition selector: ' + str(only))
+    _require(isinstance(doc, dict), 'payload is not a JSON object')
+
+    author = doc.get('author')
+    _require(isinstance(author, str) and author.strip(),
+             'payload has no PR author; cannot tell self-review from review')
+
+    # Absence, a non-list, or a list of non-strings all mean "no waiver", not
+    # "malformed". This field can only ever LOOSEN a verdict, so an unreadable
+    # one has to land on enforcement -- the same direction headRefName fails in.
+    # Requiring it would instead turn any upstream shape change into a red gate
+    # on every PR in the fleet, which is the opposite of failing closed.
+    raw_labels = doc.get('labels')
+    labels = raw_labels if isinstance(raw_labels, list) else []
+
+    reviews = doc.get('reviews')
+    threads = doc.get('threads')
+    _require(isinstance(reviews, list), 'payload field "reviews" is not a list')
+    _require(isinstance(threads, list), 'payload field "threads" is not a list')
+
+    # Roster is OPTIONAL. Absent field, None, or a non-object all mean "no
+    # roster was published for this head SHA" -- the gate falls back to the
+    # pre-roster rule and says `roster=absent` in its output. A present roster
+    # whose description cannot be parsed fails the whole evaluation closed
+    # (see parse_roster); the field's job here is to widen the verdict to
+    # one the gate cannot reach from the reviews alone.
+    raw_roster = doc.get('roster')
+    if raw_roster is None:
+        roster = None
+    else:
+        _require(isinstance(raw_roster, dict),
+                 'payload field "roster" is not an object')
+        _require('asked' in raw_roster and isinstance(raw_roster['asked'], list)
+                 and all(isinstance(n, str) for n in raw_roster['asked']),
+                 'payload field "roster.asked" is not a list of strings')
+        _require('skipped' in raw_roster and (
+                     (isinstance(raw_roster['skipped'], int) and raw_roster['skipped'] >= 0)
+                     or (isinstance(raw_roster['skipped'], list)
+                         and all(isinstance(n, str) for n in raw_roster['skipped']))),
+                 'payload field "roster.skipped" is not a count or a list of strings')
+        # A roster that names no one as `asked` cannot impose a narrower rule
+        # than the old "any non-author review" rule -- an empty `asked` is
+        # indistinguishable from "the selector wanted no reviews at all", and
+        # treating it as a stricter rule would mean a missing review fails the
+        # gate even though the selector did not ask for one. Fall back to the
+        # pre-roster rule in this single case, and surface the empty list so a
+        # reader sees it.
+        roster = raw_roster
+
+    lines = []
+
+    if doc.get('isDraft') is True:
+        return True, ['draft pull request - review gate not enforced']
+
+    # The fan-out's own payload was reviewed in maxi-config, on the PR that
+    # changed it. What lands here is a byte-for-byte copy of that payload in
+    # each of ~31 repos, opened by an app identity that never authors anything
+    # else -- so the reviewers those PRs used to summon were re-reviewing one
+    # already-reviewed diff thirty-one times. Suppressing them (CodeRabbit's
+    # ignore_usernames/ignore_title_keywords, and maxi-review's own head_ref
+    # guard) removes the only non-author reviewers a fan-out PR ever had, which
+    # would leave condition 2 unsatisfiable and this gate red forever.
+    #
+    # So the bypass is not a convenience: it is the half of that change that
+    # keeps the gate honest. It has to land BEFORE the suppression, or the
+    # fan-out strands. Like the draft case it short-circuits BOTH conditions --
+    # there is no reviewer to open a thread once the reviewers are suppressed,
+    # so judging threads alone would assert something no longer measurable.
+    #
+    # Gated on the AUTHOR as well as the branch. The branch prefix says which
+    # PRs the fan-out opens; it does not say who opened them, and a head ref is
+    # attacker-chosen. Prefix alone would have turned this bypass into a way for
+    # anyone able to push a branch -- in a repo whose gate exists precisely to
+    # stop unreviewed merges -- to name themselves past it. (maxi-reviewer, #468.)
+    head_ref = doc.get('headRefName')
+    if is_fanout_branch(head_ref) and author in FANOUT_AUTHORS:
+        return True, ['fan-out branch - reviewed at source (maxi-config or ci)']
+
+    # Dependabot: condition 2 ONLY, and deliberately not the whole gate.
+    #
+    # The fan-out bypass above short-circuits BOTH conditions because its
+    # reviewers are suppressed outright, so there is nobody left to open a
+    # thread and judging threads would assert something unmeasurable. That
+    # reasoning does NOT carry here. When a human pushes to a dependabot/*
+    # branch `github.actor` becomes that human, ordinary secrets ARE available,
+    # and the review lanes run normally -- so threads on a Dependabot PR are
+    # real, measurable, and must still be enforced. Bypassing both would have
+    # thrown that away for nothing.
+    #
+    # Note this keys on the PR AUTHOR, which stays Dependabot across such a
+    # push, while the workflow-side guards key on `github.actor`, which does
+    # not. That asymmetry is correct: the workflows are asking 「can this run
+    # read the secrets?」 and the gate is asking 「can this PR ever attract a
+    # reviewer?」. They are different questions about the same PR.
+    dependabot = (isinstance(head_ref, str)
+                  and head_ref.startswith(DEPENDABOT_BRANCH_PREFIX)
+                  and author in DEPENDABOT_AUTHORS)
+
+    # Exact match on the name, never a prefix or a substring: a label is
+    # repository-scoped and can only be applied by someone with write access,
+    # but 「contains」 would let `review-infra-unavailable-followup` waive the
+    # gate by accident.
+    infra_waiver = any(lbl == REVIEW_INFRA_LABEL
+                       for lbl in labels if isinstance(lbl, str))
+
+    # --- condition 1: unresolved threads ---------------------------------
+    unresolved = []
+    for i, th in enumerate(threads):
+        _require(isinstance(th, dict), 'thread ' + str(i) + ' is not an object')
+        resolved = th.get('isResolved')
+        # Absence is NOT 「resolved」. A shape change upstream must fail here
+        # rather than quietly reclassify every thread as fine.
+        _require(isinstance(resolved, bool),
+                 'thread ' + str(i) + ' has no boolean isResolved field')
+        if not resolved:
+            unresolved.append(th)
+
+    # --- condition 2: a non-author reviewer -------------------------------
+    # Two routes satisfy it, and a review belongs to exactly ONE of them:
+    #
+    #   route A (an APPROVAL) is per-reviewer and is a claim about a
+    #     REVISION, so it is only credited when the commit it names is the
+    #     pull request's current head;
+    #   route B (a reviewer LOOKED) is an assignment, and is credited from
+    #     the roster exactly as before -- commit-blind, because a comment is
+    #     what every reviewer in this fleet posts and re-anchoring it would
+    #     red the whole org (measured 2026-09-28: 3001 COMMENTED, 5
+    #     CHANGES_REQUESTED, 0 APPROVED across 604 open pull requests).
+    #
+    # Keeping the two apart is what makes "an approval at a stale head does
+    # nothing" true even for a reviewer the roster asked for: an APPROVED
+    # review is route A's business, so it is never credited by route B, and
+    # an approval that is not of the current head satisfies neither.
+    reviewers = []
+    approvals = []
+    head_sha = doc.get('headSha')
+    head_known = isinstance(head_sha, str) and bool(head_sha.strip())
+
+    for i, rv in enumerate(reviews):
+        _require(isinstance(rv, dict), 'review ' + str(i) + ' is not an object')
+        state = rv.get('state')
+        _require(isinstance(state, str), 'review ' + str(i) + ' has no state')
+        if state.upper() not in COUNTED_STATES:
+            continue
+        who = rv.get('author')
+        # A review whose author we cannot identify cannot be credited as a
+        # non-author review; that is the exact hole this gate exists to close.
+        if not isinstance(who, str) or not who.strip():
+            continue
+        if who == author:
+            continue
+
+        if state.upper() != 'APPROVED':
+            # Route B: this reviewer LOOKED. Unchanged from before route A
+            # existed, and deliberately commit-blind -- see the note above.
+            if who not in reviewers:
+                reviewers.append(who)
+            continue
+
+        # --- route A: this reviewer APPROVED ------------------------------
+        if not head_known:
+            # No head SHA in the payload, so an approval cannot be PLACED on
+            # the commit that would merge. Not credited: "approve, and we
+            # hope it was the current code" is the reading that lets an
+            # approval of a superseded revision carry a merge.
+            continue
+        commit = rv.get('commit')
+        if not isinstance(commit, str) or commit != head_sha:
+            # An approval of an older commit is an approval of code that is
+            # no longer in the pull request. This is the case that used to
+            # pass silently: the state was counted and the commit ignored.
+            # Route B does not pick it up either, precisely so that a stale
+            # approval cannot be credited as "the asked reviewer looked".
+            continue
+        if is_trusted_review_bot(who):
+            kind = 'trusted review bot'
+        elif is_bot_actor(who, rv.get('isBot')) is False:
+            kind = 'non-author account'
+        else:
+            # A bot the allowlist does not carry, or a reviewer whose actor
+            # type could not be read. Neither is ours to credit: the
+            # allowlist IS the trust decision for a bot.
+            continue
+        if (who, kind) not in approvals:
+            approvals.append((who, kind))
+
+    # Route B narrows to the selector's asked set when a roster is present AND
+    # non-empty. A `skipped` reviewer that happens to run (e.g. a
+    # dashboard-only bot whose lane is not gated by the roster) STILL appears
+    # in `reviewers` -- the listing is who actually reviewed, not the gate's
+    # required set -- but it does NOT end up in `covered`, because the asked
+    # set is what the gate waits for. That is the difference between "this bot
+    # was deliberately skipped" and "this bot silently failed": the roster
+    # says the first, the absence of a status says the second, and the gate
+    # honours whichever signal it sees.
+    #
+    # With NO roster the fallback used to be "any non-author review". It is
+    # now "a review from one of the review bots", because the two cases it
+    # actually decided were decided wrongly: a review from an account that is
+    # not a reviewer at all -- the org's own app identities, `github-actions`,
+    # project board automation -- satisfied a condition whose stated question
+    # is whether anyone reviewed the change. Measured 2026-09-28 over 101 open
+    # pull requests in six repositories: ten were relying on the absent-roster
+    # fallback, and three of those ten (`maxi-core#4792`, `maxi-ml#2660`,
+    # `maxi-dist#368`) were green on nothing but a review from
+    # `maxi-tools-auth[bot]`, the app identity that opens the pull request. The
+    # other seven stay green here: their reviewer is a review bot. A human who
+    # reviewed in that window is not left out either -- their APPROVAL
+    # satisfies route A, which is the stronger statement the card asks for.
+    #
+    # `active_roster` is the roster dict that applies, or None. Computed
+    # once and read by every branch below, so a typo in one branch does
+    # not silently desync from the others.
+    if roster is not None and roster.get('asked'):
+        active_roster = roster
+        # The roster publishes labels (`coderabbit`); reviews arrive as
+        # logins (`coderabbitai`, or `coderabbitai[bot]` over REST). Map
+        # before intersecting, and strip `[bot]` on both sides so the
+        # GraphQL bare slug and the REST spelling match the same row.
+        # An asked label with no row fails closed inside roster_logins,
+        # naming the label, rather than matching nothing.
+        asked_logins = roster_logins(active_roster['asked'])
+        covered = [name for name in reviewers
+                   if _strip_bot_suffix(name) in asked_logins]
+    else:
+        active_roster = None
+        asked_logins = None
+        # The absent-roster fallback: the review bots only. See the note above
+        # the branch -- the accounts this used to credit included the org's own
+        # app identities, which never review anything.
+        covered = [name for name in reviewers if is_trusted_review_bot(name)]
+
+    # Cross-family review: a covering reviewer whose family matches the
+    # producer family's is dropped from BOTH `covered` and `approvals`
+    # before the verdict is decided.
+    #
+    # This is the third hard rule on condition 2, after non-author (above)
+    # and head-anchored approval (above). It exists because the two model
+    # families that produce PRs in this fleet also post reviews, and a
+    # same-family reviewer can grant a condition whose stated question is
+    # "did somebody outside the author look at this?" with the same model
+    # that wrote the code. The shape is the same as `is_trusted_review_bot`:
+    # we trust a bot login about an approval, but not when the approval is
+    # the bot's own verdict on its own code.
+    #
+    # Family-detection sources, in order:
+    #   Producer family: `headRefName` prefix -- `claude/<slug>` is claude,
+    #     `codex/<slug>` is codex, anything else is `unknown`. The head
+    #     branch is attacker-chosen, so the prefix cannot be mis-interpreted
+    #     as a fan-out bypass: this rule is a block, not a bypass, and the
+    #     worst a wrong-prefix branch can do is "the gate refuses to treat
+    #     the reviewer as cross-family", which is the safe direction
+    #     (fails closed; maxi-tools-pr-merge t_c9377188, 2026-10-16).
+    #   Reviewer family: a login -> family map (REVIEWER_FAMILY_OF). The
+    #     only two logins whose family matters are the model-runner review
+    #     bots in the registry; every other reviewer is `other`, which
+    #     never collides with a claude- or codex-family producer.
+    #
+    # Two failure modes the rule handles differently:
+    #
+    #   Producer family known (claude or codex): the rule DELETES from
+    #     `covered` and `approvals` any reviewer whose family matches.
+    #     That blocks claude-review on a claude/<slug> head and
+    #     chatgpt-codex-connector on a codex/<slug> head.
+    #
+    #   Producer family UNKNOWN (wt/<slug> Hermes worktree, dependabot,
+    #     feature/<slug>): the producer could be either model family, but
+    #     we cannot tell which, so the rule DELETES only the logins that
+    #     are KNOWN to be one of the two model-runner review bots
+    #     (`claude-review`, `chatgpt-codex-connector`). Every other
+    #     trusted review bot (coderabbit, codacy, cubic, qodana, qlty,
+    #     gemini, qwen-coder-review, maxi-reviewer) is `other`; their
+    #     review cannot be a same-family self-verification, so they are
+    #     accepted. Codacy HIGH RISK, maxi-config#1116, 2026-10-16.
+    #
+    # `crossfam_dropped_coverers` and `crossfam_dropped_approvers` are the
+    # names the FAIL line cites so an operator can see which reviewers the
+    # rule removed. Computed BEFORE the filter rewrites `covered` /
+    # `approvals`, so the FAIL can refer back to the pre-filter state.
+    producer_family = producer_family_of(head_ref)
+    if producer_family in (FAMILY_CLAUDE, FAMILY_CODEX):
+        # Same-family match: a covering reviewer whose family equals the
+        # producer family's is dropped. Bot-vs-human makes no difference
+        # to this branch -- it is login family that matters.
+        crossfam_dropped_coverers = [name for name in covered
+                                      if reviewer_family_of_login(name) == producer_family]
+        crossfam_dropped_approvers = [who for (who, _kind) in approvals
+                                       if reviewer_family_of_login(who) == producer_family]
+        covered = [name for name in covered
+                   if reviewer_family_of_login(name) != producer_family]
+        approvals = [(who, kind) for (who, kind) in approvals
+                     if reviewer_family_of_login(who) != producer_family]
+    elif producer_family == FAMILY_UNKNOWN:
+        # Cannot tell the producer family. Refuse to credit reviewers
+        # whose login names them as a Claude or Codex model-runner bot,
+        # because any of them might be reviewing the same family that
+        # produced the change. `other` family reviewers are accepted.
+        crossfam_dropped_coverers = [name for name in covered
+                                      if is_restricted_under_unknown(name)]
+        crossfam_dropped_approvers = [who for (who, _kind) in approvals
+                                       if is_restricted_under_unknown(who)]
+        covered = [name for name in covered
+                   if not is_restricted_under_unknown(name)]
+        approvals = [(who, kind) for (who, kind) in approvals
+                     if not is_restricted_under_unknown(who)]
+    else:
+        crossfam_dropped_coverers = []
+        crossfam_dropped_approvers = []
+    cross_family_active = (producer_family in (FAMILY_CLAUDE, FAMILY_CODEX)
+                           or bool(crossfam_dropped_coverers or crossfam_dropped_approvers))
+
+    ok = True
+
+    if only in (ONLY_ALL, ONLY_THREADS) and unresolved:
+        ok = False
+        lines.append('FAIL: ' + str(len(unresolved)) + ' unresolved review thread(s):')
+        for th in unresolved:
+            where = th.get('path') or '(no file)'
+            url = th.get('url') or '(no url)'
+            who = th.get('author') or 'unknown'
+            flag = ' [outdated]' if th.get('isOutdated') is True else ''
+            lines.append('  - ' + who + ' on ' + where + flag + ' -> ' + url)
+        # The trap: resolving the last thread emits NO Actions event, so this
+        # check stays red on a PR that is now clean. Say so here rather than
+        # leaving it in a workflow comment nobody reads from a failed check.
+        lines.append('  Resolving a thread fires no Actions event, so this check')
+        lines.append('  will stay red until you re-run it or push. That is expected.')
+    elif only in (ONLY_ALL, ONLY_THREADS):
+        lines.append('ok: no unresolved review threads (' + str(len(threads)) + ' total)')
+
+    if (only in (ONLY_ALL, ONLY_REVIEWER)
+            and not covered and not approvals and not dependabot and not infra_waiver):
+        ok = False
+        self_reviews = sum(
+            1 for rv in reviews
+            if isinstance(rv, dict) and rv.get('author') == author
+            and isinstance(rv.get('state'), str)
+            and rv['state'].upper() in COUNTED_STATES
+        )
+        # Cross-family FAIL: the rule above dropped every reviewer and
+        # every APPROVED reviewer that was covering. The standard "no
+        # reviewer" FAIL line would still be true (none covered), but it
+        # would not say WHY the reviewers that ran didn't count, and an
+        # operator seeing "no review yet" would naturally push the same
+        # same-family reviewer again. The dedicated line names the family
+        # and the dropped reviewers so the fix is "summon a different-family
+        # reviewer" rather than "summon any reviewer".
+        #
+        # The line keeps the `FAIL:` prefix so the existing
+        # `failure_annotations()` path surfaces it on the checks page;
+        # the body is the cross-family-specific reason. `_CROSSFAM_PREFIX`
+        # is also embedded for any downstream consumer that wants to tell
+        # cross-family FAILs from every other kind.
+        if cross_family_active and (crossfam_dropped_coverers or crossfam_dropped_approvers):
+            cf_lines = [crossfam_dropped_coverers, crossfam_dropped_approvers]
+            dropped_names = sorted({n for lst in cf_lines for n in lst})
+            if producer_family in (FAMILY_CLAUDE, FAMILY_CODEX):
+                mode = ('reviewer family matches producer family (' + producer_family
+                        + '). dropped by the cross-family rule: '
+                        + ', '.join(dropped_names)
+                        + '. Summon a reviewer from a different family (claude <-> codex)')
+            else:
+                # Producer family unknown: the rule refused the model-runner
+                # reviewers because any of them might be the same family
+                # that wrote the diff. The actionable fix is to route the
+                # review to a non-model reviewer (one of the `other` family
+                # bots) or surface the producer family in a way the gate can
+                # see (claude/<slug> or codex/<slug> branch prefix).
+                mode = ('producer family cannot be determined from headRefName. '
+                        + 'refused model-runner reviewers '
+                        + '(' + ', '.join(dropped_names) + ') '
+                        + 'to fail closed on a possibly same-family review. '
+                        + 'Route the next review to a non-model reviewer '
+                        + '(coderabbit, codacy, cubic, qodana, qlty, gemini, '
+                        + 'qwen-coder-review, maxi-reviewer), or push a commit '
+                        + 'with a branch prefix the gate can classify '
+                        + '(claude/ or codex/).')
+            lines.append('FAIL: ' + _CROSSFAM_PREFIX + ' ' + mode)
+        elif asked_logins is not None:
+            # Roster present and non-empty: the FAIL has to name the asked
+            # set so an operator knows which reviewer to summon. The gate is
+            # here because nobody on the asked list has reviewed -- a
+            # `skipped` reviewer that ran anyway would NOT be in `covered`
+            # (covered is reviewers ∩ asked), but its presence in
+            # `reviewers` did not satisfy the required set. Surface that
+            # distinction so a triage reader does not chase a reviewer the
+            # roster said to skip.
+            lines.append('FAIL: roster asked for ' +
+                         ', '.join(sorted(active_roster['asked'])) +
+                         ' but none of them has reviewed.')
+            lines.append('  A COMMENTED review from any reviewer on the asked list')
+            lines.append('  satisfies this; pushing a commit is usually enough to')
+            lines.append('  summon them.')
+            lines.append(_APPROVAL_HELP)
+        else:
+            lines.append('FAIL: no review from anyone other than the author (' + author + ').')
+            if self_reviews:
+                lines.append('  ' + str(self_reviews) + ' review(s) found, but all are by the author.')
+                lines.append('  Self-review is not review. Every agent lane in this org')
+                lines.append('  authenticates as the same account, so this is the common case.')
+            elif reviewers:
+                # Reviews exist, but none from an account that reviews. The
+                # accounts that land here are the org's own automation -- the
+                # app identity that opens the pull request, the project board
+                # bot -- whose review says nothing about the change.
+                lines.append('  ' + str(len(reviewers)) + ' non-author review(s) found (' +
+                             ', '.join(sorted(reviewers)) + '), but none is from a')
+                lines.append('  review bot: a review from an account that does not review')
+                lines.append('  changes is not a review of this change.')
+            else:
+                lines.append('  No reviews at all. This does NOT need a human approval:')
+                lines.append('  a COMMENTED review from any review bot satisfies it. Pushing')
+                lines.append('  a commit is usually enough to summon them.')
+            lines.append(_APPROVAL_HELP)
+    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered and not approvals and dependabot:
+        # Dependabot is checked before the label so a Dependabot PR that also
+        # carries the label is still reported by its structural reason, which
+        # is the true one and needs no human to have asserted anything.
+        lines.append('ok: dependabot pull request - the review lanes cannot run '
+                     'without Dependabot secrets, so no reviewer can be summoned')
+    elif only in (ONLY_ALL, ONLY_REVIEWER) and not covered and not approvals:
+        # Reached only under the infrastructure waiver -- the branches above own
+        # every other reviewer-less case.
+        lines.append(WAIVED_PREFIX + ' ' + REVIEW_INFRA_LABEL
+                     + ' - no non-author review; merging on the assertion that '
+                       'no reviewer could be summoned')
+    elif only in (ONLY_ALL, ONLY_REVIEWER):
+        # The roster-aware line names only the asked reviewers that DID
+        # review, not the full `reviewers` set -- `skipped` reviewers are
+        # deliberately not in the asked list, and reporting them here would
+        # confuse a reader who reads "X reviewed" without the roster context
+        # and assumes X was required. The roster context goes on the line
+        # below.
+        if covered:
+            listed = sorted(covered) if asked_logins is not None else sorted(reviewers)
+            lines.append('ok: reviewed by ' + str(len(listed)) + ' non-author reviewer(s): '
+                         + ', '.join(listed))
+        else:
+            # Satisfied by the approval path alone. Naming the reviewer and
+            # WHY it was trusted is the difference between a reader who can
+            # re-derive the verdict and one who has to trust it: a bot that
+            # says "I reviewed this" is not the same evidence as a human
+            # account that approved, and the log should not blur the two.
+            lines.append('ok: approved at this head by '
+                         + ', '.join(sorted(who for who, _ in approvals)))
+        for who, kind in sorted(approvals):
+            lines.append('  ' + who + ' approved commit ' + str(head_sha)[:12]
+                         + ' (' + kind + ')')
+        if asked_logins is not None:
+            # Surface the roster shape on every passing line: a reader of the
+            # log who can see CodeRabbit skipped it knows the gate was not
+            # waiting for CodeRabbit. Naming `skipped=` here would also be
+            # correct but adds noise on PRs where `skipped=[]`; keep the
+            # one-line summary tight and put `profiles=` in the workflow's
+            # own step summary instead. `asked=` already shows up via the
+            # FAIL branch above; the PASS branch repeats the size so a
+            # reader scanning the log sees how many reviewers the roster
+            # asked for.
+            lines.append('  roster=present asked=' + str(len(active_roster['asked']))
+                         + ' skipped=' + str(_skipped_count(active_roster)))
+        else:
+            lines.append('  roster=absent - behaving as before the roster selector shipped')
+
+    return ok, lines
+
+
+def waiver_label(lines):
+    """The label a condition was waived by, or '' when none was.
+
+    Reads the evaluator's own output rather than re-deriving the decision from
+    the payload, for the same reason failure_annotations does: a second place
+    that computes the verdict is a second place that can drift from it.
+    """
+    for line in lines:
+        if line.startswith(WAIVED_PREFIX):
+            return line[len(WAIVED_PREFIX):].strip().split(' ', 1)[0]
+    return ''
+
+
+def emit_waiver(label):
+    """Publish the waiver as a GitHub Actions step output, if we are in one.
+
+    Allow-listed against the labels this gate actually honours before it is
+    written. The value is our own constant today and cannot contain a newline,
+    but $GITHUB_OUTPUT is a file format where a newline in a value sets
+    ARBITRARY further outputs -- so the safety is asserted here rather than
+    inherited from where the string happens to come from right now.
+
+    A missing $GITHUB_OUTPUT is not an error: the script is run directly by
+    tests/test_pr_review_gate.py, and refusing to judge a PR because nobody
+    wanted the output would be a gate that fails on its own test suite.
+    """
+    if label not in ('', REVIEW_INFRA_LABEL):
+        print('::warning::refusing to publish unrecognised waiver ' + repr(label))
+        return
+    path = os.environ.get('GITHUB_OUTPUT')
+    if not path:
+        return
+    try:
+        with open(path, 'a', encoding='utf-8') as fh:
+            fh.write('waiver=' + label + '\n')
+    except OSError as exc:
+        print('::warning::could not publish the waiver output: ' + str(exc))
+
+
+def failure_annotations(lines):
+    """The failing halves, as single-line GitHub `::error::` annotation texts.
+
+    The gate tests two independent conditions, and a check name cannot say
+    which of them failed. An annotation can: GitHub surfaces `::error::` on the
+    PR's checks page, so the cause is visible without opening the log. A
+    generic "see the lines above" put the cause one click away, and the
+    conclusion people reached from the name alone -- that the gate wants a
+    human approval -- was frequently the wrong half.
+
+    Each `FAIL:` line the evaluator emits is already a complete sentence naming
+    its own condition, so this reuses them rather than restating the verdict in
+    a second place that could drift from it.
+    """
+    prefix = 'FAIL:'
+    return [
+        line[len(prefix):].strip().rstrip(':')
+        for line in lines
+        if line.startswith(prefix)
+    ]
+
+
+def parse_args(argv):
+    """Return (payload_path, only). Raises Malformed on unusable arguments.
+
+    Deliberately hand-rolled rather than argparse: an unknown --only value must
+    fail closed with the same "cannot judge this PR" treatment as a malformed
+    payload. argparse would exit 2 straight out of the parser, and a check that
+    dies before it judges anything reads on the PR page as the very ambiguity
+    this split exists to remove.
+    """
+    args = list(argv[1:])
+    only = ONLY_ALL
+    positional = []
+    while args:
+        arg = args.pop(0)
+        if arg == '--only':
+            _require(args, '--only needs a value ' + str(list(ONLY_CHOICES)))
+            only = args.pop(0)
+        elif arg.startswith('--only='):
+            only = arg.split('=', 1)[1]
+        else:
+            positional.append(arg)
+    _require(only in ONLY_CHOICES,
+             'unknown --only value ' + repr(only) + '; expected one of '
+             + ', '.join(ONLY_CHOICES))
+    _require(len(positional) == 1,
+             'expected exactly one payload path, got ' + str(len(positional)))
+    return positional[0], only
+
+
+def main(argv):
+    try:
+        payload_path, only = parse_args(argv)
+        doc = load(payload_path)
+        ok, lines = evaluate(doc, only)
+    except Malformed as exc:
+        print('::error::review gate could not evaluate this PR: ' + str(exc))
+        print('Failing closed: an unjudgeable payload is not a pass.', file=sys.stderr)
+        return 1
+    for line in lines:
+        print(line)
+    emit_waiver(waiver_label(lines))
+    if not ok:
+        annotations = failure_annotations(lines)
+        if annotations:
+            for annotation in annotations:
+                print('::error::review gate: ' + annotation)
+        else:
+            # Unreachable while every failure path emits a FAIL: line, but a
+            # silent red check would be worse than a generic one.
+            print('::error::review gate failed - see the lines above')
+        return 1
+    print('review gate: passed')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
