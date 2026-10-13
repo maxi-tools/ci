@@ -113,8 +113,34 @@ jobs:
       reason: ${{ steps.resolve.outputs.reason }}
       lane: ${{ steps.resolve.outputs.lane }}
       provider: ${{ steps.resolve.outputs.provider }}
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event_name != 'merge_group' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
+      - uses: actions/checkout@v4
+        with:
+          # `persist-credentials: false` so the implicitly-minted `GITHUB_TOKEN`
+          # for this workflow job cannot be reused by a PR's local action body
+          # to push back. The resolve-runner step uses the org App token below
+          # for its own API calls, not this one.
+          persist-credentials: false
+
+      - name: Generate org repo token
+        # Same shape as route-clippy (maxi-config/.github/workflows/clippy.yml).
+        # The reusable runs in a context with no org token by default, so the
+        # resolve-runner step's `actions: read` + `organization_self_hosted_
+        # runners: read` probes 403 without a scoped mint. Under-scoped tokens
+        # buy a green check that routes to WarpBuild (resolve_runner.py maps
+        # API 403 to `reason=github-api-unavailable`).
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          permission-actions: read
+          permission-organization-self-hosted-runners: read
+
       - name: Fetch the routing policy
         id: fetch-policy
         uses: ./.github/actions/fetch-policy
@@ -137,7 +163,7 @@ jobs:
           # for all four; the four jobs share the same lane.
           job: gate
           policy-path: .maxi-config/ci/runner-routing.toml
-          github-token: ${{ github.token }}
+          github-token: ${{ steps.app-token.outputs.token }}
 
   # The preemptive half of the collapse. The caller's wrapper holds one
   # concurrency lane per (PR, event) with `cancel-in-progress: false`, so a

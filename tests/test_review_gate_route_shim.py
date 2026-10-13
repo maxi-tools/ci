@@ -92,6 +92,25 @@ class RouteShimWiringTest(unittest.TestCase):
             f"job in this file carries the same gate; a shim without it is "
             f"the regression class.",
         )
+        # merge_group carries no `pull_request` payload, so the same-repo
+        # check above would raise on a synthetic queue ref. The other
+        # self-hosted jobs in this file (supersede-check, invalidate,
+        # dedupe, gate) all guard with `github.event_name != 'merge_group'`
+        # for that reason; a shim that does not match skips the four
+        # downstream jobs on merge_group via the `needs:` chain, but the
+        # SHIM itself would still try to run, hit a missing `pull_request`
+        # field, and fail its `if:`. Mirror the same phrase.
+        self.assertIn(
+            "github.event_name != 'merge_group'",
+            if_,
+            f"{WORKFLOW.name} `{SHIM_NAME}:` `if:` does not exclude "
+            f"`merge_group`. The synthetic queue ref carries no "
+            f"`pull_request` payload, so the same-repo check would error "
+            f"on a queue ref and the shim would fail before its "
+            f"`needs:`-chain skip can take effect. Every other "
+            f"self-hosted job in this file carries the same `merge_group` "
+            f"guard; a shim without it is the regression class.",
+        )
 
     def test_shim_invokes_resolve_runner_with_documented_inputs(self):
         shim = self.jobs[SHIM_NAME]
@@ -172,6 +191,31 @@ class RouteShimWiringTest(unittest.TestCase):
                 f"`inputs.runs_on`) bypasses the router entirely; the "
                 f"overflow never reaches this job.",
             )
+
+    def test_shim_checks_out_before_using_local_actions(self):
+        # The shim's resolve-runner and fetch-policy steps use the local
+        # `./.github/actions/...` path, which is only on disk after
+        # `actions/checkout@v4` has run. Without the checkout, the runner
+        # reports `Can't find 'action.yml'...Did you forget to run
+        # actions/checkout before running your local action?` and the
+        # shim fails before it can resolve anything. The reusable runs
+        # in a context with NO checkout of the calling repo (this file's
+        # owning repo, maxi-tools/ci), so a checkout is required
+        # explicitly. Mirrors `route-clippy` in
+        # maxi-config/.github/workflows/clippy.yml.
+        shim = self.jobs[SHIM_NAME]
+        steps = shim.get("steps") or []
+        step_uses = [s.get("uses") for s in steps if isinstance(s, dict)]
+        self.assertTrue(
+            any(isinstance(u, str) and u.startswith("actions/checkout@") for u in step_uses),
+            f"{WORKFLOW.name} `{SHIM_NAME}:` does not call "
+            f"`actions/checkout@*` before its `uses: ./.github/actions/...` "
+            f"steps. The local action bodies are not on disk in a "
+            f"reusable's runner context without an explicit checkout, and "
+            f"the resolve-runner step errors with `Can't find 'action.yml'"
+            f"...` before producing a runs-on output. Mirrors the "
+            f"`route-clippy` shim in maxi-config.",
+        )
 
     def test_shim_runs_on_inputs_runs_on(self):
         # The shim's OWN runner is the caller's `inputs.runs_on`. This
