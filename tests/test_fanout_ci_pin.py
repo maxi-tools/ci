@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -166,7 +167,7 @@ class EveryConsumerIsAccountedFor(unittest.TestCase):
         """OUTCOMES is the schema the workflow's post-summary step reads."""
         src = SCRIPT.read_text(encoding="utf-8")
         for name in ("opened", "reused", "already", "dry-run", "failed",
-                     "unreadable", "opt-out", "no-pin", "not-a-sha"):
+                     "unreadable", "opt-out", "no-pin", "not-a-sha", "owned-sync"):
             self.assertIn(name, fp.OUTCOMES)
             self.assertIn(repr(name), src, f"{name!r} is declared but never emitted")
 
@@ -185,19 +186,33 @@ class OneBranchPerConsumer(unittest.TestCase):
 
         def gh(args, *, token):
             calls.append(args)
-            if args[:2] == ["pr", "list"]:
-                return json.dumps(open_prs)
+            if args[:2] == ["api", "--paginate"] and args[4] == 'repos/maxi-tools/x/pulls':
+                return "\n".join(json.dumps([p["number"], p["url"], p["headRefName"]])
+                                 for p in open_prs)
             if args[:2] == ["pr", "create"]:
                 return "https://github.com/maxi-tools/x/pull/9\n"
+            if args[:2] == ["pr", "view"]:
+                return json.dumps({'author': {'login': 'app/maxi-tools-auth'},
+                                   'headRefName': 'ci/fanout-660e29c41e4d',
+                                   'files': [{'path': '.github/workflows/review-gate.yml'}]})
+            if args[:2] == ["api", "--paginate"] and '/commits' in args[4]:
+                bot = {'name': 'Maxi Boch',
+                       'email': '874012+maxiboch@users.noreply.github.com'}
+                return json.dumps({'author': bot, 'committer': bot,
+                                   'message': 'ci: advance pin to ' + TIP[:12]})
             return ""
 
         pushes = []
+        merges = []
         with mock.patch.object(fp, "_gh", gh), \
              mock.patch.object(fp, "_push_pin_branch",
-                               lambda c, **kw: pushes.append(kw["head_ref"])):
+                               lambda c, **kw: pushes.append(kw["head_ref"])), \
+             mock.patch.object(fp, "_enable_automerge",
+                               lambda c, url, **kw: merges.append(url)):
             outcome, url = fp._open_pr(
                 consumer=fp.Consumer("maxi-tools/x"), workflow_file="review-gate-reusable",
                 old_ref=OLD, new_ref=TIP, tip_sha=TIP, token="t", dry_run=False)
+        self.assertEqual(merges, [url])
         return outcome, url, calls, pushes
 
     def test_no_open_pr_creates_one_on_the_stable_branch(self):
@@ -215,9 +230,9 @@ class OneBranchPerConsumer(unittest.TestCase):
         self.assertEqual((outcome, url), ("reused", ours["url"]))
         self.assertEqual(pushes, [fp.HEAD_REF], "the branch is force-pushed to the new tip")
         self.assertFalse(any(c[:2] == ["pr", "create"] for c in calls), "no second PR")
-        edit = next(c for c in calls if c[:2] == ["pr", "edit"])
-        self.assertEqual(edit[2], "4")
-        self.assertIn(f"ci: advance pin to {TIP[:12]} (review-gate-reusable)", edit)
+        edit = next(c for c in calls if c[:3] == ["api", "--method", "PATCH"])
+        self.assertEqual(edit[3], "repos/maxi-tools/x/pulls/4")
+        self.assertIn(f"title=ci: advance pin to {TIP[:12]} (review-gate-reusable)", edit)
 
     def test_legacy_per_sha_prs_are_closed_as_superseded(self):
         legacy = {"number": 2, "url": "https://github.com/maxi-tools/x/pull/2",
@@ -240,6 +255,167 @@ class OneBranchPerConsumer(unittest.TestCase):
                             workflow_file="review-gate-reusable", old_ref=OLD,
                             new_ref=TIP, tip_sha=TIP, token="t", dry_run=True),
                 ("dry-run", None))
+
+
+class ProtectedAutomerge(unittest.TestCase):
+    def test_effective_required_checks_enable_merge_commit(self):
+        calls = []
+        def gh(args, *, token):
+            calls.append(args)
+            if args[1] == 'repos/maxi-tools/x':
+                return json.dumps('main')
+            if '/rules/branches/' in args[1]:
+                return json.dumps([{'type': 'required_status_checks',
+                                    'parameters': {'required_status_checks': [{'context': 'build'}]}}])
+            return ''
+        with mock.patch.object(fp, '_gh', gh):
+            fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'https://github.com/maxi-tools/x/pull/9', token='t')
+        self.assertEqual(calls[-1], ['pr', 'merge', 'https://github.com/maxi-tools/x/pull/9',
+                                     '--repo', 'maxi-tools/x', '--auto', '--merge'])
+
+    def test_empty_rules_do_not_merge(self):
+        calls = []
+        def gh(args, *, token):
+            calls.append(args)
+            if args[1] == 'repos/maxi-tools/x':
+                return json.dumps('main')
+            return '[]'
+        with mock.patch.object(fp, '_gh', gh):
+            fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'url', token='t')
+        self.assertFalse(any(c[:2] == ['pr', 'merge'] for c in calls))
+
+    def test_unreadable_rules_fail_closed(self):
+        with mock.patch.object(fp, '_gh', side_effect=['"main"', RuntimeError('HTTP 403')]):
+            with self.assertRaises(RuntimeError):
+                fp._enable_automerge(fp.Consumer('maxi-tools/x'), 'url', token='t')
+
+
+class OwnedSyncRouting(unittest.TestCase):
+    def test_owned_copy_is_not_a_second_pin_pr(self):
+        import base64
+        text = '# maxi-config-owned Maxi review gate workflow.\n' + (
+            '    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@' + OLD)
+        def gh(args, *, token):
+            if args[-1] == '.[].name':
+                return 'review-gate.yml\n'
+            return base64.b64encode(text.encode()).decode()
+        with mock.patch.object(fp, '_gh', gh):
+            plan = fp._plan(tip_sha=TIP, consumers=['maxi-tools/x'], token='t')
+        self.assertEqual(plan[0].outcome, 'owned-sync')
+
+    def test_source_and_installed_copy_advance_together(self):
+        text = '# maxi-config-owned Maxi review gate workflow.\n' + (
+            '    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@' + OLD + '\n')
+        with tempfile.TemporaryDirectory() as root:
+            src = pathlib.Path(root) / 'maxi-review/review-gate.yml'
+            dst = pathlib.Path(root) / '.github/workflows/review-gate.yml'
+            src.parent.mkdir(parents=True)
+            dst.parent.mkdir(parents=True)
+            src.write_text(text)
+            dst.write_text(text)
+            with mock.patch.object(fp, '_run', return_value=''), \
+                 mock.patch('tempfile.mkdtemp', return_value=root):
+                fp._push_pin_branch(fp.Consumer('maxi-tools/maxi-config'),
+                                    head_ref=fp.HEAD_REF, new_ref=TIP, token='t')
+            self.assertEqual(src.read_text(), dst.read_text())
+            self.assertIn(TIP, src.read_text())
+
+    def _retire(self, *, pr_author='app/maxi-tools-auth',
+                paths=('.github/workflows/review-gate.yml',),
+                commits=None, already_commented=False, legacy=False,
+                consumer_name='maxi-tools/x'):
+        pr = {'number': 12, 'headRefName': ('ci/fanout-660e29c41e4d'
+                                            if legacy else fp.HEAD_REF)}
+        calls = []
+        bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
+        if commits is None:
+            commits = [{'author': bot, 'committer': bot,
+                        'message': 'ci: advance pin to ' + TIP[:12]}]
+        def gh(args, *, token):
+            calls.append(args)
+            if args[:2] == ['pr', 'view']:
+                return json.dumps({'author': {'login': pr_author},
+                                   'headRefName': pr['headRefName'],
+                                   'files': [{'path': p} for p in paths]})
+            if args[:2] == ['api', '--paginate']:
+                if '/pulls/12/commits' in args[4]:
+                    return '\n'.join(json.dumps(c) for c in commits)
+                if '/issues/12/comments' in args[4]:
+                    return '"7"' if already_commented else ''
+            return ''
+        with mock.patch.object(fp, '_open_fanout_prs', return_value=[pr]), \
+             mock.patch.object(fp, '_gh', gh):
+            if legacy:
+                with mock.patch.object(fp, '_push_pin_branch'), \
+                     mock.patch.object(fp, '_enable_automerge'):
+                    fp._open_pr(consumer=fp.Consumer(consumer_name),
+                                workflow_file='review-gate-reusable', old_ref=OLD,
+                                new_ref=TIP, tip_sha=TIP, token='t', dry_run=False)
+            else:
+                fp._retire_owned_pin_prs(fp.Consumer(consumer_name), token='t')
+        return calls
+
+    def test_only_bot_owned_pin_pr_is_retired(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                calls = self._retire(legacy=legacy)
+                closes = [c for c in calls if c[:2] == ['pr', 'close']]
+                self.assertEqual(len(closes), 1)
+                self.assertIn('--delete-branch', closes[0])
+
+    def test_maxi_config_two_file_shape_is_retired(self):
+        paths = ('maxi-review/review-gate.yml', '.github/workflows/review-gate.yml')
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                calls = self._retire(legacy=legacy, paths=paths,
+                                     consumer_name='maxi-tools/maxi-config')
+                closes = [c for c in calls if c[:2] == ['pr', 'close']]
+                self.assertEqual(len(closes), 1)
+                self.assertIn('--delete-branch', closes[0])
+        # ...but the two-file shape is NOT acceptable on other consumers.
+        calls = self._retire(paths=paths)
+        self.assertFalse(any(c[:2] == ['pr', 'close'] for c in calls))
+
+    def test_unsafe_pin_prs_are_left_open_with_their_branches(self):
+        bot = {'name': 'Maxi Boch', 'email': '874012+maxiboch@users.noreply.github.com'}
+        human_maxi = [{'author': bot, 'committer': bot,
+                       'message': 'fix(review-gate): tighten timeout'}]
+        other = {'name': 'Human', 'email': 'human@example.com'}
+        human_actor = [{'author': other, 'committer': other,
+                        'message': 'ci: advance pin to ' + TIP[:12]}]
+        mixed = [{'author': bot, 'committer': bot,
+                  'message': 'ci: advance pin to ' + TIP[:12]},
+                 {'author': other, 'committer': bot,
+                  'message': 'ci: advance pin to ' + TIP[:12]}]
+        cases = (
+            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml',),
+             human_maxi, 'commit message does not match'),
+            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml',),
+             human_actor, 'not every commit'),
+            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml',),
+             mixed, 'not every commit'),
+            ('app/maxi-tools-auth', ('.github/workflows/review-gate.yml', 'human.txt'),
+             None, 'file set'),
+            ('human', ('.github/workflows/review-gate.yml',), None, 'PR author'),
+        )
+        for legacy in (False, True):
+            for author, paths, commits, reason in cases:
+                with self.subTest(legacy=legacy, reason=reason):
+                    calls = self._retire(legacy=legacy, pr_author=author,
+                                         paths=paths, commits=commits)
+                    self.assertFalse(any(c[:2] == ['pr', 'close'] for c in calls))
+                    comments = [c for c in calls if c[:2] == ['pr', 'comment']]
+                    self.assertEqual(len(comments), 1)
+                    self.assertIn(reason, comments[0][-1])
+                    self.assertFalse(any('--delete-branch' in c for c in calls))
+
+    def test_leave_open_comment_is_not_duplicated(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                calls = self._retire(legacy=legacy, pr_author='human',
+                                     already_commented=True)
+                self.assertFalse(any(c[:2] == ['pr', 'close'] for c in calls))
+                self.assertFalse(any(c[:2] == ['pr', 'comment'] for c in calls))
 
 
 if __name__ == "__main__":
