@@ -77,6 +77,29 @@ def runtime_paths(text):
     return out
 
 
+def is_self_repository_path(inner: str) -> bool:
+    """True if a `$/<path>` form is a valid self-repository reference.
+
+    A leading-slash or `..` segment makes the path escape the running
+    repository; either is invalid syntax. Empty path is also invalid.
+    """
+    if not inner or inner.startswith('/'):
+        return False
+    return '..' not in inner.split('/')
+
+
+def action_metadata_exists(target: pathlib.Path) -> bool:
+    """True if `target` is a composite-action directory with action.yml or action.yaml.
+
+    GitHub supports either metadata filename; the previous version
+    accepted only `action.yml` and reported the supported `action.yaml`
+    form as unresolvable (maxi-config#174, ci#70).
+    """
+    if not target.is_dir():
+        return False
+    return (target / 'action.yml').is_file() or (target / 'action.yaml').is_file()
+
+
 def main():
     problems = []
     checked = 0
@@ -92,6 +115,24 @@ def main():
             ref = match.group(1).strip('"').strip("'")
             checked += 1
 
+            # `$/` is GitHub's self-repository syntax for reusable workflows
+            # and composite actions: it resolves to the workflow's own
+            # repository at the exact running commit, no checkout required.
+            # A `./` reference is therefore wrong here -- a `workflow_call`
+            # reusable runs inside each CALLER's workspace, and consumers do
+            # not vendor this repository's actions. The official docs are
+            # at https://docs.github.com/actions/reference/workflow-syntax-for-github-actions#self-repository-syntax.
+            # We accept `$/...` and defer it to runtime the same way a
+            # checkout-materialised path is deferred; reporting it as a
+            # local resolution problem is the false green that originally
+            # masked the regression (maxi-config#174, ci#70).
+            if ref.startswith('$/'):
+                if is_self_repository_path(ref[2:]):
+                    deferred.append(f'{rel}: {ref} (resolves via self-repository syntax at runtime)')
+                else:
+                    problems.append(f'{rel}: `uses: {ref}` has an invalid self-repository path')
+                continue
+
             if ref.startswith('./'):
                 inner = ref[2:]
                 root_dir = inner.split('/', 1)[0]
@@ -99,14 +140,27 @@ def main():
                     # Materialised by a checkout step in this same workflow.
                     deferred.append(f'{rel}: {ref} (created at runtime)')
                     continue
-                if not (ROOT / inner).is_file():
-                    problems.append(
-                        f'{rel}: `uses: {ref}` does not resolve, and no '
-                        f'checkout step in this workflow creates '
-                        f'{root_dir!r}. Consumers execute this call inside '
-                        f'THIS repository at the sha they pinned, so a '
-                        f'missing target breaks all of them at once and '
-                        f'nothing here reports it.')
+                # `uses: ./.github/actions/<name>` resolves to
+                # .github/actions/<name>/action.yml at runtime -- GitHub's
+                # composite-action convention. A bare file reference (a
+                # .yml directly under the path) is also accepted, matching
+                # `uses: ./.github/workflows/lane-x.yml`. Either metadata
+                # filename is supported (action.yml OR action.yaml) -- the
+                # `.yaml` form was previously reported as unresolvable here
+                # even though the runner happily executes it. Either form
+                # being resolvable here is what makes the check mean
+                # anything: the call site fails on every consumer at
+                # job-setup time otherwise, with no local signal.
+                target = ROOT / inner
+                if target.is_file() or action_metadata_exists(target):
+                    continue
+                problems.append(
+                    f'{rel}: `uses: {ref}` does not resolve, and no '
+                    f'checkout step in this workflow creates '
+                    f'{root_dir!r}. Consumers execute this call inside '
+                    f'THIS repository at the sha they pinned, so a '
+                    f'missing target breaks all of them at once and '
+                    f'nothing here reports it.')
                 continue
 
             if '@' not in ref:

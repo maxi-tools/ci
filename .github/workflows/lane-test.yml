@@ -219,14 +219,20 @@ jobs:
           fi
 
       # Repos with native system-library deps (e.g. alsa-sys behind a midi
-      # feature) declare them in ci/apt-packages.txt — one package per line,
-      # '#' comments allowed. Absent file means no extra packages. The
-      # install logic lives in .github/actions/install-apt-packages and is
-      # shared with lane-check.yml and lane-package.yml; one implementation
-      # in one place is the deduplication that closes maxi-config#174.
+      # feature) declare them in ci/apt-packages.txt. The actual install
+      # lives in the shared install-apt-packages composite action so all
+      # three lanes stay in sync; see maxi-tools/maxi-config#174.
+      #
+      # The `$/` self-repository syntax is required here: a `./` reference
+      # would resolve inside each CALLER's workspace (this file is a
+      # `workflow_call` reusable, executed in ~48 consumers), and consumer
+      # repositories do not vendor this action. `$/` resolves to the
+      # reusable workflow's own repo at the exact running commit, with no
+      # checkout step required -- which is also why this step can run
+      # before the lane-test checkout below.
       - name: Install repo-declared system packages
         if: runner.os == 'Linux'
-        uses: maxi-tools/ci/.github/actions/install-apt-packages@main
+        uses: $/.github/actions/install-apt-packages
 
       - name: Generate org repo token
         # Skipped entirely in credential-free mode (#368). Forks and external
