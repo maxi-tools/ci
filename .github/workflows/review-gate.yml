@@ -99,6 +99,19 @@ jobs:
       contents: read
       pull-requests: write
       statuses: write
+    # The callee's `route-review-gate` shim calls `actions/create-github-app-
+    # token`, which needs `APP_CLIENT_ID` + `APP_PRIVATE_KEY` as inputs. A
+    # reusable workflow cannot elevate the token its caller hands it, so the
+    # caller has to pass these two secrets through explicitly. Both are org
+    # secrets with `visibility=all`; on a fork pull request they are stripped
+    # to empty, but the shim's own fork guard
+    # (`head.repo.full_name == github.repository`) skips before the App
+    # token step runs, so an empty value here is benign. We pass the two by
+    # name rather than `secrets: inherit` so a fork PR cannot see anything
+    # else this repository has at the org level.
+    secrets:
+      APP_CLIENT_ID: ${{ secrets.APP_CLIENT_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
     with:
       # See the header. Public repository, fork pull requests, hosted minutes.
       runs_on: '["ubuntu-latest"]'
