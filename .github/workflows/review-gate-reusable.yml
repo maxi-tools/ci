@@ -140,12 +140,22 @@ jobs:
           persist-credentials: false
 
       - name: Generate org repo token
-        # Same shape as route-clippy (maxi-config/.github/workflows/clippy.yml).
-        # The reusable runs in a context with no org token by default, so the
-        # resolve-runner step's `actions: read` + `organization_self_hosted_
-        # runners: read` probes 403 without a scoped mint. Under-scoped tokens
-        # buy a green check that routes to WarpBuild (resolve_runner.py maps
-        # API 403 to `reason=github-api-unavailable`).
+        # Same shape as route-clippy (maxi-config/.github/workflows/clippy.yml),
+        # plus `contents: read`. The `+ contents: read` is the cross-repo fix
+        # for the `route-review-gate` shim on this PUBLIC repo: `fetch-policy`
+        # below reads `ci/runner-routing.toml` from the PRIVATE
+        # maxi-tools/maxi-config repo, and a public repo's stock `GITHUB_TOKEN`
+        # does NOT reach private repos by design. The resolve-runner step
+        # passes the App token its own REST probes (`actions: read` + org
+        # self-hosted-runners), so without `contents: read` the App token
+        # would mint fine but the Contents API would 404 with a Not-Found
+        # body indistinguishable from "the file does not exist" -- and the
+        # fetch retries 5x against that body, exiting non-zero on a transient
+        # 2xx, the lane fails on a green shim, and the resolve-runner step
+        # never runs. The App installation already carries contents: read on
+        # maxi-tools/maxi-config; the input here merely opts the mint into
+        # it. The two existing permission-* inputs are unchanged: drop any of
+        # them and the corresponding GET in resolve-runner 403s the same way.
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -153,6 +163,7 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: maxi-tools
           permission-actions: read
+          permission-contents: read
           permission-organization-self-hosted-runners: read
 
       - name: Fetch the routing policy
@@ -172,7 +183,13 @@ jobs:
         with:
           policy-files: |
             ci/runner-routing.toml
-          token: ${{ github.token }}
+          # The App token from the step above, NOT `github.token`. The Contents
+          # API for the private `maxi-tools/maxi-config` repo requires a token
+          # with that repo in scope; this PUBLIC repo's stock GITHUB_TOKEN
+          # does NOT carry it. With the App token, fetch-policy returns 200
+          # for `ci/runner-routing.toml` at the org App's installation scope;
+          # without it, every attempt 404s and the lane fails.
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Resolve runner
         id: resolve
