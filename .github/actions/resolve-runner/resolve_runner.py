@@ -21,20 +21,13 @@ class GithubApiError(RuntimeError):
 
 def load_policy(policy_path):
     if tomllib is None:
-        raise RuntimeError(
-            "resolve-runner requires Python 3.11+ for tomllib support"
-        )
+        raise RuntimeError("resolve-runner requires Python 3.11+ for tomllib support")
     with open(policy_path, "rb") as f:
         return tomllib.load(f)
 
 
 def repo_job_override(policy, repo, job):
-    return (
-        policy.get("repos", {})
-        .get(repo, {})
-        .get("jobs", {})
-        .get(job, {})
-    )
+    return policy.get("repos", {}).get(repo, {}).get("jobs", {}).get(job, {})
 
 
 def effective_lane(policy, lane, repo, job):
@@ -78,7 +71,11 @@ def effective_max_resolver_wait(policy, lane_cfg, repo, job):
         return int(override["max_resolver_wait_seconds"])
     if "max_resolver_wait_seconds" in lane_cfg:
         return int(lane_cfg["max_resolver_wait_seconds"])
-    return int(policy["defaults"].get("max_resolver_wait_seconds", policy["defaults"]["queue_wait_seconds"]))
+    return int(
+        policy["defaults"].get(
+            "max_resolver_wait_seconds", policy["defaults"]["queue_wait_seconds"]
+        )
+    )
 
 
 # How much existing queue still permits narrowing to a lane's preferred
@@ -100,7 +97,9 @@ def effective_prefer_max_queued_seconds(policy, lane_cfg, repo, job):
 
 
 def self_hosted_allowed(policy, lane_cfg, repo, job):
-    return bool(effective_value(policy, lane_cfg, repo, job, "self_hosted_allowed", True))
+    return bool(
+        effective_value(policy, lane_cfg, repo, job, "self_hosted_allowed", True)
+    )
 
 
 def self_hosted_disallowed_decision(policy, lane, repo, job):
@@ -158,7 +157,9 @@ def resolve(policy, lane, repo, job, runner_state):
     # contention the broad pool is strictly better, so stop preferring the moment
     # a real queue exists.
     prefer_max_queued = effective_prefer_max_queued_seconds(policy, lane_cfg, repo, job)
-    prefer_applies = bool(prefer) and idle_preferred > 0 and queued_seconds <= prefer_max_queued
+    prefer_applies = (
+        bool(prefer) and idle_preferred > 0 and queued_seconds <= prefer_max_queued
+    )
     if prefer_applies:
         return {
             "lane": selected_lane,
@@ -246,9 +247,7 @@ def runner_is_idle(runner):
 
 def oldest_queued_seconds(runs, now):
     created = [
-        parse_github_time(run["created_at"])
-        for run in runs
-        if run.get("created_at")
+        parse_github_time(run["created_at"]) for run in runs if run.get("created_at")
     ]
     if not created:
         return 0
@@ -258,7 +257,9 @@ def oldest_queued_seconds(runs, now):
 class GithubClient:
     def __init__(self, token, api_url=None):
         self.token = token
-        self.api_url = (api_url or os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+        self.api_url = (
+            api_url or os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+        ).rstrip("/")
 
     def api_json(self, path, params=None):
         query = ""
@@ -337,6 +338,7 @@ def probe_runner_state(policy, client, owner, repo, now=None):
     # would describe a different fleet, not the decision-time candidates.
     return {"lanes": lanes, "observed_at": now.isoformat(), "inventory": runners}
 
+
 def snapshot_decision(decision, state):
     if "inventory" in state and isinstance(decision["runs_on"], list):
         try:
@@ -344,10 +346,14 @@ def snapshot_decision(decision, state):
                 "observed_at": state["observed_at"],
                 "selector": decision["runs_on"],
                 "online": [
-                    {"id": r["name"], "busy": r.get("busy", False),
-                     "labels": sorted(runner_labels(r))}
+                    {
+                        "id": r["name"],
+                        "busy": r.get("busy", False),
+                        "labels": sorted(runner_labels(r)),
+                    }
                     for r in state["inventory"]
-                    if r.get("status") == "online" and runner_has_labels(r, decision["runs_on"])
+                    if r.get("status") == "online"
+                    and runner_has_labels(r, decision["runs_on"])
                 ],
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -358,7 +364,9 @@ def snapshot_decision(decision, state):
     return decision
 
 
-def resolve_after_wait(policy, lane, repo, job, client, owner, poll_seconds=15, sleep_fn=time.sleep):
+def resolve_after_wait(
+    policy, lane, repo, job, client, owner, poll_seconds=15, sleep_fn=time.sleep
+):
     selected_lane = effective_lane(policy, lane, repo, job)
     lane_cfg = policy["lanes"][selected_lane]
     if not self_hosted_allowed(policy, lane_cfg, repo, job):
@@ -446,7 +454,9 @@ def main(argv):
     if state_path:
         decision = resolve(policy, lane, repo, job, runner_state)
     elif github_token and owner and repo:
-        decision = resolve_after_wait(policy, lane, repo, job, GithubClient(github_token), owner)
+        decision = resolve_after_wait(
+            policy, lane, repo, job, GithubClient(github_token), owner
+        )
     else:
         decision = resolve(policy, lane, repo, job, runner_state)
     snapshot_path = os.environ.get("INPUT_DECISION_SNAPSHOT_PATH")

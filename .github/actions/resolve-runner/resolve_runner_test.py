@@ -6,7 +6,8 @@ import tempfile
 import urllib.error
 
 spec = importlib.util.spec_from_file_location(
-    "resolve_runner", ".github/actions/resolve-runner/resolve_runner.py")
+    "resolve_runner", ".github/actions/resolve-runner/resolve_runner.py"
+)
 rr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rr)
 
@@ -40,9 +41,7 @@ POLICY = {
     },
     "repos": {
         "maxi-core": {
-            "jobs": {
-                "build-pr": {"lane": "macos-arm64", "queue_wait_seconds": 600}
-            }
+            "jobs": {"build-pr": {"lane": "macos-arm64", "queue_wait_seconds": 600}}
         },
     },
 }
@@ -154,10 +153,15 @@ assert_self_hosted_only(out, "linux-x64-disallowed")
 
 class ProbeMustNotRun:
     def org_runners(self, owner):
-        raise AssertionError("self-hosted-only resolver must not probe the API when the lane is disallowed")
+        raise AssertionError(
+            "self-hosted-only resolver must not probe the API when the lane is disallowed"
+        )
 
     def queued_runs(self, owner, repo):
-        raise AssertionError("self-hosted-only resolver must not probe queued runs when the lane is disallowed")
+        raise AssertionError(
+            "self-hosted-only resolver must not probe queued runs when the lane is disallowed"
+        )
+
 
 # A `self_hosted_allowed: False` lane raises in `resolve_after_wait`. The
 # probe is asserted absent above: the lane has no other runner to find, so
@@ -180,7 +184,9 @@ else:
 # --- prefer-fast lane: prefer tier-fast box when idle, else broad. ---------
 # An idle fast box wins: route to the narrow tier-fast label set.
 prefer_hit = {
-    "lanes": {"macos-arm64-heavy": {"idle": 3, "idle_preferred": 1, "queued_seconds": 0}}
+    "lanes": {
+        "macos-arm64-heavy": {"idle": 3, "idle_preferred": 1, "queued_seconds": 0}
+    }
 }
 out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", prefer_hit)
 verify(
@@ -193,9 +199,13 @@ assert_self_hosted_only(out, "macos-arm64-heavy prefer-hit")
 # No fast box idle but the broad pool has capacity: fall back to broad labels so
 # preference never shrinks the pool under load.
 prefer_miss = {
-    "lanes": {"macos-arm64-heavy": {"idle": 2, "idle_preferred": 0, "queued_seconds": 0}}
+    "lanes": {
+        "macos-arm64-heavy": {"idle": 2, "idle_preferred": 0, "queued_seconds": 0}
+    }
 }
-out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", prefer_miss)
+out = rr.resolve(
+    POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", prefer_miss
+)
 verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64", "disk-large"], out)
 verify(out["provider"] == "self-hosted", out)
 verify(out["reason"] == "idle-self-hosted-runner", out)
@@ -208,7 +218,9 @@ prefer_none = {
         "macos-arm64-heavy": {"idle": 0, "idle_preferred": 0, "queued_seconds": 9999}
     }
 }
-out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", prefer_none)
+out = rr.resolve(
+    POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", prefer_none
+)
 verify(out["provider"] == "self-hosted", out)
 verify(out["reason"] == "saturated-self-hosted-pool", out)
 assert_self_hosted_only(out, "macos-arm64-heavy prefer-none")
@@ -224,16 +236,22 @@ queued_with_idle_fast = {
         "macos-arm64-heavy": {"idle": 5, "idle_preferred": 1, "queued_seconds": 1476}
     }
 }
-out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", queued_with_idle_fast)
+out = rr.resolve(
+    POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", queued_with_idle_fast
+)
 verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64", "disk-large"], out)
 verify(out["reason"] == "idle-self-hosted-runner", out)
 assert_self_hosted_only(out, "macos-arm64-heavy queued")
 
 # Just under the gate, preference still applies -- the fast path must not vanish.
 barely_queued = {
-    "lanes": {"macos-arm64-heavy": {"idle": 5, "idle_preferred": 1, "queued_seconds": 30}}
+    "lanes": {
+        "macos-arm64-heavy": {"idle": 5, "idle_preferred": 1, "queued_seconds": 30}
+    }
 }
-out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", barely_queued)
+out = rr.resolve(
+    POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", barely_queued
+)
 verify(
     out["runs_on"] == ["self-hosted", "macOS", "ARM64", "disk-large", "tier-fast"], out
 )
@@ -470,46 +488,71 @@ with tempfile.NamedTemporaryFile("r", delete=False) as f:
 
 try:
     os.environ["GITHUB_STEP_SUMMARY"] = summary_path
-    rr.write_summary({
-        "lane": "linux-x64",
-        "provider": "self-hosted",
-        "reason": "saturated-self-hosted-pool",
-        "queued_seconds": 700,
-        "threshold_seconds": 300,
-    })
+    rr.write_summary(
+        {
+            "lane": "linux-x64",
+            "provider": "self-hosted",
+            "reason": "saturated-self-hosted-pool",
+            "queued_seconds": 700,
+            "threshold_seconds": 300,
+        }
+    )
     with open(summary_path) as f:
         summary = f.read()
-    verify("| linux-x64 | self-hosted | saturated-self-hosted-pool |" in summary, summary)
+    verify(
+        "| linux-x64 | self-hosted | saturated-self-hosted-pool |" in summary, summary
+    )
     verify("| 700 / 300 |" in summary, summary)
 finally:
     os.environ.pop("GITHUB_STEP_SUMMARY", None)
     os.unlink(summary_path)
 
+
 class SnapshotClient:
     def org_runners(self, owner):
         def runner(name, status, busy, labels):
-            return {"name": name, "status": status, "busy": busy,
-                    "labels": [{"name": value} for value in labels]}
+            return {
+                "name": name,
+                "status": status,
+                "busy": busy,
+                "labels": [{"name": value} for value in labels],
+            }
+
         base = ["self-hosted", "Linux", "X64"]
-        return [runner("idle", "online", False, base),
-                runner("busy", "online", True, base),
-                runner("offline", "offline", False, base),
-                runner("wrong", "online", False, ["self-hosted", "Linux", "ARM64"])]
+        return [
+            runner("idle", "online", False, base),
+            runner("busy", "online", True, base),
+            runner("offline", "offline", False, base),
+            runner("wrong", "online", False, ["self-hosted", "Linux", "ARM64"]),
+        ]
 
     def queued_runs(self, owner, repo):
         return []
 
-observed = rr.resolve_after_wait(POLICY, "linux-x64", "maxi-core", "lint",
-                                 SnapshotClient(), "maxi-tools")
+
+observed = rr.resolve_after_wait(
+    POLICY, "linux-x64", "maxi-core", "lint", SnapshotClient(), "maxi-tools"
+)
 verify(observed["runs_on"] == ["self-hosted", "Linux", "X64"], observed)
-verify({c["id"] for c in observed["observation"]["online"]} == {"idle", "busy"}, observed)
+verify(
+    {c["id"] for c in observed["observation"]["online"]} == {"idle", "busy"}, observed
+)
 verify(observed["observation"]["selector"] == observed["runs_on"], observed)
 assert_self_hosted_only(observed, "linux-x64 snapshot")
 malformed = rr.snapshot_decision(
     {"runs_on": ["self-hosted", "Linux", "X64"], "provider": "self-hosted"},
-    {"observed_at": "2026-09-26T12:00:00Z", "inventory":
-     [{"status": "online", "labels": [{"name": "self-hosted"}, {"name": "Linux"}, {"name": "X64"}]}]},
+    {
+        "observed_at": "2026-09-26T12:00:00Z",
+        "inventory": [
+            {
+                "status": "online",
+                "labels": [{"name": "self-hosted"}, {"name": "Linux"}, {"name": "X64"}],
+            }
+        ],
+    },
 )
-verify("observation" not in malformed and malformed["provider"] == "self-hosted", malformed)
+verify(
+    "observation" not in malformed and malformed["provider"] == "self-hosted", malformed
+)
 
 print("resolve_runner_test: passed")
