@@ -396,16 +396,19 @@ def resolve_after_wait(
         lane_cfg = policy["lanes"][selected_lane]
         max_wait = effective_max_resolver_wait(policy, lane_cfg, repo, job)
 
-        if elapsed >= max_wait:
+        # Fold the four "we are done polling" reasons into one branch:
+        # whether to keep waiting or return the saturated decision.
+        remaining_threshold = decision["threshold_seconds"] - decision["queued_seconds"]
+        remaining_max_wait = max_wait - elapsed
+        should_keep_polling = (
+            elapsed < max_wait
+            and remaining_threshold > 0
+            and remaining_max_wait > 0
+        )
+        if not should_keep_polling:
             return snapshot_decision(decision, runner_state)
 
-        remaining = decision["threshold_seconds"] - decision["queued_seconds"]
-        if remaining <= 0:
-            return snapshot_decision(decision, runner_state)
-
-        wait_seconds = min(poll_seconds, remaining, max_wait - elapsed)
-        if wait_seconds <= 0:
-            return snapshot_decision(decision, runner_state)
+        wait_seconds = min(poll_seconds, remaining_threshold, remaining_max_wait)
         sleep_fn(wait_seconds)
         elapsed += wait_seconds
 
