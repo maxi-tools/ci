@@ -39,6 +39,21 @@ name: Review gate
 
 on:
   workflow_call:
+    # The caller's review-gate.yml passes APP_CLIENT_ID and APP_PRIVATE_KEY
+    # explicitly (listed by name, not `secrets: inherit`). A reusable workflow
+    # must declare every secret it accepts; otherwise the run fails at
+    # creation with "unexpected value" / startup_failure and the routing shim
+    # never executes.
+    secrets:
+      APP_CLIENT_ID:
+        description: GitHub App client ID used to mint the org token for
+          resolve-runner. Required because the reusable is pinned by SHA from
+          the local caller and cannot elevate the caller's token.
+        required: false
+      APP_PRIVATE_KEY:
+        description: GitHub App private key paired with APP_CLIENT_ID.
+          Required for the same reason.
+        required: false
     inputs:
       runs_on:
         description: >
@@ -75,6 +90,143 @@ on:
 permissions: {}
 
 jobs:
+  # The route shim. Lands the saturated-Linux → idle-Mac overflow this
+  # reusable otherwise cannot reach -- the four downstream jobs hardcode
+  # `runs-on: fromJSON(inputs.runs_on)` today, so without this shim a queued
+  # Review Gate job on a Focus PR waits behind every other self-hosted
+  # Linux job even when ten self-hosted Macs are idle. The shim is the
+  # single point where the resolve-runner answer reaches this workflow.
+  #
+  # Trust gate: same-repo only. A fork pull request's run reaches this job
+  # otherwise, and the org's self-hosted fleet would be a target for fork
+  # code (the same reason every other self-hosted job in this file carries
+  # the same-repo `if:`). Skipping here is safe: a skipped dependency
+  # skips its dependents, and a fork PR that skips the whole gate publishes
+  # nothing, which leaves the verdicts pending and blocks rather than
+  # permits -- identical to the existing fork behaviour.
+  #
+  # LANE IS `linux-arm64` UNCONDITIONALLY. A caller that wanted hosted
+  # runners before this shim existed passed `runs_on: '["ubuntu-latest"]'`;
+  # the shim still runs on that input (the caller's intent is honoured for
+  # the shim's OWN runner), but the downstream jobs read the shim's
+  # `outputs.runs_on`, which the resolve-runner populates with
+  # `[self-hosted, Linux, ARM64]` for `lane = "linux-arm64"`. A fork PR
+  # skips the shim, the downstream jobs skip via `needs:`, and the
+  # local `review-gate.yml` (this repo's own call site) loses the explicit
+  # `runs_on: '["ubuntu-latest"]'` override so the shim runs on the
+  # default self-hosted lane; the fork guard above keeps fork code off the
+  # org's fleet exactly as it was on the hosted call site.
+  route-review-gate:
+    name: 'per-run: route to a self-hosted lane (Linux primary, Mac overflow)'
+    # Was `fromJSON(inputs.runs_on)`. The shim calls resolve-runner,
+    # which needs the org-scoped `actions: read` + `organization_self_
+    # hosted_runners: read` permissions to list the fleet -- permissions
+    # `GITHUB_TOKEN` does NOT carry (it is repo-scoped). The org App
+    # token mints those permissions, but it is only available on
+    # SELF-hosted runners; on a hosted runner `secrets.APP_CLIENT_ID`
+    # is empty and the App token step errors with `client-id input must
+    # be set to a non-empty string`. The shim is therefore pinned to
+    # self-hosted Linux, and the four downstream jobs read the shim's
+    # `outputs.runs_on` -- a hosted caller gets the shim on self-hosted
+    # but the downstream on whatever the router picks. Same shape as
+    # `route-clippy` in maxi-config/.github/workflows/clippy.yml (also
+    # `[self-hosted, Linux]`), and a fork PR still skips via the same
+    # `if:` as before -- the trust gate is unchanged.
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      runs_on: ${{ steps.resolve.outputs.runs-on }}
+      reason: ${{ steps.resolve.outputs.reason }}
+      lane: ${{ steps.resolve.outputs.lane }}
+      provider: ${{ steps.resolve.outputs.provider }}
+    if: >-
+      github.event_name != 'merge_group' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          # `persist-credentials: false` so the implicitly-minted `GITHUB_TOKEN`
+          # for this workflow job cannot be reused by a PR's local action body
+          # to push back. The resolve-runner step uses the org App token below
+          # for its own API calls, not this one.
+          persist-credentials: false
+
+      - name: Generate org repo token
+        # Same shape as route-clippy (maxi-config/.github/workflows/clippy.yml),
+        # plus `contents: read`. The `+ contents: read` is the cross-repo fix
+        # for the `route-review-gate` shim on this PUBLIC repo: `fetch-policy`
+        # below reads `ci/runner-routing.toml` from the PRIVATE
+        # maxi-tools/maxi-config repo, and a public repo's stock `GITHUB_TOKEN`
+        # does NOT reach private repos by design. The resolve-runner step
+        # passes the App token its own REST probes (`actions: read` + org
+        # self-hosted-runners), so without `contents: read` the App token
+        # would mint fine but the Contents API would 404 with a Not-Found
+        # body indistinguishable from "the file does not exist" -- and the
+        # fetch retries 5x against that body, exiting non-zero on a transient
+        # 2xx, the lane fails on a green shim, and the resolve-runner step
+        # never runs. The App installation already carries contents: read on
+        # maxi-tools/maxi-config; the input here merely opts the mint into
+        # it. The two existing permission-* inputs are unchanged: drop any of
+        # them and the corresponding GET in resolve-runner 403s the same way.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          permission-actions: read
+          permission-contents: read
+          permission-organization-self-hosted-runners: read
+
+      - name: Fetch the routing policy
+        id: fetch-policy
+        # Same-owner pin to a 40-char SHA (the SHA of the first commit on this
+        # branch that introduced the `resolve-runner` action: every
+        # descendant of that commit has the same `action.yml` blob, so the
+        # action definition the run evaluates is unchanged. A relative
+        # `./.github/actions/...` resolves to the CALLER for `workflow_call`,
+        # so when a consumer repo pins
+        # `maxi-tools/ci/.github/workflows/review-gate-reusable.yml@<sha>`
+        # the relative path looks in the consumer's own checkout, not here.
+        # Same-owner (not external) pins are exempt from this repo's
+        # no-mutable-ref rule; the contract lives at
+        # `maxi-config/docs/contracts/mirror-pin-is-a-security-boundary.md`.
+        uses: maxi-tools/ci/.github/actions/fetch-policy@96393c66f35c1a37d54aa639200f931074f1fdcd
+        with:
+          policy-files: |
+            ci/runner-routing.toml
+          # The App token from the step above, NOT `github.token`. The Contents
+          # API for the private `maxi-tools/maxi-config` repo requires a token
+          # with that repo in scope; this PUBLIC repo's stock GITHUB_TOKEN
+          # does NOT carry it. With the App token, fetch-policy returns 200
+          # for `ci/runner-routing.toml` at the org App's installation scope;
+          # without it, every attempt 404s and the lane fails.
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve runner
+        id: resolve
+        # Same-owner pin to a 40-char SHA. Advance the pin so the
+        # resolve-runner call site reaches the queued-job-classified
+        # implementation (09f330c) -- the version the verifier
+        # t_77bfa3c0's REJECT required. The action's `action.yml` blob
+        # is unchanged, so any commit on the branch is a valid pin.
+        uses: maxi-tools/ci/.github/actions/resolve-runner@09f330ce3a483a00604f9b386932c48052b81bdb # v0.0.0, route-review-gate overflow_decision + classify every fetched job by its own status
+        with:
+          lane: linux-arm64
+          # `repo: ci` is the short form (`maxi-tools/ci` is the long form);
+          # `effective_value()` in resolve-runner reads the policy under
+          # `[repos.<repo>.jobs.<job>]`. PR-B in ci ships the wiring; PR-C
+          # in maxi-config ships the matching overflow policy entries.
+          repo: ci
+          # The heaviest downstream job, so the overflow answer is correct
+          # for all four; the four jobs share the same lane.
+          job: gate
+          policy-path: .maxi-config/ci/runner-routing.toml
+          github-token: ${{ steps.app-token.outputs.token }}
+
   # The preemptive half of the collapse. The caller's wrapper holds one
   # concurrency lane per (PR, event) with `cancel-in-progress: false`, so a
   # review burst queues runs behind the in-flight one instead of cancelling
@@ -118,7 +270,13 @@ jobs:
   # re-run; the id only breaks ties.
   supersede-check:
     name: 'per-run: superseded by a newer run of this lane?'
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    # Routed through `route-review-gate` so a saturated Linux lane can
+    # overflow onto an idle Mac pool. Falls back to the caller's `inputs.runs_on`
+    # ONLY when the shim was skipped (fork pull request) -- in that case the
+    # `needs: route-review-gate` dependency would have skipped this job too,
+    # so the fallback is a defense-in-depth read that never actually evaluates.
+    needs: route-review-gate
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
     timeout-minutes: 5
     permissions:
       actions: read
@@ -228,9 +386,9 @@ jobs:
     # grey pass-equivalent, and a review burst used to leave a dozen of the
     # former on every bot-reviewed PR.
     name: 'per-run: invalidate previous verdicts'
-    needs: supersede-check
+    needs: [route-review-gate, supersede-check]
     if: needs.supersede-check.outputs.superseded != 'true'
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
     timeout-minutes: 5
     permissions:
       actions: read
@@ -367,8 +525,8 @@ jobs:
   # `if:` shape to gate App-token work; see its own App-token step.)
   dedupe:
     name: 'per-run: dedupe bot review threads'
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
-    needs: [supersede-check, invalidate]
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
+    needs: [route-review-gate, supersede-check, invalidate]
     # Both halves are load-bearing and they fail differently, which is why
     # neither is implied by the other:
     #
@@ -425,7 +583,7 @@ jobs:
           pr: ${{ github.event.pull_request.number }}
 
   gate:
-    needs: [supersede-check, invalidate, dedupe]
+    needs: [route-review-gate, supersede-check, invalidate, dedupe]
     # RUNS EVEN IF `dedupe` DID NOT.
     #
     # A `needs:` dependency that is skipped or failed skips the dependent job
@@ -539,7 +697,7 @@ jobs:
     # string is parsed into the label list. `runs-on: ${{ inputs.runs_on }}`
     # alone cannot express a multi-label self-hosted selector -- it would be
     # matched as one literal label named `["self-hosted", "Linux", "X64"]`.
-    runs-on: ${{ (startsWith(inputs.runs_on, '[') || startsWith(inputs.runs_on, '"')) && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    runs-on: ${{ fromJSON(needs.route-review-gate.outputs.runs_on) }}
     timeout-minutes: 10
     permissions:
       actions: read

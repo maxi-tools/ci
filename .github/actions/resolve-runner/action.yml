@@ -1,0 +1,73 @@
+name: Resolve CI runner
+description: Resolve a self-hosted runner label set, waiting on self-hosted when none is idle.
+inputs:
+  lane:
+    required: true
+    description: Routing lane name.
+  repo:
+    required: true
+    description: Repository name without owner.
+  job:
+    required: true
+    description: GitHub Actions job name.
+  policy-path:
+    required: false
+    default: ci/runner-routing.toml
+    description: Path to runner routing policy.
+  runner-state-path:
+    required: false
+    default: ""
+    description: Optional JSON file with lane runner state.
+  github-token:
+    required: false
+    default: ""
+    description: GitHub token used to probe org runner availability and queued workflow runs.
+  decision-snapshot-path:
+    required: false
+    default: ""
+    description: Optional shadow-only path for the decision-time probe and selected labels.
+  owner:
+    required: false
+    default: ${{ github.repository_owner }}
+    description: GitHub organization or owner for runner and workflow-run probes.
+outputs:
+  runs-on:
+    description: JSON array or string for GitHub Actions runs-on.
+    value: ${{ steps.resolve.outputs.runs-on }}
+  provider:
+    description: always self-hosted.
+    value: ${{ steps.resolve.outputs.provider }}
+  lane:
+    description: Effective lane.
+    value: ${{ steps.resolve.outputs.lane }}
+  reason:
+    description: Selection reason.
+    value: ${{ steps.resolve.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    - id: python
+      shell: bash
+      run: |
+        set -euo pipefail
+        for bin in python3.13 python3.12 python3.11 python3; do
+          if command -v "$bin" >/dev/null 2>&1 && "$bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+            echo "python=$bin" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        echo "::error::resolve-runner requires Python 3.11+ for tomllib support"
+        exit 1
+    - id: resolve
+      shell: bash
+      env:
+        INPUT_LANE: ${{ inputs.lane }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_JOB: ${{ inputs.job }}
+        INPUT_POLICY_PATH: ${{ inputs.policy-path }}
+        INPUT_RUNNER_STATE_PATH: ${{ inputs.runner-state-path }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_DECISION_SNAPSHOT_PATH: ${{ inputs.decision-snapshot-path }}
+        INPUT_OWNER: ${{ inputs.owner }}
+      run: |
+        "${{ steps.python.outputs.python }}" "${{ github.action_path }}/resolve_runner.py"

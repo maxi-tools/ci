@@ -81,7 +81,7 @@ permissions: {}
 
 jobs:
   review-gate:
-    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@14f387b4144a783899e91c5f4a2da83b315560bb  # maxi-tools/ci main
+    uses: maxi-tools/ci/.github/workflows/review-gate-reusable.yml@7ff1a52e026565293770eb9e9d8f01dec865b691  # maxi-tools/ci main, resolves Linux/Mac overflow on gate + classifies every fetched job by its own status + the route-review-gate shim's resolve-runner pin reaches the same corrected commit
     # A reusable workflow cannot elevate the token its caller hands it, and the
     # whole nested graph is validated when the run is CREATED -- before any job
     # `if:` is evaluated. So this map is the union of what EVERY job in the
@@ -99,6 +99,30 @@ jobs:
       contents: read
       pull-requests: write
       statuses: write
+    # The callee's `route-review-gate` shim calls `actions/create-github-app-
+    # token`, which needs `APP_CLIENT_ID` + `APP_PRIVATE_KEY` as inputs. A
+    # reusable workflow cannot elevate the token its caller hands it, so the
+    # caller has to pass these secrets through explicitly. The two secrets
+    # are org secrets with `visibility=all`; on a fork pull request they are
+    # stripped to empty, but the shim's own fork guard
+    # (`head.repo.full_name == github.repository`) skips before the App
+    # token step runs, so an empty value here is benign.
+    #
+    # Listed BY NAME rather than `secrets: inherit`. zizmor flags `secrets:
+    # inherit` as `secrets-inherit` (the called workflow receives every
+    # secret from the caller's context, not just the two it asks for);
+    # qlty's zizmor plugin then post the finding as an unresolved review
+    # thread on every push, which fails the `review-gate / per-run:
+    # resolve-review-threads` step on this very PR. Each name below is one
+    # the callee specifically asks for via `with:` in its own declaration,
+    # so the surface is the same regardless of which form is used -- the
+    # difference is only what the static analyzer sees. zizmor:
+    # ignore[secrets-inherit] is the alternative if a future qlty version
+    # tightens this check; it would suppress the same warning at the call
+    # site rather than shaping the call.
+    secrets:
+      APP_CLIENT_ID: ${{ secrets.APP_CLIENT_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
     with:
       # See the header. Public repository, fork pull requests, hosted minutes.
       runs_on: '["ubuntu-latest"]'
