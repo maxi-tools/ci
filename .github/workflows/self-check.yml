@@ -150,10 +150,23 @@ jobs:
         # would have caught --json returning before execution.
         run: |
           set -euo pipefail
-          # workspace-guard parses YAML; hosted Python does not guarantee PyYAML.
-          python3 -m venv "$RUNNER_TEMP/moments-python"
-          . "$RUNNER_TEMP/moments-python/bin/activate"
-          python3 -m pip install PyYAML==6.0.3
+          # workspace-guard parses YAML. On a NixOS-based self-hosted
+          # runner the system Python does not bundle pip (and
+          # `python3 -m venv` produces a venv whose pip is the empty
+          # placeholder), so fall through to the system site-packages
+          # if the import already works; otherwise provision pip into
+          # the venv explicitly. The hosted ubuntu-latest image
+          # already has PyYAML, so this branch is the no-op there.
+          if ! python3 -c 'import yaml,sys; sys.exit(0 if yaml.__version__ == "6.0.3" else 1)' 2>/dev/null; then
+            python3 -m venv "$RUNNER_TEMP/moments-python"
+            . "$RUNNER_TEMP/moments-python/bin/activate"
+            # ensurepip is a no-op on a Python that already has pip
+            # (hosted ubuntu-latest) and is the missing piece on
+            # NixOS runners where `python3 -m venv` leaves the venv
+            # without a working pip.
+            python3 -m ensurepip --upgrade 2>/dev/null || true
+            python3 -m pip install --quiet PyYAML==6.0.3
+          fi
           failed=0
           for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_review_gate_route_shim.py tests/test_review_gate_secret_contract.py tests/test_review_gate_transitive_pin.py tests/test_self_check_fork_guard.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py; do
             echo "== $t"
