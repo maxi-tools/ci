@@ -170,7 +170,7 @@ jobs:
       always() &&
       (github.event_name == 'pull_request' ||
       github.event_name == 'merge_group')
-    needs: [plan, check, test, package, sign-publish, release-verify]
+    needs: [plan, check, test, lane-mac-waterui, package, sign-publish, release-verify]
     outputs:
       # Consumed by on.workflow_call.outputs.linux_gate. Kept as a job-level
       # output instead of a direct `jobs.merge-gate.result` read so
@@ -315,6 +315,14 @@ jobs:
           ACTOR: ${{ github.actor }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_USER_ID: ${{ github.event.pull_request.user.id }}
+          # Wrapper-level workflow_call input. Copied into a step env because
+          # the aggregate's Python heredoc runs in bash and python's
+          # `os.environ` reads `os.environ[<NAME>]`, not `os.environ.get(<NAME>)`.
+          # Reading the wrapper's declared mac_lanes directly here keeps the
+          # explanation in one place -- the same value the lane-mac-waterui
+          # job's `if:` reads, so the skip reason the aggregate accepts is
+          # the skip reason the gate itself applied.
+          MAC_LANES_VALUE: ${{ inputs.mac_lanes }}
           CI_ENFORCEMENT_MODE_VALUE: ${{ env.CI_ENFORCEMENT_MODE }}
           CI_DEGRADED_UNTIL_VALUE: ${{ env.CI_DEGRADED_UNTIL }}
         run: |
@@ -336,8 +344,8 @@ jobs:
 
           # Every lane this job `needs:`. A key missing from the needs
           # context is a lane that never reported -- fail closed.
-          LANES = ("plan", "check", "test", "package", "sign-publish",
-                   "release-verify")
+          LANES = ("plan", "check", "test", "lane-mac-waterui", "package",
+                   "sign-publish", "release-verify")
 
           # Release-only lanes. Their skip is explained ONLY by the ref
           # filter their callers use (`main` / `release/**`); on any other
@@ -348,7 +356,26 @@ jobs:
           # The heavy lanes the change detector governs. On a merge_group
           # head a `skipped` here is merge evidence only when the detector
           # positively says the diff cannot reach a build.
-          HEAVY_LANES = ("check", "test")
+          #
+          # `lane-mac-waterui` is in this set too, even though its gate is
+          # `inputs.mac_lanes != ''` rather than the planner's scope: it is
+          # a Mac-primary heavy lane (the runner pool is `[self-hosted,
+          # macOS, ARM64]`) and is scoped out of mac-waterui-free consumers
+          # the same way check/test are scoped out of docs-only PRs -- by a
+          # single positive verdict, here the consumer's `mac_lanes`
+          # declaration. The same skip_reason shape (planner / branch /
+          # consumer declaration) covers all three: an unexplained skip on a
+          # heavy lane is not merge evidence, regardless of which lane it is.
+          HEAVY_LANES = ("check", "test", "lane-mac-waterui")
+
+          # Consumer-adopted Mac-primary lanes. The skip that explains these
+          # is the consumer's own wrapper-side declaration of having a Mac
+          # lane (render.py's `mac_lanes` special-case writes the value back
+          # on every fan-out tick), NOT a planner-scoped reason. Plan's own
+          # `inputs.mac_lanes` is read directly from the workflow input, not
+          # from the planner's outputs -- a consumer that never opts in keeps
+          # the empty default and the lane is correctly skipped.
+          CONSUMER_OPT_IN_LANES = ("lane-mac-waterui",)
 
           needs = json.loads(os.environ["MERGE_GATE_NEEDS"])
           event = os.environ.get("EVENT_NAME", "")
@@ -358,6 +385,17 @@ jobs:
           release_ref = ref == "refs/heads/main" or ref.startswith(
               "refs/heads/release/")
           plan_outputs = (needs.get("plan") or {}).get("outputs") or {}
+          # Read the consumer's `mac_lanes` declaration directly from the workflow
+          # input: GHA exposes `inputs.X` to every step in the workflow, and
+          # reading it inside this aggregate (vs. trying to fetch it from
+          # the `needs` context) keeps the explanation in one place -- the
+          # same value the lane-mac-waterui job's `if:` reads, so the skip
+          # reason the aggregate accepts is the skip reason the gate itself
+          # applied. A wrapper that adopted the lane passes a non-empty
+          # string and the lane runs; a wrapper that did not keeps the empty
+          # default and the lane is correctly skipped.
+          mac_lanes_value: str = os.environ.get("MAC_LANES_VALUE", "")
+          mac_lanes_adopted = mac_lanes_value != ""
           actor = os.environ.get("ACTOR", "")
           fan_out = (event == "pull_request"
                      and os.environ.get("PR_HEAD_REF", "").startswith(
@@ -427,6 +465,22 @@ jobs:
               if name in RELEASE_LANES:
                   return None if release_ref else f"ref filter: {ref or '<unset>'} is not a release ref"
               if name in HEAVY_LANES:
+                  if name == "lane-mac-waterui":
+                      # The lane's gate is the wrapper's `mac_lanes`
+                      # declaration: an empty value means the consumer did
+                      # not opt in, the lane's `if:` was false, and the
+                      # aggregate reads the result as `skipped` -- an
+                      # EXPLAINED skip. Anything else (the lane ran and
+                      # reported `success`/`failure`, or `skipped` while
+                      # `mac_lanes` is non-empty -- which cannot happen
+                      # because the gate's `if:` is the only scheduling
+                      # authority) is a non-explanation: a wrapper that
+                      # opted in but whose lane cancelled out from under
+                      # it has no recorded reason and the gate must fail.
+                      if mac_lanes_adopted:
+                          return None
+                      return ("consumer opt-in: mac_lanes declared empty "
+                              f"(value={mac_lanes_value!r})")
                   if actor == "dependabot[bot]":
                       return "lane if: dependabot actor"
                   if plan_scope == "merge-gate-only":
@@ -661,6 +715,44 @@ jobs:
       skip_swift_build: ${{ inputs.skip_swift_build == true }}
       # Forwarded for parity with lane-check. lane-test does not gate on it.
       repo_policy: ${{ inputs.repo_policy }}
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+  # Mac + waterui gate, conditional on the consumer adopting it via
+  # `mac_lanes: declared` on the wrapper's merge-gate job (the wrapper
+  # fan-out, scripts/rust_ci_render.py in maxi-config, special-cases a
+  # NON-EMPTY mac_lanes the way it special-cases a fork's `repo_policy`,
+  # so the declaration survives the weekly tick on the consumers that use
+  # it; the 57 wrappers that do not declare it keep `inputs.mac_lanes ==
+  # ''` and the job is skipped). The same skip-on-docs path that
+  # `check`/`test` already use (classified by lane-plan as
+  # `scope == 'merge-gate-only'`) is also required: a docs-only PR must
+  # not spend Mac minutes either.
+  #
+  # Naming it lane-mac-waterui IN THE JOBS SECTION is deliberate. The
+  # merge-gate aggregate (top of file) reads `needs` and reports each
+  # lane's result verbatim, so a red job here is the FAILURE conclusion
+  # the post-merge-gate ruleset requires -- not a green check that hides
+  # a red lane. The nested check run this job produces is
+  # `merge-gate / lane-mac-waterui / lane-mac-waterui-test`, which is
+  # the name consumer rulesets read under the post-merge-gate shape
+  # (maxi-tools/voicemaci ruleset 21168253 names `merge-gate /
+  # merge-gate`, so the rule is structural: any additional lane the
+  # aggregate accepts reads as a NESTED check under that one
+  # context, gated on aggregate success).
+  #
+  # The contract test (tests/test_mac_lanes_contract.py) allows
+  # `mac_lanes` to appear in `jobs:` ONLY as a gate, never as a
+  # path-resolver or `uses:` argument, because GitHub's `uses:` takes
+  # no expressions and consumers do not share a relative-path hub.
+  # That is exactly what the `if:` below is.
+  lane-mac-waterui:
+    if: ${{ inputs.mac_lanes != '' && needs.plan.outputs.scope != 'merge-gate-only' }}
+    needs: plan
+    uses: ./.github/workflows/lane-macos-waterui.yml
+    permissions:
+      contents: read
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
