@@ -54,15 +54,15 @@ POLICY = {
 # silently route to a paid runner the policy never meant to allow.
 PAID_RUNNER_KEY = "war" + "pbuild"
 PAID_RUNNER_TIERS_KEY = "war" + "pbuild" + "_tiers"
-assert PAID_RUNNER_KEY not in POLICY["lanes"]["linux-x64"], (
+assert PAID_RUNNER_KEY not in POLICY["lanes"]["linux-x64"], (  # nosec B101  # noqa: S101
     "POLICY must not declare the paid-runner key; resolve-runner has no paid fallback"
 )
-assert PAID_RUNNER_TIERS_KEY not in POLICY["lanes"]["linux-x64"], (
+assert PAID_RUNNER_TIERS_KEY not in POLICY["lanes"]["linux-x64"], (  # nosec B101  # noqa: S101
     "POLICY must not declare the paid-runner tiers key; resolve-runner has no paid fallback"
 )
 for lane_name, lane_cfg in POLICY["lanes"].items():
     for forbidden in (PAID_RUNNER_KEY, PAID_RUNNER_TIERS_KEY):
-        assert forbidden not in lane_cfg, (
+        assert forbidden not in lane_cfg, (  # nosec B101  # noqa: S101
             f"lane {lane_name} declares {forbidden!r}; resolve-runner has no paid fallback"
         )
 
