@@ -760,6 +760,273 @@ minutes = rr.lane_queue_minutes(
 verify(abs(minutes - 0.0) < 1e-6, minutes)  # noqa: S1244  # nosec: overrun floors at zero, exact comparison is the contract
 
 
+# JOB-LEVEL COLLECTION ACROSS BOTH RUN COLLECTIONS (verifier t_77bfa3c0's
+# REJECT on PR #98 at 7a0550e6). lane_job_estimates must classify every
+# fetched job by its OWN status, regardless of which run-collection
+# surfaced the run. A run can be `in_progress` while still holding
+# `queued` jobs waiting for a runner; the pre-fix implementation only
+# walked queued jobs from queued runs and in_progress jobs from
+# in_progress runs, so a queued Mac job sitting in an in_progress run
+# was silently dropped -- the Mac lane's queue_minutes came out 0, and a
+# Linux-saturated lane with one idle Mac box overflowed onto Mac when it
+# should have stayed on Linux.
+class CrossRunStatusClient(rr.GithubClient):
+    """Verbatim fixture from verifier t_77bfa3c0.
+
+    No queued runs (status=queued), one in_progress run holding two jobs:
+      - mac-waiting: status=queued, Mac labels
+      - linux-running: status=in_progress, Linux labels
+
+    No idle Linux runner, one idle Mac runner. With p50 600s and the
+    pre-fix drop, lane_job_estimates returned an EMPTY queued list; the
+    Mac lane's queue_minutes came out 0; 0 <= 0.5 * 10 held; the resolver
+    chose linux-saturated-mac-overflow. The fix must include the queued
+    Mac job; its p50 of 600s makes the Mac queue_minutes 10.0; 10 <= 5
+    is false; the resolver must stay on Linux.
+
+    Inherits the production lane_job_estimates so this test exercises
+    the SAME classification path real API responses flow through. Only
+    the four data-fetching methods are stubbed; the orchestration code
+    is the production code.
+    """
+
+    def __init__(self):
+        super().__init__(token="")
+
+    def org_runners(self, owner):
+        return [
+            {  # busy Linux (cuda-dgx slot, ARM64 host): no idle Linux runner
+                "status": "online",
+                "busy": True,
+                "labels": _labels("self-hosted", "Linux", "ARM64"),
+            },
+            {  # idle Mac: one idle Mac runner
+                "status": "online",
+                "busy": False,
+                "labels": _labels("self-hosted", "macOS", "ARM64"),
+            },
+        ]
+
+    def queued_runs(self, owner, repo):
+        return []
+
+    def running_runs(self, owner, repo):
+        return [
+            {
+                "id": 99001,
+                "status": "in_progress",
+                "created_at": "2026-10-14T12:00:00Z",
+            }
+        ]
+
+    def run_jobs(self, owner, repo, run_id):
+        verify(run_id == 99001, run_id)
+        return [
+            {
+                "id": 1,
+                "name": "mac-waiting",
+                "status": "queued",
+                # GitHub's /actions/runs/{id}/jobs endpoint returns labels as
+                # STRINGS (a job carries the runs-on label set it requested,
+                # exactly as it would appear in workflow yaml). job_matches_lane
+                # does string equality, not dict lookup, against lane_cfg.
+                "labels": ["self-hosted", "macOS", "ARM64"],
+                "started_at": None,
+            },
+            {
+                "id": 2,
+                "name": "linux-running",
+                "status": "in_progress",
+                "labels": ["self-hosted", "Linux", "ARM64"],
+                "started_at": "2026-10-14T12:09:00Z",  # 60s elapsed
+            },
+        ]
+
+
+# The fix's surface is lane_job_estimates, so assert it directly: a
+# queued Mac job inside an in_progress run lands in the QUEUED list, not
+# silently dropped. Pre-fix the queued list is empty; post-fix it holds
+# exactly the mac-waiting job.
+cross_client = CrossRunStatusClient()
+queued_seen, running_seen = cross_client.lane_job_estimates("maxi-tools", "ci")
+verify(len(queued_seen) == 1, queued_seen)
+verify(queued_seen[0]["name"] == "mac-waiting", queued_seen)
+verify(queued_seen[0]["labels"] == ["self-hosted", "macOS", "ARM64"], queued_seen)
+verify(len(running_seen) == 1, running_seen)
+verify(running_seen[0]["name"] == "linux-running", running_seen)
+
+# Probe end-to-end: feed lane_job_estimates through probe_runner_state,
+# then resolve. The verifier's exact scenario -- Linux saturated, one
+# idle Mac, the queued Mac job visible -- must STAY on Linux, not
+# overflow. With p50_seconds=600 from ci/runner-routing.toml's gate job,
+# the Mac queue_minutes is 600/60 = 10.0 and the Linux queue_minutes is
+# (600 - 60) / 60 = 9.0, so 10.0 <= 0.5 * 9.0 (= 4.5) is false and
+# overflow must decline.
+cross_state = rr.probe_runner_state(
+    POLICY,
+    cross_client,
+    "maxi-tools",
+    "ci",
+    now=rr.parse_github_time("2026-10-14T12:10:00Z"),
+)
+verify(cross_state["lanes"]["linux-arm64"]["idle"] == 0, cross_state)
+verify(cross_state["lanes"]["macos-arm64"]["idle"] == 1, cross_state)
+verify(
+    abs(cross_state["lanes"]["linux-arm64"]["queue_minutes"] - 9.0) < 1e-6,  # noqa: S1244  # nosec
+    cross_state["lanes"]["linux-arm64"],
+)
+verify(
+    abs(cross_state["lanes"]["macos-arm64"]["queue_minutes"] - 10.0) < 1e-6,  # noqa: S1244  # nosec
+    cross_state["lanes"]["macos-arm64"],
+)
+out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", cross_state)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+assert_self_hosted_only(out, "queued-in-in-progress-run: stay on Linux")
+
+
+# INVERSE CASE: a queued LINUX job inside an in_progress run -- the
+# source lane has a queued job the pre-fix code dropped, and an idle
+# Linux runner available. The default "idle runner" branch must still
+# take priority: stay on Linux, reason=idle-self-hosted-runner. The
+# inverse case exists to prove the fix did not over-correct -- the
+# queued-job-in-running-run shape must surface on BOTH sides of the
+# Mac/Linux boundary, and the resolver's idle-branch logic is the same
+# code path that read the (now-correct) queue_minutes.
+class InverseCrossRunStatusClient(rr.GithubClient):
+    def __init__(self):
+        super().__init__(token="")
+
+    def org_runners(self, owner):
+        return [
+            {  # idle Linux: one idle Linux runner
+                "status": "online",
+                "busy": False,
+                "labels": _labels("self-hosted", "Linux", "ARM64"),
+            },
+            {  # busy Mac: no idle Mac runner
+                "status": "online",
+                "busy": True,
+                "labels": _labels("self-hosted", "macOS", "ARM64"),
+            },
+        ]
+
+    def queued_runs(self, owner, repo):
+        return []
+
+    def running_runs(self, owner, repo):
+        return [
+            {
+                "id": 99002,
+                "status": "in_progress",
+                "created_at": "2026-10-14T12:00:00Z",
+            }
+        ]
+
+    def run_jobs(self, owner, repo, run_id):
+        verify(run_id == 99002, run_id)
+        return [
+            {
+                "id": 10,
+                "name": "linux-waiting",
+                "status": "queued",
+                "labels": ["self-hosted", "Linux", "ARM64"],
+                "started_at": None,
+            },
+            {
+                "id": 11,
+                "name": "mac-running",
+                "status": "in_progress",
+                "labels": ["self-hosted", "macOS", "ARM64"],
+                "started_at": "2026-10-14T12:09:00Z",
+            },
+        ]
+
+
+inv_client = InverseCrossRunStatusClient()
+queued_inv, running_inv = inv_client.lane_job_estimates("maxi-tools", "ci")
+verify(len(queued_inv) == 1, queued_inv)
+verify(queued_inv[0]["name"] == "linux-waiting", queued_inv)
+verify(len(running_inv) == 1, running_inv)
+verify(running_inv[0]["name"] == "mac-running", running_inv)
+inv_state = rr.probe_runner_state(
+    POLICY,
+    inv_client,
+    "maxi-tools",
+    "ci",
+    now=rr.parse_github_time("2026-10-14T12:10:00Z"),
+)
+verify(inv_state["lanes"]["linux-arm64"]["idle"] == 1, inv_state)
+out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", inv_state)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "idle-self-hosted-runner", out)
+assert_self_hosted_only(
+    out, "queued-in-in-progress-run inverse: idle Linux takes priority"
+)
+
+
+# DEDUPE: the same run id surfaced in BOTH collections (e.g. it
+# transitioned queued -> in_progress between the two API calls) must
+# contribute its jobs exactly once. Pre-fix the second collection
+# re-fetched the same jobs and double-counted their p50, inflating the
+# lane's queue_minutes by 2x.
+class DuplicateRunClient(rr.GithubClient):
+    def __init__(self):
+        super().__init__(token="")
+
+    def org_runners(self, owner):
+        return [
+            {
+                "status": "online",
+                "busy": False,
+                "labels": _labels("self-hosted", "Linux", "ARM64"),
+            },
+            {
+                "status": "online",
+                "busy": True,
+                "labels": _labels("self-hosted", "macOS", "ARM64"),
+            },
+        ]
+
+    def queued_runs(self, owner, repo):
+        return [
+            {
+                "id": 99003,
+                "status": "queued",
+                "created_at": "2026-10-14T12:00:00Z",
+            }
+        ]
+
+    def running_runs(self, owner, repo):
+        return [
+            {
+                "id": 99003,  # SAME id surfaced in both
+                "status": "in_progress",
+                "created_at": "2026-10-14T12:00:00Z",
+            }
+        ]
+
+    def run_jobs(self, owner, repo, run_id):
+        verify(run_id == 99003, run_id)
+        return [
+            {
+                "id": 100,
+                "name": "route-clippy",
+                "status": "queued",
+                "labels": ["self-hosted", "Linux", "ARM64"],
+                "started_at": None,
+            }
+        ]
+
+
+dup_queued, dup_running = DuplicateRunClient().lane_job_estimates("maxi-tools", "ci")
+verify(len(dup_queued) == 1, dup_queued)  # NOT 2: dedupe by run id
+verify(dup_queued[0]["name"] == "route-clippy", dup_queued)
+verify(dup_running == [], dup_running)
+
+
 # CLIENT WITHOUT lane_job_estimates: probe_runner_state() must NOT
 # fabricate queue_minutes out of nothing. A pre-overflow client (or a
 # test double) without the helper simply never overflows -- "stay on

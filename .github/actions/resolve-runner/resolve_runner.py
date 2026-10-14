@@ -523,31 +523,37 @@ class GithubClient:
 
         Jobs are classified by their OWN status, not their run's: a run turns
         `in_progress` as soon as its first job starts, so an in_progress run
-        routinely still holds `queued` jobs waiting for a runner. Taking only
-        the in_progress jobs from those runs dropped that pending work and
-        under-estimated the lane's queue.
+        routinely still holds `queued` jobs waiting for a runner. Dropping
+        any non-run-status job under-estimated the lane's queue -- a queued
+        Mac job in an in_progress run was silently invisible, the Mac lane's
+        queue_minutes came out 0, and a Linux-saturated lane with one idle
+        Mac box overflowed onto Mac when it should have stayed on Linux
+        (verifier t_77bfa3c0's REJECT on PR #98 at 7a0550e6).
         """
+        seen_run_ids = set()
+        all_jobs = []
+        for run_collection in (
+            self.queued_runs(owner, repo),
+            self.running_runs(owner, repo),
+        ):
+            for run in run_collection:
+                run_id = run.get("id")
+                if run_id is None or run_id in seen_run_ids:
+                    continue
+                seen_run_ids.add(run_id)
+                all_jobs.extend(self.run_jobs(owner, repo, run_id))
         queued_jobs, running_jobs = [], []
-        for run in self.queued_runs(owner, repo):
-            for job in self.run_jobs(owner, repo, run["id"]):
-                if job.get("status") == "queued":
-                    queued_jobs.append(
-                        {
-                            "name": job.get("name", ""),
-                            "labels": job.get("labels", []),
-                            "started_at": job.get("started_at"),
-                        }
-                    )
-        for run in self.running_runs(owner, repo):
-            for job in self.run_jobs(owner, repo, run["id"]):
-                if job.get("status") == "in_progress":
-                    running_jobs.append(
-                        {
-                            "name": job.get("name", ""),
-                            "labels": job.get("labels", []),
-                            "started_at": job.get("started_at"),
-                        }
-                    )
+        for job in all_jobs:
+            status = job.get("status")
+            entry = {
+                "name": job.get("name", ""),
+                "labels": job.get("labels", []),
+                "started_at": job.get("started_at"),
+            }
+            if status == "queued":
+                queued_jobs.append(entry)
+            elif status == "in_progress":
+                running_jobs.append(entry)
         return queued_jobs, running_jobs
 
 
