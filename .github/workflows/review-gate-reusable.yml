@@ -208,11 +208,12 @@ jobs:
 
       - name: Resolve runner
         id: resolve
-        # Same-owner pin to a 40-char SHA (same reasoning as `fetch-policy`
-        # above). The action's `action.yml` blob is unchanged across every
-        # commit on this branch, so pinning to `96393c6` (the first commit
-        # on the branch) and never amending keeps this reference valid.
-        uses: maxi-tools/ci/.github/actions/resolve-runner@9a103abe57bcdd4240a812d8ca9d92b5f6a9c6bc # v0.0.0, route-review-gate overflow_decision added
+        # Same-owner pin to a 40-char SHA. Advance the pin so the
+        # resolve-runner call site reaches the queued-job-classified
+        # implementation (09f330c) -- the version the verifier
+        # t_77bfa3c0's REJECT required. The action's `action.yml` blob
+        # is unchanged, so any commit on the branch is a valid pin.
+        uses: maxi-tools/ci/.github/actions/resolve-runner@09f330ce3a483a00604f9b386932c48052b81bdb # v0.0.0, route-review-gate overflow_decision + classify every fetched job by its own status
         with:
           lane: linux-arm64
           # `repo: ci` is the short form (`maxi-tools/ci` is the long form);
