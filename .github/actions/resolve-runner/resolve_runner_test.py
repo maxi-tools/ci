@@ -25,6 +25,9 @@ POLICY = {
             "self_hosted": ["self-hosted", "Linux", "X64"],
             "self_hosted_allowed": False,
         },
+        "linux-arm64": {
+            "self_hosted": ["self-hosted", "Linux", "ARM64"],
+        },
         "macos-arm64": {
             "self_hosted": ["self-hosted", "macOS", "ARM64"],
         },
@@ -42,6 +45,15 @@ POLICY = {
     "repos": {
         "maxi-core": {
             "jobs": {"build-pr": {"lane": "macos-arm64", "queue_wait_seconds": 600}}
+        },
+        "ci": {
+            "jobs": {
+                "gate": {
+                    "lane": "linux-arm64",
+                    "overflow_to": ["macos-arm64"],
+                    "queue_wait_seconds": 60,
+                }
+            }
         },
     },
 }
@@ -554,5 +566,228 @@ malformed = rr.snapshot_decision(
 verify(
     "observation" not in malformed and malformed["provider"] == "self-hosted", malformed
 )
+
+# --- overflow_to: Linux-saturated jobs spilling onto an idle Mac pool -----
+# The PR-98 fixture from verifier t_8aeb6900's REJECT, verbatim:
+# linux-arm64 idle=0, queued_seconds=120; macos-arm64 idle=10;
+# ci/gate overflow_to=[macos-arm64]; threshold=60.
+# With the lane's own pool fully occupied (idle == 0) AND an idle Mac
+# pool (idle == 10) AND the Mac lane's queue_minutes <= half the Linux
+# lane's, the resolver MUST return the macOS self-hosted labels under
+# reason="linux-saturated-mac-overflow". Before the fix it returned
+# [self-hosted, Linux, ARM64] with reason="saturated-self-hosted-pool",
+# which was the verifier's REJECT.
+verifier_fixture = {
+    "lanes": {
+        "linux-arm64": {"idle": 0, "queued_seconds": 120, "queue_minutes": 40.0},
+        "macos-arm64": {"idle": 10, "queued_seconds": 0, "queue_minutes": 10.0},
+    }
+}
+out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", verifier_fixture)
+verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64"], out)
+verify(out["provider"] == "self-hosted", out)
+verify(out["reason"] == "linux-saturated-mac-overflow", out)
+verify(out["lane"] == "linux-arm64", out)
+verify(out["overflow_lane"] == "macos-arm64", out)
+verify(out["overflow_source_minutes"] == 40.0, out)
+verify(out["overflow_target_minutes"] == 10.0, out)
+verify(out["threshold_seconds"] == 60, out)
+verify(out["queued_seconds"] == 120, out)
+assert_self_hosted_only(out, "verifier fixture (Linux saturated + idle Mac pool)")
+
+# NEGATIVE: Linux has an idle runner -- overflow MUST NOT fire, even
+# though overflow_to is declared and the Mac lane would otherwise
+# qualify. "Stay on Linux" is the default, checked before overflow is
+# ever consulted.
+linux_free_mac_idle = {
+    "lanes": {
+        "linux-arm64": {"idle": 1, "queued_seconds": 0, "queue_minutes": 0.0},
+        "macos-arm64": {"idle": 10, "queued_seconds": 0, "queue_minutes": 0.0},
+    }
+}
+out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", linux_free_mac_idle)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "idle-self-hosted-runner", out)
+assert_self_hosted_only(out, "linux-arm64 idle (no overflow)")
+
+# NEGATIVE: Linux saturated, but the Mac lane's queue_minutes is more
+# than half the Linux lane's -- overflow MUST decline. The Linux lane
+# stays, queues on its own self_hosted label set, no paid/hosted
+# fallback exists (operator check 04:15Z on PR #98).
+mac_queue_too_long = {
+    "lanes": {
+        "linux-arm64": {"idle": 0, "queued_seconds": 700, "queue_minutes": 40.0},
+        "macos-arm64": {"idle": 10, "queued_seconds": 0, "queue_minutes": 30.0},
+    }
+}
+out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", mac_queue_too_long)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+assert_self_hosted_only(out, "linux-arm64 saturated, Mac queue too long")
+
+# NEGATIVE: Linux saturated, Mac lane qualifies on queue_minutes BUT has
+# no idle runner -- must NOT overflow onto a fully-saturated Mac pool.
+# A low queue_minutes estimate is not the same thing as idle capacity:
+# a job already past its p50 contributes 0 per lane_queue_minutes but the
+# box it is running on is still busy. "Overflow onto idle Mac runners",
+# not onto a cheap-looking estimate.
+mac_busy_cheap_estimate = {
+    "lanes": {
+        "linux-arm64": {"idle": 0, "queued_seconds": 700, "queue_minutes": 40.0},
+        "macos-arm64": {"idle": 0, "queued_seconds": 0, "queue_minutes": 0.0},
+    }
+}
+out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", mac_busy_cheap_estimate)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+assert_self_hosted_only(out, "Mac busy, cheap estimate")
+
+# EXACT-HALF BOUNDARY: target <= 0.5 * source qualifies (<=, not <).
+exact_half = {
+    "lanes": {
+        "linux-arm64": {"idle": 0, "queued_seconds": 0, "queue_minutes": 40.0},
+        "macos-arm64": {"idle": 1, "queued_seconds": 0, "queue_minutes": 20.0},
+    }
+}
+out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", exact_half)
+verify(out["reason"] == "linux-saturated-mac-overflow", out)
+
+# NO DECLARATION: a job without overflow_to in policy must NEVER overflow,
+# even when the source lane is saturated and the target lane is empty.
+# Declaration is required, never inferred.
+policy_no_overflow = json.loads(json.dumps(POLICY))
+policy_no_overflow["repos"]["ci"]["jobs"]["gate"].pop("overflow_to")
+out = rr.resolve(
+    policy_no_overflow,
+    "linux-arm64",
+    "ci",
+    "gate",
+    verifier_fixture,
+)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+
+# NO TARGET ESTIMATE DATA: overflow_to declares a target lane that
+# probe_runner_state() did not populate with queue_minutes (e.g. a client
+# that does not implement lane_job_estimates). MUST NOT overflow silently
+# onto that lane -- the <= half source gate has no target to compare
+# against, and overflow is unreachable without an estimate.
+target_lane_unlisted = {
+    "lanes": {
+        "linux-arm64": {"idle": 0, "queued_seconds": 700, "queue_minutes": 40.0},
+        "macos-arm64": {"idle": 10, "queued_seconds": 0},
+    }
+}
+out = rr.resolve(
+    POLICY,
+    "linux-arm64",
+    "ci",
+    "gate",
+    target_lane_unlisted,
+)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+
+# WRONG TARGET NAME: overflow_to declares a lane name that does not
+# appear in [lanes]. Resolver must not KeyError, must simply not overflow.
+policy_bad_target = json.loads(json.dumps(POLICY))
+policy_bad_target["repos"]["ci"]["jobs"]["gate"]["overflow_to"] = ["no-such-lane"]
+out = rr.resolve(
+    policy_bad_target,
+    "linux-arm64",
+    "ci",
+    "gate",
+    verifier_fixture,
+)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+
+# JOB P50 ESTIMATOR (lane_queue_minutes). 100s queued (matched lane) +
+# 10s remaining on a running job (90s elapsed of a 100s p50) = 110s =
+# 1.8333 min. Cross-lane jobs contribute nothing.
+estimator_policy = {
+    "defaults": {},
+    "repos": {
+        "maxi-core": {
+            "jobs": {"route-clippy": {"p50_seconds": 100}},
+        },
+    },
+}
+linux_arm_lane_cfg = {"self_hosted": ["self-hosted", "Linux", "ARM64"]}
+queued = [
+    {"name": "route-clippy", "labels": ["self-hosted", "Linux", "ARM64"]},
+    {"name": "other-job", "labels": ["self-hosted", "macOS", "ARM64"]},
+]
+now = rr.parse_github_time("2026-10-14T12:10:00Z")
+running = [
+    {
+        "name": "route-clippy",
+        "labels": ["self-hosted", "Linux", "ARM64"],
+        "started_at": "2026-10-14T12:08:30Z",  # 90s elapsed of a 100s p50
+    },
+]
+minutes = rr.lane_queue_minutes(
+    estimator_policy, "maxi-core", linux_arm_lane_cfg, queued, running, now
+)
+verify(abs(minutes - (110 / 60.0)) < 1e-6, minutes)
+
+# A running job already past its p50 contributes nothing (floored at 0).
+overrun = [
+    {
+        "name": "route-clippy",
+        "labels": ["self-hosted", "Linux", "ARM64"],
+        "started_at": "2026-10-14T12:00:00Z",  # 600s elapsed, p50 only 100s
+    },
+]
+minutes = rr.lane_queue_minutes(
+    estimator_policy, "maxi-core", linux_arm_lane_cfg, [], overrun, now
+)
+verify(minutes == 0.0, minutes)
+
+
+# CLIENT WITHOUT lane_job_estimates: probe_runner_state() must NOT
+# fabricate queue_minutes out of nothing. A pre-overflow client (or a
+# test double) without the helper simply never overflows -- "stay on
+# Linux" is the default, NOT "always overflow".
+class NoJobDetailClient:
+    def org_runners(self, owner):
+        return []
+
+    def queued_runs(self, owner, repo):
+        return []
+
+
+no_detail_state = rr.probe_runner_state(
+    POLICY,
+    NoJobDetailClient(),
+    "maxi-tools",
+    "ci",
+    now=rr.parse_github_time("2026-10-14T12:00:00Z"),
+)
+verify("queue_minutes" not in no_detail_state["lanes"]["linux-arm64"], no_detail_state)
+out = rr.resolve(
+    POLICY,
+    "linux-arm64",
+    "ci",
+    "gate",
+    {
+        "lanes": {
+            **no_detail_state["lanes"],
+            "linux-arm64": {
+                **no_detail_state["lanes"]["linux-arm64"],
+                "idle": 0,
+                "queued_seconds": 700,
+            },
+        },
+    },
+)
+verify(out["reason"] != "linux-saturated-mac-overflow", out)
+verify(out["runs_on"] == ["self-hosted", "Linux", "ARM64"], out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
 
 print("resolve_runner_test: passed")

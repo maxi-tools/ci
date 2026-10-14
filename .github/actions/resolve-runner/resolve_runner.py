@@ -102,6 +102,141 @@ def self_hosted_allowed(policy, lane_cfg, repo, job):
     )
 
 
+# Representative duration (seconds) assumed for a job this resolver has no
+# p50 data for, when estimating lane queue minutes for overflow_to. Better to
+# over-estimate a stranger job's cost (biasing AGAINST overflow) than to
+# under-estimate it and overflow work the Mac pool cannot actually absorb in
+# time.
+DEFAULT_JOB_P50_SECONDS = 600
+
+
+def job_requested_labels(job):
+    return {str(label).lower() for label in job.get("labels", []) or []}
+
+
+def job_matches_lane(job, lane_cfg):
+    """A queued/running job's requested `runs-on` labels, compared for EXACT
+    equality against a lane's self_hosted set.
+
+    Equality, not subset: resolve_runner emits exactly `lane_cfg["self_hosted"]`
+    as `runs_on` when a job is routed self-hosted, so a job queued/running for
+    lane X carries exactly X's label set. A subset match would also catch jobs
+    actually routed to a narrower sibling lane (e.g. macos-arm64-heavy, which
+    shares macos-arm64's labels plus more), double-counting them against the
+    broader lane's estimate.
+    """
+    have = job_requested_labels(job)
+    want = {str(label).lower() for label in lane_cfg.get("self_hosted", [])}
+    return bool(want) and have == want
+
+
+def estimate_job_seconds(policy, repo, job_name, lane_cfg):
+    job_cfg = repo_job_override(policy, repo, job_name)
+    p50 = job_cfg.get("p50_seconds")
+    if p50 is None:
+        p50 = lane_cfg.get("p50_seconds")
+    if p50 is None:
+        p50 = policy.get("defaults", {}).get("p50_seconds")
+    if p50 is None:
+        p50 = DEFAULT_JOB_P50_SECONDS
+    return int(p50)
+
+
+def lane_queue_minutes(policy, repo, lane_cfg, queued_jobs, running_jobs, now):
+    """Estimated minutes of CI work still owed to a lane: every queued job's
+    full p50, plus every running job's REMAINING p50 (p50 minus elapsed,
+    floored at zero so a job already past its p50 contributes nothing extra
+    -- it is assumed to finish imminently rather than overrun forever).
+    """
+    total_seconds = 0
+    for job in queued_jobs:
+        if job_matches_lane(job, lane_cfg):
+            total_seconds += estimate_job_seconds(
+                policy, repo, job.get("name", ""), lane_cfg
+            )
+    for job in running_jobs:
+        if not job_matches_lane(job, lane_cfg):
+            continue
+        p50 = estimate_job_seconds(policy, repo, job.get("name", ""), lane_cfg)
+        started = job.get("started_at")
+        elapsed = 0
+        if started:
+            try:
+                elapsed = max(
+                    0, int((now - parse_github_time(started)).total_seconds())
+                )
+            except ValueError:
+                elapsed = 0
+        total_seconds += max(0, p50 - elapsed)
+    return total_seconds / 60.0
+
+
+def overflow_targets_for(policy, lane_cfg, repo, job):
+    return list(effective_value(policy, lane_cfg, repo, job, "overflow_to", []) or [])
+
+
+def overflow_decision(
+    policy,
+    selected_lane,
+    lane_cfg,
+    repo,
+    job,
+    idle,
+    runner_state,
+    source_state,
+    threshold,
+    queued_seconds,
+):
+    """Overflow a Linux-capable job onto an idle Mac pool.
+
+    ONLY when both hold at plan time:
+      (a) the source lane's self-hosted pool is fully occupied (idle == 0),
+      (b) the target lane's estimated queue minutes <= half the source
+          lane's estimated queue minutes.
+    `overflow_to` must be declared per-lane/job in policy (never inferred),
+    and is only meaningful for jobs proven portable -- the policy author's
+    responsibility, not this resolver's. Returns None when overflow does not
+    apply, so the caller falls through to the existing self-hosted
+    decision.
+    """
+    targets = overflow_targets_for(policy, lane_cfg, repo, job)
+    if not targets or idle > 0:
+        return None
+    source_minutes = source_state.get("queue_minutes")
+    if source_minutes is None:
+        return None
+    for target_lane in targets:
+        target_cfg = policy["lanes"].get(target_lane)
+        if target_cfg is None:
+            continue
+        target_state = runner_state.get("lanes", {}).get(target_lane, {})
+        # The target Mac lane must actually have spare capacity right now --
+        # a low/zero queue_minutes estimate is NOT the same thing as an idle
+        # runner (a job already past its p50 contributes 0 per
+        # lane_queue_minutes but the box it's running on is still busy).
+        # Without this the gate can overflow onto a fully-saturated Mac pool
+        # whose stale estimate happens to look cheap. Required per the card:
+        # overflow "onto idle Mac runners", not onto a queue estimate alone.
+        if int(target_state.get("idle", 0)) <= 0:
+            continue
+        target_minutes = target_state.get("queue_minutes")
+        if target_minutes is None:
+            continue
+        if target_minutes <= 0.5 * source_minutes:
+            return {
+                "lane": selected_lane,
+                "runs_on": target_cfg["self_hosted"],
+                "provider": "self-hosted",
+                "reason": "linux-saturated-mac-overflow",
+                "threshold_seconds": threshold,
+                "queued_seconds": queued_seconds,
+                "overflow_lane": target_lane,
+                "overflow_source_minutes": round(source_minutes, 2),
+                "overflow_target_minutes": round(target_minutes, 2),
+            }
+    return None
+
+
 def self_hosted_disallowed_decision(policy, lane, repo, job):
     # The policy says self-hosted is not permitted and the action no longer
     # knows any other runner. A `self_hosted_allowed: false` lane is a
@@ -179,6 +314,31 @@ def resolve(policy, lane, repo, job, runner_state):
             "threshold_seconds": threshold,
             "queued_seconds": queued_seconds,
         }
+
+    # Linux-saturated overflow onto an idle Mac pool (ONE fix, 2026-10-14).
+    # Only reached once the lane's own self-hosted pool is fully occupied
+    # (idle == 0, checked above) -- "stay on Linux" is the default outcome,
+    # this is the exception. Declared per lane/job via `overflow_to` in
+    # policy; never inferred here, and gated a second time inside
+    # overflow_decision on the target lane's estimated queue being <= half
+    # the source lane's AND the target lane having an idle runner. No
+    # paid/hosted fallback exists or will be added here (operator check
+    # 04:15Z on PR #98): overflow goes only to idle self-hosted Macs; if
+    # none is free the job waits on its own lane's self_hosted label set.
+    overflow = overflow_decision(
+        policy,
+        selected_lane,
+        lane_cfg,
+        repo,
+        job,
+        idle,
+        runner_state,
+        state,
+        threshold,
+        queued_seconds,
+    )
+    if overflow is not None:
+        return overflow
 
     # No idle self-hosted runner and no other runner to spill to. The job must
     # queue on the lane's self_hosted label set; returning that set here means
@@ -309,11 +469,103 @@ class GithubClient:
             page += 1
         return runs
 
+    def running_runs(self, owner, repo):
+        """In-progress runs, so the Linux-overflow estimate can subtract
+        elapsed time from a running job's p50 rather than treating it as a
+        fresh queue entry (ci/runner-routing.toml overflow_to)."""
+        runs = []
+        page = 1
+        while True:
+            data = self.api_json(
+                f"/repos/{owner}/{repo}/actions/runs",
+                {"status": "in_progress", "per_page": "100", "page": str(page)},
+            )
+            batch = data.get("workflow_runs", [])
+            if not batch:
+                break
+            runs.extend(batch)
+            page += 1
+        return runs
+
+    def run_jobs(self, owner, repo, run_id):
+        """Per-JOB detail (requested labels, started_at) for one run.
+
+        A workflow run has no `labels` of its own -- labels are per-job, so
+        the overflow estimate needs this to know what a queued/running run
+        is actually asking to run on. Cheap relative to the run list: called
+        once per queued/running run, not per poll tick, and only inside
+        `lane_job_estimates` which the resolver calls once per plan.
+        """
+        jobs = []
+        page = 1
+        while True:
+            data = self.api_json(
+                f"/repos/{owner}/{repo}/actions/runs/{run_id}/jobs",
+                {"per_page": "100", "page": str(page)},
+            )
+            batch = data.get("jobs", [])
+            if not batch:
+                break
+            jobs.extend(batch)
+            page += 1
+        return jobs
+
+    def lane_job_estimates(self, owner, repo):
+        """-> (queued_jobs, running_jobs), each a list of
+        {"name", "labels", "started_at"} job-level dicts.
+
+        Resolves the run-level queued/in_progress lists down to job-level
+        label sets, which is what lane matching actually needs -- a run can
+        contain jobs destined for several different lanes.
+
+        Jobs are classified by their OWN status, not their run's: a run turns
+        `in_progress` as soon as its first job starts, so an in_progress run
+        routinely still holds `queued` jobs waiting for a runner. Taking only
+        the in_progress jobs from those runs dropped that pending work and
+        under-estimated the lane's queue.
+        """
+        queued_jobs, running_jobs = [], []
+        for run in self.queued_runs(owner, repo):
+            for job in self.run_jobs(owner, repo, run["id"]):
+                if job.get("status") == "queued":
+                    queued_jobs.append(
+                        {
+                            "name": job.get("name", ""),
+                            "labels": job.get("labels", []),
+                            "started_at": job.get("started_at"),
+                        }
+                    )
+        for run in self.running_runs(owner, repo):
+            for job in self.run_jobs(owner, repo, run["id"]):
+                if job.get("status") == "in_progress":
+                    running_jobs.append(
+                        {
+                            "name": job.get("name", ""),
+                            "labels": job.get("labels", []),
+                            "started_at": job.get("started_at"),
+                        }
+                    )
+        return queued_jobs, running_jobs
+
 
 def probe_runner_state(policy, client, owner, repo, now=None):
     now = now or datetime.now(timezone.utc)
     runners = client.org_runners(owner)
-    queued_seconds = oldest_queued_seconds(client.queued_runs(owner, repo), now)
+    queued_runs = client.queued_runs(owner, repo)
+    queued_seconds = oldest_queued_seconds(queued_runs, now)
+    # Job-level label/timing visibility is optional: a client written before
+    # this fix (or a test double exercising the pre-overflow surface) need
+    # not implement it, and an estimate with no job-level data simply never
+    # overflows -- lane_queue_minutes() sees empty lists and every lane's
+    # queue_minutes comes out 0, so overflow_decision's "target <= half
+    # source" gate can still fire spuriously at 0 <= 0. Guard explicitly:
+    # no job-level data means "stay on Linux", not "always overflow".
+    if hasattr(client, "lane_job_estimates"):
+        queued_jobs, running_jobs = client.lane_job_estimates(owner, repo)
+        have_job_estimates = True
+    else:
+        queued_jobs, running_jobs = [], []
+        have_job_estimates = False
     lanes = {}
     for lane, lane_cfg in policy["lanes"].items():
         idle = sum(
@@ -334,6 +586,10 @@ def probe_runner_state(policy, client, owner, repo, now=None):
             "idle_preferred": idle_preferred,
             "queued_seconds": queued_seconds,
         }
+        if have_job_estimates:
+            lanes[lane]["queue_minutes"] = lane_queue_minutes(
+                policy, repo, lane_cfg, queued_jobs, running_jobs, now
+            )
     # Preserve the SAME probe used to choose the selector. A later probe
     # would describe a different fleet, not the decision-time candidates.
     return {"lanes": lanes, "observed_at": now.isoformat(), "inventory": runners}
@@ -401,9 +657,7 @@ def resolve_after_wait(
         remaining_threshold = decision["threshold_seconds"] - decision["queued_seconds"]
         remaining_max_wait = max_wait - elapsed
         should_keep_polling = (
-            elapsed < max_wait
-            and remaining_threshold > 0
-            and remaining_max_wait > 0
+            elapsed < max_wait and remaining_threshold > 0 and remaining_max_wait > 0
         )
         if not should_keep_polling:
             return snapshot_decision(decision, runner_state)
@@ -439,6 +693,19 @@ def write_summary(decision):
             f"{decision['reason']} | {queued} / {threshold} |",
             file=f,
         )
+        if decision["reason"] == "linux-saturated-mac-overflow":
+            # Log every overflow decision (lane, both estimates) in the plan job
+            # output so an operator reading the summary sees WHY the lane was
+            # left and WHAT target it overflowed to. Acceptance from the
+            # review-gate overflow card: "log every overflow decision".
+            print("", file=f)
+            print(
+                f"Overflowed `{decision['lane']}` -> `{decision['overflow_lane']}`: "
+                f"source estimate {decision['overflow_source_minutes']} min, "
+                f"target estimate {decision['overflow_target_minutes']} min "
+                f"(target <= 0.5 x source).",
+                file=f,
+            )
 
 
 def main(argv):
