@@ -85,6 +85,15 @@ jobs:
         with:
           files: ".github/workflows/*.yml"
           fail-on-error: true
+          # The action defaults to provisioning pyflakes via pipx and
+          # shellcheck via apt-get, neither of which is available on the
+          # org's self-hosted runners. Disable them explicitly so the
+          # action doesn't try to install them; the YAML / expression
+          # checks above are what matter for this lane, and a Python
+          # / shellcheck pass is run by `test_review_gate_route_shim.py`
+          # and the existing python test suites anyway.
+          pyflakes: false
+          shellcheck: false
 
       - name: Check `uses:` references
         # Two properties actionlint does not cover: that a relative call
