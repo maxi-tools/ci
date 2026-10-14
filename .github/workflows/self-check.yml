@@ -120,6 +120,19 @@ jobs:
               failed=1
             fi
           done
+          # resolve_runner_test.py lives under the action (so the composite
+          # action step can import it directly when needed) but the routing
+          # logic it exercises -- overflow_to, lane_queue_minutes, the
+          # probe_runner_state client-guard -- is the heart of PR #98's
+          # contract. The verifier's REJECT fixture (Linux-saturated + idle
+          # Mac pool -> Mac labels) only proves it from this script, so
+          # running it here is the difference between the fixture having
+          # run green in CI and it not being in the CI loop at all.
+          echo "== .github/actions/resolve-runner/resolve_runner_test.py"
+          if ! python3 .github/actions/resolve-runner/resolve_runner_test.py; then
+            echo "::error file=.github/actions/resolve-runner/resolve_runner_test.py::resolve_runner_test failed"
+            failed=1
+          fi
           # Non-vacuity: every tests/test_*.py must be in the list above.
           for f in tests/test_*.py; do
             case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_review_gate_route_shim.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py " in
