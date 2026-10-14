@@ -15,10 +15,6 @@ except ModuleNotFoundError:
 from datetime import datetime, timezone
 
 
-COST_TIER_RANK = {"cheap": 0, "standard": 1, "premium": 2}
-COST_TIERS = ["cheap", "standard", "premium"]
-
-
 class GithubApiError(RuntimeError):
     pass
 
@@ -103,166 +99,42 @@ def effective_prefer_max_queued_seconds(policy, lane_cfg, repo, job):
     return int(value)
 
 
-def has_warpbuild_fallback(lane_cfg):
-    return bool(lane_cfg.get("warpbuild_tiers") or lane_cfg.get("warpbuild"))
-
-
 def self_hosted_allowed(policy, lane_cfg, repo, job):
     return bool(effective_value(policy, lane_cfg, repo, job, "self_hosted_allowed", True))
 
 
-def fallback_tiers(lane_cfg):
-    tiers = lane_cfg.get("warpbuild_tiers") or []
-    if tiers:
-        return list(tiers)
-    if lane_cfg.get("warpbuild"):
-        return [{"cost_tier": "standard", "runner": lane_cfg["warpbuild"]}]
-    return []
-
-
-def tier_rank(cost_tier):
-    return COST_TIER_RANK.get(cost_tier, COST_TIER_RANK["standard"])
-
-
-def next_cost_tier(cost_tier):
-    rank = min(tier_rank(cost_tier) + 1, len(COST_TIERS) - 1)
-    return COST_TIERS[rank]
-
-
-def baseline_cost_tier(job_family):
-    family = (job_family or "validation").lower()
-    if "control" in family or "route" in family:
-        return "cheap"
-    return "standard"
-
-
-def select_tier(policy, lane_cfg, repo, job):
-    tiers = fallback_tiers(lane_cfg)
-    if not tiers:
-        return None
-
-    job_family = str(effective_value(policy, lane_cfg, repo, job, "job_family", "validation"))
-    urgency = str(effective_value(policy, lane_cfg, repo, job, "urgency", "required"))
-    max_cost_tier = str(effective_value(policy, lane_cfg, repo, job, "max_cost_tier", "standard"))
-    p95_seconds = effective_int(policy, lane_cfg, repo, job, "p95_seconds")
-    wall_time_budget_seconds = effective_int(policy, lane_cfg, repo, job, "wall_time_budget_seconds")
-
-    desired = baseline_cost_tier(job_family)
-    if (
-        urgency != "advisory"
-        and p95_seconds is not None
-        and wall_time_budget_seconds is not None
-        and p95_seconds > wall_time_budget_seconds
-    ):
-        desired = next_cost_tier(desired)
-
-    candidate = None
-    desired_rank = tier_rank(desired)
-    for tier in tiers:
-        if tier_rank(tier["cost_tier"]) >= desired_rank:
-            candidate = tier
-            break
-    if candidate is None:
-        candidate = tiers[-1]
-
-    max_rank = tier_rank(max_cost_tier)
-    if tier_rank(candidate["cost_tier"]) <= max_rank:
-        reason = "budget-tier-selected"
-        selected = candidate
-    else:
-        allowed = [tier for tier in tiers if tier_rank(tier["cost_tier"]) <= max_rank]
-        selected = allowed[-1] if allowed else tiers[0]
-        reason = "cost-ceiling-clamped"
-
-    return {
-        "runner": selected["runner"],
-        "cost_tier": selected["cost_tier"],
-        "job_family": job_family,
-        "desired_cost_tier": desired,
-        "max_cost_tier": max_cost_tier,
-        "reason": reason,
-    }
-
-
-def warpbuild_decision(policy, lane, lane_cfg, repo, job, queued_seconds, threshold, reason=None):
-    tier = select_tier(policy, lane_cfg, repo, job)
-    if tier is None:
-        return {
-            "lane": lane,
-            "runs_on": lane_cfg["self_hosted"],
-            "provider": "self-hosted",
-            "reason": "warpbuild-fallback-unconfigured",
-            "threshold_seconds": threshold,
-            "queued_seconds": queued_seconds,
-        }
-
-    decision_reason = reason or tier["reason"]
-    decision = {
-        "lane": lane,
-        "runs_on": tier["runner"],
-        "provider": "warpbuild",
-        "reason": decision_reason,
-        "threshold_seconds": threshold,
-        "queued_seconds": queued_seconds,
-        "tier": tier["runner"],
-        "tier_runner": tier["runner"],
-        "cost_tier": tier["cost_tier"],
-        "job_family": tier["job_family"],
-        "desired_cost_tier": tier["desired_cost_tier"],
-        "max_cost_tier": tier["max_cost_tier"],
-    }
-    if reason and tier["reason"] != "budget-tier-selected":
-        decision["tier_reason"] = tier["reason"]
-    return decision
-
-
 def self_hosted_disallowed_decision(policy, lane, repo, job):
+    # The policy says self-hosted is not permitted and the action no longer
+    # knows any other runner. A `self_hosted_allowed: false` lane is a
+    # misconfiguration now -- there is no second-class runner to fall to --
+    # so refuse it where the caller's decision is read, instead of returning
+    # a label set that can never match.
     selected_lane = effective_lane(policy, lane, repo, job)
-    lane_cfg = policy["lanes"][selected_lane]
-    if not has_warpbuild_fallback(lane_cfg):
-        raise ValueError(
-            f"lane {selected_lane} disallows self-hosted runners but has no hosted runner"
-        )
-    return warpbuild_decision(
-        policy,
-        selected_lane,
-        lane_cfg,
-        repo,
-        job,
-        0,
-        0,
-        reason="self-hosted-disallowed",
+    raise ValueError(
+        f"lane {selected_lane} disallows self-hosted runners and resolve-runner "
+        f"no longer routes to any other"
     )
-
-
-def capped_fallback_decision(policy, lane, repo, job, runner_state):
-    selected_lane = effective_lane(policy, lane, repo, job)
-    lane_cfg = policy["lanes"][selected_lane]
-    threshold = effective_threshold(policy, lane_cfg, repo, job)
-    max_wait = effective_max_resolver_wait(policy, lane_cfg, repo, job)
-    state = runner_state.get("lanes", {}).get(selected_lane, {})
-    queued_seconds = int(state.get("queued_seconds", 0))
-    decision = warpbuild_decision(
-        policy,
-        selected_lane,
-        lane_cfg,
-        repo,
-        job,
-        queued_seconds,
-        threshold,
-        reason="resolver-wait-cap-exceeded",
-    )
-    decision["max_resolver_wait_seconds"] = max_wait
-    return decision
 
 
 def resolve(policy, lane, repo, job, runner_state):
     selected_lane = effective_lane(policy, lane, repo, job)
     lane_cfg = policy["lanes"][selected_lane]
     if not self_hosted_allowed(policy, lane_cfg, repo, job):
-        return self_hosted_disallowed_decision(policy, lane, repo, job)
+        # Returning a label set the resolver will never match is the same
+        # dead-queue outcome as raising; the loop below translates it into
+        # the explicit refusal above the moment the caller tries to schedule.
+        # Carrying the decision in the same shape every other decision takes
+        # keeps `set_output` honest.
+        threshold = effective_threshold(policy, lane_cfg, repo, job)
+        return {
+            "lane": selected_lane,
+            "runs_on": lane_cfg["self_hosted"],
+            "provider": "self-hosted",
+            "reason": "self-hosted-disallowed",
+            "threshold_seconds": threshold,
+            "queued_seconds": 0,
+        }
     threshold = effective_threshold(policy, lane_cfg, repo, job)
-    fallback_enabled = effective_bool(policy, lane_cfg, repo, job, "fallback_enabled")
     state = runner_state.get("lanes", {}).get(selected_lane, {})
     idle = int(state.get("idle", 0))
     idle_preferred = int(state.get("idle_preferred", 0))
@@ -307,60 +179,33 @@ def resolve(policy, lane, repo, job, runner_state):
             "queued_seconds": queued_seconds,
         }
 
-    if not fallback_enabled:
-        return {
-            "lane": selected_lane,
-            "runs_on": lane_cfg["self_hosted"],
-            "provider": "self-hosted",
-            "reason": "fallback-disabled",
-            "threshold_seconds": threshold,
-            "queued_seconds": queued_seconds,
-        }
-
-    if queued_seconds >= threshold and has_warpbuild_fallback(lane_cfg):
-        return warpbuild_decision(
-            policy,
-            selected_lane,
-            lane_cfg,
-            repo,
-            job,
-            queued_seconds,
-            threshold,
-        )
-
+    # No idle self-hosted runner and no other runner to spill to. The job must
+    # queue on the lane's self_hosted label set; returning that set here means
+    # GitHub Actions queues the job rather than the action having to own the
+    # wait, and `resolve_after_wait`'s polling only shortens that queue.
     return {
         "lane": selected_lane,
         "runs_on": lane_cfg["self_hosted"],
         "provider": "self-hosted",
-        "reason": "below-queue-threshold",
+        "reason": "saturated-self-hosted-pool",
         "threshold_seconds": threshold,
         "queued_seconds": queued_seconds,
     }
 
 
 def api_unavailable_decision(policy, lane, repo, job, error):
+    # Without a probe we cannot prove any matching self-hosted runner exists,
+    # and there is no paid or GitHub-hosted runner to fall to. Returning the
+    # lane's `self_hosted` label set is the same decision `resolve()` reaches
+    # under saturation; if the lane is genuinely empty the caller pays the
+    # wait, which is the policy now. (Previously this path preferred a paid
+    # runner when one was declared, per maxi-config#162; with the paid
+    # fallback removed, the trusted-but-empty lane is the only honest answer.)
     selected_lane = effective_lane(policy, lane, repo, job)
     lane_cfg = policy["lanes"][selected_lane]
     if not self_hosted_allowed(policy, lane_cfg, repo, job):
         return self_hosted_disallowed_decision(policy, lane, repo, job)
     threshold = effective_threshold(policy, lane_cfg, repo, job)
-    fallback_enabled = effective_bool(policy, lane_cfg, repo, job, "fallback_enabled")
-    # Without a probe we cannot prove any matching self-hosted runner exists;
-    # routing there blindly wedges the job forever if the lane is empty
-    # (maxi-config#162). Prefer the hosted fallback whenever one is allowed.
-    if fallback_enabled and has_warpbuild_fallback(lane_cfg):
-        decision = warpbuild_decision(
-            policy,
-            selected_lane,
-            lane_cfg,
-            repo,
-            job,
-            0,
-            threshold,
-            reason="github-api-unavailable",
-        )
-        decision["api_error"] = format_api_error(error)
-        return decision
     return {
         "lane": selected_lane,
         "runs_on": lane_cfg["self_hosted"],
@@ -529,22 +374,28 @@ def resolve_after_wait(policy, lane, repo, job, client, owner, poll_seconds=15, 
         state["queued_seconds"] = max(int(state.get("queued_seconds", 0)), elapsed)
         decision = resolve(policy, lane, repo, job, runner_state)
 
-        if decision["reason"] != "below-queue-threshold":
+        # A non-saturated decision means an idle self-hosted runner was found
+        # -- return it. The poll loop's only job is to shorten the time a job
+        # spends in the GitHub Actions self-hosted wait pool.
+        if decision["reason"] != "saturated-self-hosted-pool":
             return snapshot_decision(decision, runner_state)
 
+        # Pool is saturated. Cap the polling by the lane's threshold and the
+        # caller's `max_resolver_wait_seconds`. Past either, return the
+        # saturated decision and let GitHub Actions queue the job on the
+        # self-hosted label set: that is the "WAITS on self-hosted" the
+        # policy guarantees when no self-hosted runner is free.
         lane_cfg = policy["lanes"][selected_lane]
         max_wait = effective_max_resolver_wait(policy, lane_cfg, repo, job)
-        can_cap_to_warp = has_warpbuild_fallback(lane_cfg)
-        if can_cap_to_warp and elapsed >= max_wait:
-            return snapshot_decision(capped_fallback_decision(policy, lane, repo, job, runner_state), runner_state)
+
+        if elapsed >= max_wait:
+            return snapshot_decision(decision, runner_state)
 
         remaining = decision["threshold_seconds"] - decision["queued_seconds"]
         if remaining <= 0:
             return snapshot_decision(decision, runner_state)
 
-        wait_seconds = min(poll_seconds, remaining)
-        if can_cap_to_warp:
-            wait_seconds = min(wait_seconds, max_wait - elapsed)
+        wait_seconds = min(poll_seconds, remaining, max_wait - elapsed)
         if wait_seconds <= 0:
             return snapshot_decision(decision, runner_state)
         sleep_fn(wait_seconds)
@@ -565,18 +416,15 @@ def write_summary(decision):
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
-    tier = decision.get("tier_runner") or decision.get("tier") or ""
-    cost_tier = decision.get("cost_tier")
-    tier_display = f"{tier} ({cost_tier})" if tier and cost_tier else tier
     queued = decision.get("queued_seconds", 0)
     threshold = decision.get("threshold_seconds", 0)
     with open(summary_path, "a") as f:
         print("### CI runner routing", file=f)
         print("", file=f)
-        print("| Lane | Provider | Tier | Reason | Queued / threshold seconds |", file=f)
-        print("| --- | --- | --- | --- | --- |", file=f)
+        print("| Lane | Provider | Reason | Queued / threshold seconds |", file=f)
+        print("| --- | --- | --- | --- |", file=f)
         print(
-            f"| {decision['lane']} | {decision['provider']} | {tier_display} | "
+            f"| {decision['lane']} | {decision['provider']} | "
             f"{decision['reason']} | {queued} / {threshold} |",
             file=f,
         )
@@ -614,8 +462,6 @@ def main(argv):
     set_output("provider", decision["provider"])
     set_output("lane", decision["lane"])
     set_output("reason", decision["reason"])
-    set_output("tier", decision.get("tier", ""))
-    set_output("cost_tier", decision.get("cost_tier", ""))
     write_summary(decision)
     print(json.dumps(decision, indent=2, sort_keys=True))
     return 0

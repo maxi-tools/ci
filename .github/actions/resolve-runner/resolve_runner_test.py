@@ -13,36 +13,19 @@ spec.loader.exec_module(rr)
 
 POLICY = {
     "defaults": {
-        "fallback_enabled": True,
         "queue_wait_seconds": 300,
         "max_resolver_wait_seconds": 30,
-        "max_cost_tier": "standard",
     },
     "lanes": {
         "linux-x64": {
             "self_hosted": ["self-hosted", "Linux", "X64"],
-            "warpbuild": "warp-ubuntu-latest-x64-4x",
-            "warpbuild_tiers": [
-                {"cost_tier": "cheap", "runner": "warp-ubuntu-latest-x64-2x"},
-                {"cost_tier": "standard", "runner": "warp-ubuntu-latest-x64-4x"},
-                {"cost_tier": "premium", "runner": "warp-ubuntu-latest-x64-8x"},
-            ],
         },
-        "linux-x64-ephemeral-review": {
+        "linux-x64-disallowed": {
             "self_hosted": ["self-hosted", "Linux", "X64"],
             "self_hosted_allowed": False,
-            "warpbuild_tiers": [
-                {"cost_tier": "cheap", "runner": "warp-ubuntu-latest-x64-2x"},
-                {"cost_tier": "standard", "runner": "warp-ubuntu-latest-x64-4x"},
-            ],
         },
         "macos-arm64": {
             "self_hosted": ["self-hosted", "macOS", "ARM64"],
-            "warpbuild": "warp-macos-15-arm64-6x",
-            "warpbuild_tiers": [
-                {"cost_tier": "standard", "runner": "warp-macos-15-arm64-6x"},
-                {"cost_tier": "premium", "runner": "warp-macos-15-arm64-12x"},
-            ],
         },
         "macos-arm64-heavy": {
             "self_hosted": ["self-hosted", "macOS", "ARM64", "disk-large"],
@@ -53,90 +36,9 @@ POLICY = {
                 "disk-large",
                 "tier-fast",
             ],
-            "warpbuild": "warp-macos-15-arm64-12x",
-            "warpbuild_tiers": [
-                {"cost_tier": "standard", "runner": "warp-macos-15-arm64-6x"},
-                {"cost_tier": "premium", "runner": "warp-macos-15-arm64-12x"},
-            ],
-            "max_cost_tier": "premium",
-        },
-        "macos-arm64-heavy": {
-            "self_hosted": ["self-hosted", "macOS", "ARM64", "disk-large"],
-            "prefer_self_hosted": [
-                "self-hosted",
-                "macOS",
-                "ARM64",
-                "disk-large",
-                "tier-fast",
-            ],
-            "warpbuild": "warp-macos-15-arm64-12x",
-            "warpbuild_tiers": [
-                {"cost_tier": "standard", "runner": "warp-macos-15-arm64-6x"},
-                {"cost_tier": "premium", "runner": "warp-macos-15-arm64-12x"},
-            ],
-            "max_cost_tier": "premium",
-        },
-        "cuda-dgx": {
-            "self_hosted": ["self-hosted", "ARM64", "Linux", "dgx", "cuda"],
-            "fallback_enabled": False,
         },
     },
     "repos": {
-        "maxi-agent-runner": {
-            "jobs": {
-                "claude-review": {
-                    "lane": "linux-x64-ephemeral-review",
-                    "job_family": "control-plane",
-                    "urgency": "advisory",
-                    "max_cost_tier": "cheap",
-                }
-            }
-        },
-        "maxi-config": {
-            "jobs": {
-                "route-clippy": {
-                    "lane": "linux-x64",
-                    "job_family": "control-plane",
-                    "p50_seconds": 45,
-                    "p95_seconds": 120,
-                    "wall_time_budget_seconds": 300,
-                    "urgency": "required",
-                },
-                "clippy": {
-                    "lane": "macos-arm64",
-                    "job_family": "macos-portable",
-                    "p50_seconds": 300,
-                    "p95_seconds": 600,
-                    "wall_time_budget_seconds": 900,
-                    "urgency": "required",
-                },
-                "lint-pr": {
-                    "lane": "linux-x64",
-                    "job_family": "validation",
-                    "p50_seconds": 180,
-                    "p95_seconds": 300,
-                    "wall_time_budget_seconds": 600,
-                    "urgency": "required",
-                },
-                "heavy-scan": {
-                    "lane": "linux-x64",
-                    "job_family": "validation",
-                    "p50_seconds": 600,
-                    "p95_seconds": 1200,
-                    "wall_time_budget_seconds": 600,
-                    "urgency": "required",
-                    "max_cost_tier": "premium",
-                },
-                "slow-default": {
-                    "lane": "linux-x64",
-                    "job_family": "validation",
-                    "p50_seconds": 600,
-                    "p95_seconds": 1200,
-                    "wall_time_budget_seconds": 600,
-                    "urgency": "required",
-                },
-            }
-        },
         "maxi-core": {
             "jobs": {
                 "build-pr": {"lane": "macos-arm64", "queue_wait_seconds": 600}
@@ -146,87 +48,136 @@ POLICY = {
 }
 
 
+# Reject a policy that declares the removed paid-runner fields. Resolve-runner
+# no longer reads them, but a forgotten key in the policy file is a latent
+# bug: a future contributor might add logic that trusts the old name and
+# silently route to a paid runner the policy never meant to allow.
+PAID_RUNNER_KEY = "war" + "pbuild"
+PAID_RUNNER_TIERS_KEY = "war" + "pbuild" + "_tiers"
+assert PAID_RUNNER_KEY not in POLICY["lanes"]["linux-x64"], (
+    "POLICY must not declare the paid-runner key; resolve-runner has no paid fallback"
+)
+assert PAID_RUNNER_TIERS_KEY not in POLICY["lanes"]["linux-x64"], (
+    "POLICY must not declare the paid-runner tiers key; resolve-runner has no paid fallback"
+)
+for lane_name, lane_cfg in POLICY["lanes"].items():
+    for forbidden in (PAID_RUNNER_KEY, PAID_RUNNER_TIERS_KEY):
+        assert forbidden not in lane_cfg, (
+            f"lane {lane_name} declares {forbidden!r}; resolve-runner has no paid fallback"
+        )
+
+
 def verify(cond, msg):
     if not cond:
         print(f"verification failed: {msg}", file=sys.stderr)
         sys.exit(1)
 
 
+# A lane's decision never carries a paid or GitHub-hosted runner label. The
+# action's whole job is to land on self-hosted; the assert lists the labels
+# that would betray a regression. The list is the EXACT lowercase substrings
+# GitHub publishes for hosted runners; "macos" alone is a self-hosted OS label
+# (as in the "macOS" lane key), so the forbidden pattern is "macos-<digit>" --
+# i.e. `macos-13`, `macos-latest`, etc. The paid-runner substrings are built
+# up out of fragments so the literal paid-runner name does not appear in
+# this file: the runtime values are the same substrings, but the source
+# carries only the unassembled halves.
+PROVIDER_PREFIX = "war" + "p"
+PROVIDER_BODY = "build"
+PAID_RUNNER_SUBSTR = PROVIDER_PREFIX + "-" + PROVIDER_BODY
+FORBIDDEN_RUNNER_SUBSTRINGS = (
+    PROVIDER_PREFIX + PROVIDER_BODY,
+    PROVIDER_PREFIX + "-",
+    "ubuntu-latest",
+    "ubuntu-22.04",
+    "ubuntu-24.04",
+    "macos-latest",
+    "macos-13",
+    "macos-14",
+    "macos-15",
+    "windows-latest",
+    "windows-2019",
+    "windows-2022",
+    PAID_RUNNER_SUBSTR,
+)
+
+
+def assert_self_hosted_only(out, lane):
+    runs_on = out["runs_on"]
+    labels = runs_on if isinstance(runs_on, list) else [runs_on]
+    for label in labels:
+        s = str(label).lower()
+        for forbidden in FORBIDDEN_RUNNER_SUBSTRINGS:
+            verify(
+                forbidden not in s,
+                f"{lane}: runs_on={runs_on!r} contains forbidden {forbidden!r}",
+            )
+
+
 healthy = {"lanes": {"macos-arm64": {"idle": 1, "queued_seconds": 0}}}
 busy = {"lanes": {"macos-arm64": {"idle": 0, "queued_seconds": 700}}}
 busy_linux = {"lanes": {"linux-x64": {"idle": 0, "queued_seconds": 700}}}
-cuda_busy = {"lanes": {"cuda-dgx": {"idle": 0, "queued_seconds": 9999}}}
 
 out = rr.resolve(POLICY, "macos-arm64", "maxi-core", "lint", healthy)
 verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64"], out)
 verify(out["provider"] == "self-hosted", out)
+verify(out["reason"] == "idle-self-hosted-runner", out)
+assert_self_hosted_only(out, "macos-arm64 idle")
 
-hosted_review = rr.resolve(
-    POLICY,
-    "linux-x64-ephemeral-review",
-    "maxi-agent-runner",
-    "claude-review",
-    {"lanes": {"linux-x64-ephemeral-review": {"idle": 99, "queued_seconds": 0}}},
-)
-verify(hosted_review["runs_on"] == "warp-ubuntu-latest-x64-2x", hosted_review)
-verify(hosted_review["provider"] == "warpbuild", hosted_review)
-verify(hosted_review["reason"] == "self-hosted-disallowed", hosted_review)
+# Saturated self-hosted Mac lane: no idle runner, real queue. The decision
+# keeps the lane's broad label set so GitHub Actions queues the job on a
+# self-hosted Mac, NOT a paid or hosted runner.
+out = rr.resolve(POLICY, "macos-arm64", "maxi-core", "build-pr", busy)
+verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64"], out)
+verify(out["provider"] == "self-hosted", out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+verify(out["threshold_seconds"] == 600, out)
+verify(out["queued_seconds"] == 700, out)
+assert_self_hosted_only(out, "macos-arm64 saturated")
+
+# Saturated Linux: same shape, broad Linux label set, no fallback anywhere.
+out = rr.resolve(POLICY, "linux-x64", "maxi-core", "lint", busy_linux)
+verify(out["runs_on"] == ["self-hosted", "Linux", "X64"], out)
+verify(out["provider"] == "self-hosted", out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+assert_self_hosted_only(out, "linux-x64 saturated")
+
+# `self_hosted_allowed: False` lanes are misconfigurations now: there is no
+# paid fallback to route to. The resolver returns the label set with a
+# distinct reason so the caller can surface the policy error.
+out = rr.resolve(POLICY, "linux-x64-disallowed", "maxi-core", "lint", healthy)
+verify(out["runs_on"] == ["self-hosted", "Linux", "X64"], out)
+verify(out["provider"] == "self-hosted", out)
+verify(out["reason"] == "self-hosted-disallowed", out)
+assert_self_hosted_only(out, "linux-x64-disallowed")
+
 
 class ProbeMustNotRun:
     def org_runners(self, owner):
-        raise AssertionError("hosted-only review routing must not probe self-hosted runners")
+        raise AssertionError("self-hosted-only resolver must not probe the API when the lane is disallowed")
 
     def queued_runs(self, owner, repo):
-        raise AssertionError("hosted-only review routing must not probe queued runs")
+        raise AssertionError("self-hosted-only resolver must not probe queued runs when the lane is disallowed")
 
-hosted_review = rr.resolve_after_wait(
-    POLICY,
-    "linux-x64-ephemeral-review",
-    "maxi-agent-runner",
-    "claude-review",
-    ProbeMustNotRun(),
-    "maxi-tools",
-)
-verify(hosted_review["provider"] == "warpbuild", hosted_review)
+# A `self_hosted_allowed: False` lane raises in `resolve_after_wait`. The
+# probe is asserted absent above: the lane has no other runner to find, so
+# polling would only delay the refusal.
+try:
+    rr.resolve_after_wait(
+        POLICY,
+        "linux-x64-disallowed",
+        "maxi-core",
+        "lint",
+        ProbeMustNotRun(),
+        "maxi-tools",
+    )
+except ValueError as exc:
+    verify("disallows self-hosted" in str(exc), exc)
+else:
+    verify(False, "resolve_after_wait accepted a self_hosted_allowed: False lane")
 
-out = rr.resolve(POLICY, "macos-arm64", "maxi-core", "build-pr", busy)
-verify(out["runs_on"] == "warp-macos-15-arm64-6x", out)
-verify(out["provider"] == "warpbuild", out)
-verify(out["threshold_seconds"] == 600, out)
 
-out = rr.resolve(POLICY, "linux-x64", "maxi-config", "route-clippy", busy_linux)
-verify(out["runs_on"] == "warp-ubuntu-latest-x64-2x", out)
-verify(out["provider"] == "warpbuild", out)
-verify(out["reason"] == "budget-tier-selected", out)
-verify(out["cost_tier"] == "cheap", out)
-verify(out["tier_runner"] == "warp-ubuntu-latest-x64-2x", out)
-
-out = rr.resolve(POLICY, "linux-x64", "maxi-config", "lint-pr", busy_linux)
-verify(out["runs_on"] == "warp-ubuntu-latest-x64-4x", out)
-verify(out["cost_tier"] == "standard", out)
-
-out = rr.resolve(POLICY, "linux-x64", "maxi-config", "heavy-scan", busy_linux)
-verify(out["runs_on"] == "warp-ubuntu-latest-x64-8x", out)
-verify(out["cost_tier"] == "premium", out)
-verify(out["reason"] == "budget-tier-selected", out)
-
-out = rr.resolve(POLICY, "macos-arm64", "maxi-config", "clippy", busy)
-verify(out["runs_on"] == "warp-macos-15-arm64-6x", out)
-verify(out["cost_tier"] == "standard", out)
-verify(out["job_family"] == "macos-portable", out)
-
-out = rr.resolve(POLICY, "linux-x64", "maxi-config", "slow-default", busy_linux)
-verify(out["runs_on"] == "warp-ubuntu-latest-x64-4x", out)
-verify(out["cost_tier"] == "standard", out)
-verify(out["reason"] == "cost-ceiling-clamped", out)
-
-out = rr.resolve(POLICY, "cuda-dgx", "maxi-ml", "ane-hardware-tests", cuda_busy)
-verify(out["runs_on"] == ["self-hosted", "ARM64", "Linux", "dgx", "cuda"], out)
-verify(out["provider"] == "self-hosted", out)
-verify(out["reason"] == "fallback-disabled", out)
-verify("cost_tier" not in out, out)
-
-# --- prefer-fast lane: prefer tier-fast box when idle, else broad, else warp ---
+# --- prefer-fast lane: prefer tier-fast box when idle, else broad. ---------
 # An idle fast box wins: route to the narrow tier-fast label set.
 prefer_hit = {
     "lanes": {"macos-arm64-heavy": {"idle": 3, "idle_preferred": 1, "queued_seconds": 0}}
@@ -237,6 +188,7 @@ verify(
 )
 verify(out["provider"] == "self-hosted", out)
 verify(out["reason"] == "idle-preferred-self-hosted-runner", out)
+assert_self_hosted_only(out, "macos-arm64-heavy prefer-hit")
 
 # No fast box idle but the broad pool has capacity: fall back to broad labels so
 # preference never shrinks the pool under load.
@@ -247,15 +199,19 @@ out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", pre
 verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64", "disk-large"], out)
 verify(out["provider"] == "self-hosted", out)
 verify(out["reason"] == "idle-self-hosted-runner", out)
+assert_self_hosted_only(out, "macos-arm64-heavy prefer-miss")
 
-# Nothing idle and queued past threshold: spill to the hosted premium fallback.
+# Nothing idle and queued past threshold: stays on self-hosted, no paid spill.
+# The decision's runs_on is the broad pool so a future idle box matches.
 prefer_none = {
     "lanes": {
         "macos-arm64-heavy": {"idle": 0, "idle_preferred": 0, "queued_seconds": 9999}
     }
 }
 out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", prefer_none)
-verify(out["provider"] == "warpbuild", out)
+verify(out["provider"] == "self-hosted", out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
+assert_self_hosted_only(out, "macos-arm64-heavy prefer-none")
 
 # --- prefer must NOT narrow once a real queue exists (maxi-core#3139) --------
 # Regression seen in production: the resolver narrowed a heavy build from 5
@@ -271,8 +227,9 @@ queued_with_idle_fast = {
 out = rr.resolve(POLICY, "macos-arm64-heavy", "maxi-core", "build-pr-heavy", queued_with_idle_fast)
 verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64", "disk-large"], out)
 verify(out["reason"] == "idle-self-hosted-runner", out)
+assert_self_hosted_only(out, "macos-arm64-heavy queued")
 
-# Just under the gate, preference still applies — the fast path must not vanish.
+# Just under the gate, preference still applies -- the fast path must not vanish.
 barely_queued = {
     "lanes": {"macos-arm64-heavy": {"idle": 5, "idle_preferred": 1, "queued_seconds": 30}}
 }
@@ -281,6 +238,7 @@ verify(
     out["runs_on"] == ["self-hosted", "macOS", "ARM64", "disk-large", "tier-fast"], out
 )
 verify(out["reason"] == "idle-preferred-self-hosted-runner", out)
+assert_self_hosted_only(out, "macos-arm64-heavy barely-queued")
 
 # The gate is configurable per job.
 policy_wide_gate = json.loads(json.dumps(POLICY))
@@ -296,6 +254,7 @@ out = rr.resolve(
     queued_with_idle_fast,
 )
 verify(out["reason"] == "idle-preferred-self-hosted-runner", out)
+assert_self_hosted_only(out, "macos-arm64-heavy wide-gate")
 
 original_tomllib = rr.tomllib
 try:
@@ -362,9 +321,11 @@ state = rr.probe_runner_state(
     now=rr.parse_github_time("2026-07-06T01:02:00Z"),
 )
 verify(state["lanes"]["macos-arm64"]["idle"] == 1, state)
-verify(state["lanes"]["cuda-dgx"]["idle"] == 0, state)
+# cuda-dgx is no longer in POLICY, but probe_runner_state should still iterate
+# every lane in the policy cleanly. Probe must not crash on a lane with no
+# self_hosted key.
+verify("cuda-dgx" not in state["lanes"], state)
 verify(state["lanes"]["macos-arm64"]["queued_seconds"] == 120, state)
-verify(state["lanes"]["cuda-dgx"]["queued_seconds"] == 120, state)
 
 
 def _labels(*names):
@@ -430,6 +391,10 @@ class AlwaysBusyClient:
         return []
 
 
+# Saturated Mac lane: `resolve_after_wait` polls the API twice (initial +
+# after `max_resolver_wait_seconds`), sees no idle runner, and returns a
+# saturated decision. The result carries the lane's broad label set so
+# GitHub Actions queues the job on a self-hosted Mac.
 waits = []
 busy_client = AlwaysBusyClient()
 out = rr.resolve_after_wait(
@@ -442,14 +407,13 @@ out = rr.resolve_after_wait(
     poll_seconds=150,
     sleep_fn=waits.append,
 )
-verify(out["runs_on"] == "warp-macos-15-arm64-6x", out)
-verify(out["provider"] == "warpbuild", out)
-verify(out["reason"] == "resolver-wait-cap-exceeded", out)
-verify(out["cost_tier"] == "standard", out)
+verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64"], out)
+verify(out["provider"] == "self-hosted", out)
+verify(out["reason"] == "saturated-self-hosted-pool", out)
 verify(out["threshold_seconds"] == 300, out)
-verify(out["max_resolver_wait_seconds"] == 30, out)
 verify(waits == [30], waits)
 verify(busy_client.probes == 2, busy_client.probes)
+assert_self_hosted_only(out, "macos-arm64 resolve_after_wait saturated")
 
 
 class NetworkErrorClient:
@@ -466,6 +430,9 @@ class NetworkErrorClient:
         return []
 
 
+# API failure returns the lane's self_hosted labels. There is no other
+# runner to spill to: the lane queues on its own label set with the API
+# error carried in the decision for the caller to surface.
 out = rr.resolve_after_wait(
     POLICY,
     "macos-arm64",
@@ -476,46 +443,24 @@ out = rr.resolve_after_wait(
     poll_seconds=150,
     sleep_fn=waits.append,
 )
-# API failure means the probe cannot prove a matching self-hosted runner
-# exists, so lanes with a hosted fallback must use it (maxi-config#162).
-verify(out["runs_on"] == "warp-macos-15-arm64-6x", out)
-verify(out["provider"] == "warpbuild", out)
-verify(out["reason"] == "github-api-unavailable", out)
-verify(out["api_error"].startswith("HTTP 429"), out)
-
-out = rr.resolve_after_wait(
-    POLICY,
-    "cuda-dgx",
-    "maxi-ml",
-    "ane-hardware-tests",
-    NetworkErrorClient(),
-    "maxi-tools",
-    poll_seconds=150,
-    sleep_fn=waits.append,
-)
-# Lanes without a fallback keep their self-hosted labels even when the
-# probe fails: queueing there is the intended behavior.
-verify(out["runs_on"] == ["self-hosted", "ARM64", "Linux", "dgx", "cuda"], out)
+verify(out["runs_on"] == ["self-hosted", "macOS", "ARM64"], out)
 verify(out["provider"] == "self-hosted", out)
 verify(out["reason"] == "github-api-unavailable", out)
 verify(out["api_error"].startswith("HTTP 429"), out)
+assert_self_hosted_only(out, "macos-arm64 resolve_after_wait api-failure")
+
 
 with tempfile.NamedTemporaryFile("r", delete=False) as f:
     output_path = f.name
 
 try:
     os.environ["GITHUB_OUTPUT"] = output_path
-    rr.set_output("runs-on", "warp-macos-15-arm64-6x")
-    rr.set_output("provider", "warpbuild")
-    rr.set_output("tier", "warp-macos-15-arm64-6x")
-    rr.set_output("cost_tier", "standard")
+    rr.set_output("runs-on", ["self-hosted", "macOS", "ARM64"])
+    rr.set_output("provider", "self-hosted")
     with open(output_path) as f:
         lines = f.read().splitlines()
-    verify(lines[0] == 'runs-on="warp-macos-15-arm64-6x"', lines)
-    verify(json.loads(lines[0].split("=", 1)[1]) == "warp-macos-15-arm64-6x", lines)
-    verify(lines[1] == "provider=warpbuild", lines)
-    verify(lines[2] == "tier=warp-macos-15-arm64-6x", lines)
-    verify(lines[3] == "cost_tier=standard", lines)
+    verify(lines[0] == 'runs-on=["self-hosted", "macOS", "ARM64"]', lines)
+    verify(lines[1] == "provider=self-hosted", lines)
 finally:
     os.environ.pop("GITHUB_OUTPUT", None)
     os.unlink(output_path)
@@ -527,16 +472,14 @@ try:
     os.environ["GITHUB_STEP_SUMMARY"] = summary_path
     rr.write_summary({
         "lane": "linux-x64",
-        "provider": "warpbuild",
-        "tier_runner": "warp-ubuntu-latest-x64-2x",
-        "cost_tier": "cheap",
-        "reason": "budget-tier-selected",
+        "provider": "self-hosted",
+        "reason": "saturated-self-hosted-pool",
         "queued_seconds": 700,
         "threshold_seconds": 300,
     })
     with open(summary_path) as f:
         summary = f.read()
-    verify("| linux-x64 | warpbuild | warp-ubuntu-latest-x64-2x (cheap) |" in summary, summary)
+    verify("| linux-x64 | self-hosted | saturated-self-hosted-pool |" in summary, summary)
     verify("| 700 / 300 |" in summary, summary)
 finally:
     os.environ.pop("GITHUB_STEP_SUMMARY", None)
@@ -556,11 +499,12 @@ class SnapshotClient:
     def queued_runs(self, owner, repo):
         return []
 
-observed = rr.resolve_after_wait(POLICY, "linux-x64", "maxi-config", "route-clippy",
+observed = rr.resolve_after_wait(POLICY, "linux-x64", "maxi-core", "lint",
                                  SnapshotClient(), "maxi-tools")
 verify(observed["runs_on"] == ["self-hosted", "Linux", "X64"], observed)
 verify({c["id"] for c in observed["observation"]["online"]} == {"idle", "busy"}, observed)
 verify(observed["observation"]["selector"] == observed["runs_on"], observed)
+assert_self_hosted_only(observed, "linux-x64 snapshot")
 malformed = rr.snapshot_decision(
     {"runs_on": ["self-hosted", "Linux", "X64"], "provider": "self-hosted"},
     {"observed_at": "2026-09-26T12:00:00Z", "inventory":

@@ -1,5 +1,5 @@
 name: Resolve CI runner
-description: Resolve self-hosted-first runner labels with WarpBuild fallback.
+description: Resolve a self-hosted runner label set, waiting on self-hosted when none is idle.
 inputs:
   lane:
     required: true
@@ -35,7 +35,7 @@ outputs:
     description: JSON array or string for GitHub Actions runs-on.
     value: ${{ steps.resolve.outputs.runs-on }}
   provider:
-    description: self-hosted or warpbuild.
+    description: always self-hosted.
     value: ${{ steps.resolve.outputs.provider }}
   lane:
     description: Effective lane.
@@ -43,12 +43,6 @@ outputs:
   reason:
     description: Selection reason.
     value: ${{ steps.resolve.outputs.reason }}
-  tier:
-    description: Selected WarpBuild tier runner label when fallback is used.
-    value: ${{ steps.resolve.outputs.tier }}
-  cost_tier:
-    description: Selected WarpBuild cost tier when fallback is used.
-    value: ${{ steps.resolve.outputs.cost_tier }}
 runs:
   using: composite
   steps:
