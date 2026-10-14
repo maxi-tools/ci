@@ -306,7 +306,7 @@ class MacLanesContractTest(unittest.TestCase):
         import re
 
         m: "re.Match[str] | None" = re.search(
-            r"^  merge-gate:\n(?:    [^\n]*\n)+",
+            r"^ {2}merge-gate:\n(?: {4}[^\n]*\n)+",
             text, flags=re.MULTILINE,
         )
         self.assertIsNotNone(
