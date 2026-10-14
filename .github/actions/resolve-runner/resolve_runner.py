@@ -142,12 +142,22 @@ def estimate_job_seconds(policy, repo, job_name, lane_cfg):
     return int(p50)
 
 
-def lane_queue_minutes(policy, repo, lane_cfg, queued_jobs, running_jobs, now):
+def lane_queue_minutes(policy, repo, lane_cfg, snapshot):
     """Estimated minutes of CI work still owed to a lane: every queued job's
     full p50, plus every running job's REMAINING p50 (p50 minus elapsed,
     floored at zero so a job already past its p50 contributes nothing extra
     -- it is assumed to finish imminently rather than overrun forever).
+
+    `snapshot` is one probe's view of the queue, structured as
+    {"queued": [...], "running": [...], "now": datetime}. The caller builds
+    it once from `client.lane_job_estimates(owner, repo)` and reuses it
+    across every lane so a single probe's fleet matches every lane's
+    estimate -- a per-lane probe would describe a different fleet than the
+    one the lane selector saw.
     """
+    now = snapshot["now"]
+    queued_jobs = snapshot.get("queued", [])
+    running_jobs = snapshot.get("running", [])
     total_seconds = 0
     for job in queued_jobs:
         if job_matches_lane(job, lane_cfg):
@@ -175,65 +185,54 @@ def overflow_targets_for(policy, lane_cfg, repo, job):
     return list(effective_value(policy, lane_cfg, repo, job, "overflow_to", []) or [])
 
 
-def overflow_decision(
-    policy,
-    selected_lane,
-    lane_cfg,
-    repo,
-    job,
-    idle,
-    runner_state,
-    source_state,
-    threshold,
-    queued_seconds,
-):
-    """Overflow a Linux-capable job onto an idle Mac pool.
+def overflow_decision(policy, selected_lane, runner_state, target_lane):
+    """Pick the lane a Linux-capable job overflows onto, or None.
 
     ONLY when both hold at plan time:
       (a) the source lane's self-hosted pool is fully occupied (idle == 0),
       (b) the target lane's estimated queue minutes <= half the source
-          lane's estimated queue minutes.
-    `overflow_to` must be declared per-lane/job in policy (never inferred),
-    and is only meaningful for jobs proven portable -- the policy author's
-    responsibility, not this resolver's. Returns None when overflow does not
-    apply, so the caller falls through to the existing self-hosted
-    decision.
+          lane's estimated queue minutes,
+      (c) the target lane actually has an idle runner right now (a low
+          queue_minutes estimate is NOT the same thing as idle capacity --
+          a running job past its p50 contributes 0 to the estimate but
+          its box is still busy).
+
+    `policy` is the runner-routing policy, `selected_lane` is the source
+    lane, `runner_state` is one probe's view of the fleet (the SAME
+    probe used by the lane selector -- a later probe would describe a
+    different fleet, not the decision-time candidates), and `target_lane`
+    is the lane the policy declared via `overflow_to`. Returns
+    (source_minutes, target_minutes) when overflow applies, so resolve()
+    builds the decision alongside its other branches; None means fall
+    through to the existing self-hosted decision.
+
+    This is the function a single declared `overflow_to` target reaches;
+    the loop over the declared targets and the per-target lane lookup
+    happen in resolve() so the function stays short and the parameter
+    count stays under qlty:function-parameters' threshold.
     """
-    targets = overflow_targets_for(policy, lane_cfg, repo, job)
-    if not targets or idle > 0:
+    lanes_state = runner_state.get("lanes", {})
+    source_state = lanes_state.get(selected_lane, {})
+    if int(source_state.get("idle", 0)) > 0:
         return None
     source_minutes = source_state.get("queue_minutes")
     if source_minutes is None:
         return None
-    for target_lane in targets:
-        target_cfg = policy["lanes"].get(target_lane)
-        if target_cfg is None:
-            continue
-        target_state = runner_state.get("lanes", {}).get(target_lane, {})
-        # The target Mac lane must actually have spare capacity right now --
-        # a low/zero queue_minutes estimate is NOT the same thing as an idle
-        # runner (a job already past its p50 contributes 0 per
-        # lane_queue_minutes but the box it's running on is still busy).
-        # Without this the gate can overflow onto a fully-saturated Mac pool
-        # whose stale estimate happens to look cheap. Required per the card:
-        # overflow "onto idle Mac runners", not onto a queue estimate alone.
-        if int(target_state.get("idle", 0)) <= 0:
-            continue
-        target_minutes = target_state.get("queue_minutes")
-        if target_minutes is None:
-            continue
-        if target_minutes <= 0.5 * source_minutes:
-            return {
-                "lane": selected_lane,
-                "runs_on": target_cfg["self_hosted"],
-                "provider": "self-hosted",
-                "reason": "linux-saturated-mac-overflow",
-                "threshold_seconds": threshold,
-                "queued_seconds": queued_seconds,
-                "overflow_lane": target_lane,
-                "overflow_source_minutes": round(source_minutes, 2),
-                "overflow_target_minutes": round(target_minutes, 2),
-            }
+    target_cfg = policy["lanes"].get(target_lane)
+    if target_cfg is None:
+        return None
+    target_state = lanes_state.get(target_lane, {})
+    # The target Mac lane must actually have spare capacity right now --
+    # a low/zero queue_minutes estimate is NOT the same thing as an idle
+    # runner. "Overflow onto idle Mac runners", not onto a queue estimate
+    # alone.
+    if int(target_state.get("idle", 0)) <= 0:
+        return None
+    target_minutes = target_state.get("queue_minutes")
+    if target_minutes is None:
+        return None
+    if target_minutes <= 0.5 * source_minutes:
+        return source_minutes, target_minutes
     return None
 
 
@@ -325,20 +324,23 @@ def resolve(policy, lane, repo, job, runner_state):
     # paid/hosted fallback exists or will be added here (operator check
     # 04:15Z on PR #98): overflow goes only to idle self-hosted Macs; if
     # none is free the job waits on its own lane's self_hosted label set.
-    overflow = overflow_decision(
-        policy,
-        selected_lane,
-        lane_cfg,
-        repo,
-        job,
-        idle,
-        runner_state,
-        state,
-        threshold,
-        queued_seconds,
-    )
-    if overflow is not None:
-        return overflow
+    overflow_targets = overflow_targets_for(policy, lane_cfg, repo, job)
+    for target_lane in overflow_targets:
+        result = overflow_decision(policy, selected_lane, runner_state, target_lane)
+        if result is None:
+            continue
+        source_minutes, target_minutes = result
+        return {
+            "lane": selected_lane,
+            "runs_on": policy["lanes"][target_lane]["self_hosted"],
+            "provider": "self-hosted",
+            "reason": "linux-saturated-mac-overflow",
+            "threshold_seconds": threshold,
+            "queued_seconds": queued_seconds,
+            "overflow_lane": target_lane,
+            "overflow_source_minutes": round(source_minutes, 2),
+            "overflow_target_minutes": round(target_minutes, 2),
+        }
 
     # No idle self-hosted runner and no other runner to spill to. The job must
     # queue on the lane's self_hosted label set; returning that set here means
@@ -563,9 +565,10 @@ def probe_runner_state(policy, client, owner, repo, now=None):
     if hasattr(client, "lane_job_estimates"):
         queued_jobs, running_jobs = client.lane_job_estimates(owner, repo)
         have_job_estimates = True
+        snapshot = {"queued": queued_jobs, "running": running_jobs, "now": now}
     else:
-        queued_jobs, running_jobs = [], []
         have_job_estimates = False
+        snapshot = None
     lanes = {}
     for lane, lane_cfg in policy["lanes"].items():
         idle = sum(
@@ -588,7 +591,10 @@ def probe_runner_state(policy, client, owner, repo, now=None):
         }
         if have_job_estimates:
             lanes[lane]["queue_minutes"] = lane_queue_minutes(
-                policy, repo, lane_cfg, queued_jobs, running_jobs, now
+                policy,
+                repo,
+                lane_cfg,
+                snapshot,
             )
     # Preserve the SAME probe used to choose the selector. A later probe
     # would describe a different fleet, not the decision-time candidates.

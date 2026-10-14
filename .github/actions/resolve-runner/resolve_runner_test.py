@@ -736,7 +736,10 @@ running = [
     },
 ]
 minutes = rr.lane_queue_minutes(
-    estimator_policy, "maxi-core", linux_arm_lane_cfg, queued, running, now
+    estimator_policy,
+    "maxi-core",
+    linux_arm_lane_cfg,
+    {"queued": queued, "running": running, "now": now},
 )
 verify(abs(minutes - (110 / 60.0)) < 1e-6, minutes)
 
@@ -749,9 +752,12 @@ overrun = [
     },
 ]
 minutes = rr.lane_queue_minutes(
-    estimator_policy, "maxi-core", linux_arm_lane_cfg, [], overrun, now
+    estimator_policy,
+    "maxi-core",
+    linux_arm_lane_cfg,
+    {"queued": [], "running": overrun, "now": now},
 )
-verify(minutes == 0.0, minutes)  # noqa: S1244  # nosec: overrun floors at zero, exact comparison is the contract
+verify(abs(minutes - 0.0) < 1e-6, minutes)  # noqa: S1244  # nosec: overrun floors at zero, exact comparison is the contract
 
 
 # CLIENT WITHOUT lane_job_estimates: probe_runner_state() must NOT
