@@ -39,6 +39,21 @@ name: Review gate
 
 on:
   workflow_call:
+    # The caller's review-gate.yml passes APP_CLIENT_ID and APP_PRIVATE_KEY
+    # explicitly (listed by name, not `secrets: inherit`). A reusable workflow
+    # must declare every secret it accepts; otherwise the run fails at
+    # creation with "unexpected value" / startup_failure and the routing shim
+    # never executes.
+    secrets:
+      APP_CLIENT_ID:
+        description: GitHub App client ID used to mint the org token for
+          resolve-runner. Required because the reusable is pinned by SHA from
+          the local caller and cannot elevate the caller's token.
+        required: false
+      APP_PRIVATE_KEY:
+        description: GitHub App private key paired with APP_CLIENT_ID.
+          Required for the same reason.
+        required: false
     inputs:
       runs_on:
         description: >
