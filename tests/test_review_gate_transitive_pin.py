@@ -45,12 +45,12 @@ This test follows the chain end-to-end:
 Run directly: `python3 tests/test_review_gate_transitive_pin.py`.
 Run in CI: `self-check.yml`'s "Run the test suites" step.
 """
+
 from __future__ import annotations
 
 import pathlib
 import re
-import subprocess
-import sys
+import subprocess  # nosec B404
 import unittest
 
 
@@ -74,9 +74,7 @@ RESOLVER_PIN = "09f330ce3a483a00604f9b386932c48052b81bdb"
 # target that depends on the local checkout's history.
 MIN_REUSABLE_PIN = "7ff1a52e026565293770eb9e9d8f01dec865b691"
 
-PIN_RE = re.compile(
-    r"maxi-tools/ci/" + re.escape(REUSABLE_PATH) + r"@([0-9a-f]{40})"
-)
+PIN_RE = re.compile(r"maxi-tools/ci/" + re.escape(REUSABLE_PATH) + r"@([0-9a-f]{40})")
 SHIM_PIN_RE = re.compile(
     r"maxi-tools/ci/" + re.escape(RESOLVE_RUNNER_PATH) + r"@([0-9a-f]{40})"
 )
@@ -91,7 +89,7 @@ def _git_cat(commit: str, relpath: str) -> str:
     ancestor of HEAD. The test refuses (rather than falls through) if the
     path is missing -- a missing file means the chain link is broken.
     """
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosec B603 B607  # noqa: S603 S607
         ["git", "cat-file", "-p", f"{commit}:{relpath}"],
         cwd=str(ROOT),
         check=False,
@@ -113,7 +111,7 @@ def _is_descendant(child: str, ancestor: str) -> bool:
     argument is an ancestor of (or equal to) the first. The function
     wraps the exit code rather than parses its output, which is empty.
     """
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosec B603 B607  # noqa: S603 S607
         ["git", "merge-base", "--is-ancestor", ancestor, child],
         cwd=str(ROOT),
         check=False,
@@ -139,7 +137,8 @@ class TransitivePinTest(unittest.TestCase):
             raise AssertionError("unreachable")  # for type checkers
         self.caller_pin: str = caller_match.group(1)
         self.assertEqual(
-            len(self.caller_pin), 40,
+            len(self.caller_pin),
+            40,
             f"{CALLER.name}: extracted pin {self.caller_pin!r} is not "
             f"40 chars; the regex matched but the chain link is malformed.",
         )

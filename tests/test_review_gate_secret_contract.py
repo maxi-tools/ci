@@ -42,11 +42,12 @@ head is correct.
 Run directly: `python3 tests/test_review_gate_secret_contract.py`.
 Run in CI: `self-check.yml`'s "Run the test suites" step.
 """
+
 from __future__ import annotations
 
 import pathlib
 import re
-import subprocess
+import subprocess  # nosec B404
 import unittest
 
 import yaml
@@ -63,7 +64,7 @@ CALLER_PIN_RE = re.compile(
 
 def _git_cat(commit: str, relpath: str) -> str:
     """Read `<relpath>` from the tree at `<commit>` in the local checkout."""
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosec B603 B607  # noqa: S603 S607
         ["git", "cat-file", "-p", f"{commit}:{relpath}"],
         cwd=str(ROOT),
         check=False,
@@ -128,9 +129,7 @@ class CallerCalleeSecretContractTest(unittest.TestCase):
         self.caller_name, self.caller_job = uses_jobs[0]
         self.caller_pin = _caller_pin(CALLER.read_text(encoding="utf-8"))
 
-        reusable_doc = yaml.safe_load(
-            _git_cat(self.caller_pin, REUSABLE_PATH)
-        )
+        reusable_doc = yaml.safe_load(_git_cat(self.caller_pin, REUSABLE_PATH))
         if not isinstance(reusable_doc, dict):
             raise AssertionError(
                 f"{REUSABLE_PATH} at {self.caller_pin}: not a YAML mapping"
@@ -190,7 +189,8 @@ class CallerCalleeSecretContractTest(unittest.TestCase):
         caller_names = set(caller_secrets.keys())
         missing = sorted(reusable_names - caller_names)
         self.assertEqual(
-            missing, [],
+            missing,
+            [],
             f"{CALLER.name} `{self.caller_name}:` does not pass every "
             f"secret the reusable at {self.caller_pin} declares in "
             f"`on.workflow_call.secrets:`. Missing: {missing}. Declared "
@@ -218,7 +218,8 @@ class CallerCalleeSecretContractTest(unittest.TestCase):
         caller_names = set(caller_secrets.keys())
         extra = sorted(caller_names - reusable_names)
         self.assertEqual(
-            extra, [],
+            extra,
+            [],
             f"{CALLER.name} `{self.caller_name}:` passes secret(s) "
             f"{extra} that the reusable at {self.caller_pin} does not "
             f"declare in `on.workflow_call.secrets:`. Declared by "
