@@ -212,7 +212,7 @@ jobs:
         # above). The action's `action.yml` blob is unchanged across every
         # commit on this branch, so pinning to `96393c6` (the first commit
         # on the branch) and never amending keeps this reference valid.
-        uses: maxi-tools/ci/.github/actions/resolve-runner@96393c66f35c1a37d54aa639200f931074f1fdcd
+        uses: maxi-tools/ci/.github/actions/resolve-runner@9a103abe57bcdd4240a812d8ca9d92b5f6a9c6bc # v0.0.0, route-review-gate overflow_decision added
         with:
           lane: linux-arm64
           # `repo: ci` is the short form (`maxi-tools/ci` is the long form);
