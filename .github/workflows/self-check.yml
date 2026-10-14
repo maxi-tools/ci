@@ -11,12 +11,21 @@
 # Codacy, days later, on maxi-config's mirror of the same file -- by accident
 # of the mirror existing, not by any gate in this repository.
 #
-# HOSTED, not self-hosted, and deliberately. This repository is PUBLIC, which
+# SELF-HOSTED, with a same-repo fork guard. This repository is PUBLIC, which
 # is the entire reason it exists (GitHub will not resolve a `uses:` from a
 # public repository into a private one). Fork pull requests are therefore
 # expected here, and fork code must never reach the org's self-hosted fleet.
-# actionlint takes seconds, so the hosted cost is small and the isolation is
-# worth more than the minutes.
+# The guard below (`head.repo.full_name == github.repository`) makes the
+# check SKIP on a fork pull request, which leaves the `self-check` status
+# absent and the merge blocked rather than permitted -- exactly the
+# outcome the previous hosted-only behaviour produced. Every other
+# self-hosted job in the org carries the same guard for the same reason.
+#
+# Same-repo PRs land on the org's self-hosted `[self-hosted, Linux, X64]`
+# pool and execute every step against PR-controlled Python / Node test
+# files (`tests/test_*.py`, `tests/test_moments_gallery_browser.js`).
+# The cost is the minutes the previous hosted-only run consumed; the
+# isolation is preserved by the fork guard.
 name: Self-check
 
 on:
@@ -35,7 +44,19 @@ concurrency:
 
 jobs:
   self-check:
-    runs-on: ubuntu-latest
+    # Same-repo fork guard. A fork pull request's token is read-only and
+    # its `head.repo.full_name != github.repository`, so the `if:` makes
+    # the job SKIP -- which GitHub reports as the absence of the
+    # `self-check` context, and a ruleset that requires that context
+    # (`ci-protect-main`, ID 22719524) blocks the merge rather than
+    # permitting it. A fork PR's code never reaches the self-hosted
+    # pool, and a fork PR's contributor cannot bypass the check by
+    # editing the workflow file because `actions/checkout` runs only
+    # inside the job's steps -- none of which run on a fork.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -125,7 +146,7 @@ jobs:
           . "$RUNNER_TEMP/moments-python/bin/activate"
           python3 -m pip install PyYAML==6.0.3
           failed=0
-          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_review_gate_route_shim.py tests/test_review_gate_secret_contract.py tests/test_review_gate_transitive_pin.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py; do
+          for t in tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_review_gate_route_shim.py tests/test_review_gate_secret_contract.py tests/test_review_gate_transitive_pin.py tests/test_self_check_fork_guard.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py; do
             echo "== $t"
             if ! python3 "$t"; then
               echo "::error file=$t::$t failed"
@@ -147,7 +168,7 @@ jobs:
           fi
           # Non-vacuity: every tests/test_*.py must be in the list above.
           for f in tests/test_*.py; do
-            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_review_gate_route_shim.py tests/test_review_gate_secret_contract.py tests/test_review_gate_transitive_pin.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py " in
+            case " tests/test_dedupe_review_threads.py tests/test_fanout_ci_pin.py tests/test_impossible_caller_contexts.py tests/test_lane_decisions.py tests/test_parse_summary.py tests/test_review_gate_route_shim.py tests/test_review_gate_secret_contract.py tests/test_review_gate_transitive_pin.py tests/test_self_check_fork_guard.py tests/test_roster_label_login.py tests/test_roster_parse.py tests/test_collect_roster_statuses.py tests/test_ci_design_permissions.py tests/test_trusted_bot_approval.py tests/test_workspace_guard.py tests/test_swift_skip_env.py tests/test_moments_gallery.py tests/test_moments_png_filters.py tests/test_mac_lanes_contract.py tests/test_plan_lane.py " in
               *" $f "*) ;;
               *) echo "::error file=$f::$f exists but is not run by this lane; add it to the list"; failed=1 ;;
             esac
