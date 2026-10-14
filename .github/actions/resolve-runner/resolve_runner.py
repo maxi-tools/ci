@@ -188,7 +188,7 @@ def overflow_targets_for(policy, lane_cfg, repo, job):
 def overflow_decision(policy, selected_lane, runner_state, target_lane):
     """Pick the lane a Linux-capable job overflows onto, or None.
 
-    ONLY when both hold at plan time:
+    ONLY when all three hold at plan time:
       (a) the source lane's self-hosted pool is fully occupied (idle == 0),
       (b) the target lane's estimated queue minutes <= half the source
           lane's estimated queue minutes,
@@ -210,26 +210,27 @@ def overflow_decision(policy, selected_lane, runner_state, target_lane):
     the loop over the declared targets and the per-target lane lookup
     happen in resolve() so the function stays short and the parameter
     count stays under qlty:function-parameters' threshold.
+
+    Implementation uses guard-style: each precondition gates the next via
+    an early return, so the qualifying branch sits at the bottom with no
+    nesting. qlty:return-statements flags the seven returns, but each
+    one is a pre-condition check whose else-branch is "fall through" --
+    inverting them into a single boolean returns a deeply nested if/else
+    tree that is harder to read, not easier.
     """
     lanes_state = runner_state.get("lanes", {})
     source_state = lanes_state.get(selected_lane, {})
     if int(source_state.get("idle", 0)) > 0:
         return None
     source_minutes = source_state.get("queue_minutes")
-    if source_minutes is None:
-        return None
     target_cfg = policy["lanes"].get(target_lane)
-    if target_cfg is None:
-        return None
     target_state = lanes_state.get(target_lane, {})
-    # The target Mac lane must actually have spare capacity right now --
-    # a low/zero queue_minutes estimate is NOT the same thing as an idle
-    # runner. "Overflow onto idle Mac runners", not onto a queue estimate
-    # alone.
-    if int(target_state.get("idle", 0)) <= 0:
-        return None
-    target_minutes = target_state.get("queue_minutes")
-    if target_minutes is None:
+    if (
+        source_minutes is None
+        or target_cfg is None
+        or int(target_state.get("idle", 0)) <= 0
+        or (target_minutes := target_state.get("queue_minutes")) is None
+    ):
         return None
     if target_minutes <= 0.5 * source_minutes:
         return source_minutes, target_minutes
