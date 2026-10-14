@@ -43,6 +43,18 @@ jobs:
           # Nothing here pushes, so the runner should not carry the credential
           # into .git/config.
           persist-credentials: false
+          # fetch-depth: 0 (full history) so the caller/callee pin tests
+          # (tests/test_review_gate_transitive_pin.py and
+          # tests/test_review_gate_secret_contract.py) can `git cat-file -p
+          # <sha>:.github/workflows/review-gate-reusable.yml` against the
+          # commit the local caller pins. The default `fetch-depth: 1`
+          # (shallow) does NOT include those commits, and the tests then
+          # fail with `fatal: path ... exists on disk, but not in <sha>`.
+          # Repo is ~390 commits; the fetch cost is negligible, and a
+          # shallow checkout offers nothing here (no `git log` walks the
+          # history -- the only callers are the pin tests, which need
+          # exact commits).
+          fetch-depth: 0
 
       - name: actionlint
         # Reads every workflow, checks expression syntax, and shellchecks the
