@@ -770,6 +770,16 @@ verify(abs(minutes - 0.0) < 1e-6, minutes)  # noqa: S1244  # nosec: overrun floo
 # was silently dropped -- the Mac lane's queue_minutes came out 0, and a
 # Linux-saturated lane with one idle Mac box overflowed onto Mac when it
 # should have stayed on Linux.
+
+# Test fixtures reference these timestamps as both the run's `created_at`
+# and individual jobs' `started_at`; the resolver compares them against
+# `now` to derive remaining-p50 seconds. Centralised so a single edit
+# changes every probe's clock and the diff stays small.
+RUN_CREATED_AT = "2026-10-14T12:00:00Z"  # noqa: S105  # nosec: literal test fixture, not a credential
+PROBE_NOW_AT = "2026-10-14T12:10:00Z"  # noqa: S105  # nosec: literal test fixture, not a credential
+JOB_STARTED_AT = "2026-10-14T12:09:00Z"  # noqa: S105  # nosec: literal test fixture, not a credential
+
+
 class CrossRunStatusClient(rr.GithubClient):
     """Verbatim fixture from verifier t_77bfa3c0.
 
@@ -791,7 +801,12 @@ class CrossRunStatusClient(rr.GithubClient):
     """
 
     def __init__(self):
-        super().__init__(token="")
+        # Token deliberately empty: this test client never makes an API
+        # call, it only provides the data-fetching methods lane_job_estimates
+        # walks. The "B106 hardcoded password" finding is a false positive
+        # here -- the field is an API credential placeholder, not a
+        # password, and qlty's bandit plugin does not know that.
+        super().__init__(token="")  # nosec B106  # noqa: S106
 
     def org_runners(self, owner):
         return [
@@ -815,7 +830,7 @@ class CrossRunStatusClient(rr.GithubClient):
             {
                 "id": 99001,
                 "status": "in_progress",
-                "created_at": "2026-10-14T12:00:00Z",
+                "created_at": RUN_CREATED_AT,
             }
         ]
 
@@ -838,7 +853,7 @@ class CrossRunStatusClient(rr.GithubClient):
                 "name": "linux-running",
                 "status": "in_progress",
                 "labels": ["self-hosted", "Linux", "ARM64"],
-                "started_at": "2026-10-14T12:09:00Z",  # 60s elapsed
+                "started_at": JOB_STARTED_AT,  # 60s elapsed at PROBE_NOW_AT
             },
         ]
 
@@ -867,7 +882,7 @@ cross_state = rr.probe_runner_state(
     cross_client,
     "maxi-tools",
     "ci",
-    now=rr.parse_github_time("2026-10-14T12:10:00Z"),
+    now=rr.parse_github_time(PROBE_NOW_AT),
 )
 verify(cross_state["lanes"]["linux-arm64"]["idle"] == 0, cross_state)
 verify(cross_state["lanes"]["macos-arm64"]["idle"] == 1, cross_state)
@@ -896,7 +911,9 @@ assert_self_hosted_only(out, "queued-in-in-progress-run: stay on Linux")
 # code path that read the (now-correct) queue_minutes.
 class InverseCrossRunStatusClient(rr.GithubClient):
     def __init__(self):
-        super().__init__(token="")
+        # See CrossRunStatusClient.__init__ -- empty token is correct for
+        # a test client that provides its own data-fetching methods.
+        super().__init__(token="")  # nosec B106  # noqa: S106
 
     def org_runners(self, owner):
         return [
@@ -920,7 +937,7 @@ class InverseCrossRunStatusClient(rr.GithubClient):
             {
                 "id": 99002,
                 "status": "in_progress",
-                "created_at": "2026-10-14T12:00:00Z",
+                "created_at": RUN_CREATED_AT,
             }
         ]
 
@@ -939,7 +956,7 @@ class InverseCrossRunStatusClient(rr.GithubClient):
                 "name": "mac-running",
                 "status": "in_progress",
                 "labels": ["self-hosted", "macOS", "ARM64"],
-                "started_at": "2026-10-14T12:09:00Z",
+                "started_at": JOB_STARTED_AT,
             },
         ]
 
@@ -955,7 +972,7 @@ inv_state = rr.probe_runner_state(
     inv_client,
     "maxi-tools",
     "ci",
-    now=rr.parse_github_time("2026-10-14T12:10:00Z"),
+    now=rr.parse_github_time(PROBE_NOW_AT),
 )
 verify(inv_state["lanes"]["linux-arm64"]["idle"] == 1, inv_state)
 out = rr.resolve(POLICY, "linux-arm64", "ci", "gate", inv_state)
@@ -974,7 +991,9 @@ assert_self_hosted_only(
 # lane's queue_minutes by 2x.
 class DuplicateRunClient(rr.GithubClient):
     def __init__(self):
-        super().__init__(token="")
+        # See CrossRunStatusClient.__init__ -- empty token is correct for
+        # a test client that provides its own data-fetching methods.
+        super().__init__(token="")  # nosec B106  # noqa: S106
 
     def org_runners(self, owner):
         return [
@@ -995,7 +1014,7 @@ class DuplicateRunClient(rr.GithubClient):
             {
                 "id": 99003,
                 "status": "queued",
-                "created_at": "2026-10-14T12:00:00Z",
+                "created_at": RUN_CREATED_AT,
             }
         ]
 
@@ -1004,7 +1023,7 @@ class DuplicateRunClient(rr.GithubClient):
             {
                 "id": 99003,  # SAME id surfaced in both
                 "status": "in_progress",
-                "created_at": "2026-10-14T12:00:00Z",
+                "created_at": RUN_CREATED_AT,
             }
         ]
 
