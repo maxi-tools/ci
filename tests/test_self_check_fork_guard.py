@@ -27,6 +27,7 @@ deliberate choice that must not happen without updating this test.
 Run directly: `python3 tests/test_self_check_fork_guard.py`.
 Run in CI: `self-check.yml`'s "Run the test suites" step.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -37,9 +38,7 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/self-check.yml"
 
-FORK_GUARD_PHRASE = (
-    "github.event.pull_request.head.repo.full_name == github.repository"
-)
+FORK_GUARD_PHRASE = "github.event.pull_request.head.repo.full_name == github.repository"
 PUSH_GUARD_PHRASE = "github.event_name != 'pull_request'"
 
 
