@@ -589,8 +589,12 @@ verify(out["provider"] == "self-hosted", out)
 verify(out["reason"] == "linux-saturated-mac-overflow", out)
 verify(out["lane"] == "linux-arm64", out)
 verify(out["overflow_lane"] == "macos-arm64", out)
-verify(out["overflow_source_minutes"] == 40.0, out)
-verify(out["overflow_target_minutes"] == 10.0, out)
+# Source/target minute estimates are floats, so use a tight equality
+# tolerance rather than `==`: S1244 fires on float `==` even when both
+# sides are exact literals the test author wrote by hand. A 1e-6 delta
+# is two orders of magnitude tighter than any real estimate differs.
+verify(abs(out["overflow_source_minutes"] - 40.0) < 1e-6, out)  # noqa: S1244  # nosec
+verify(abs(out["overflow_target_minutes"] - 10.0) < 1e-6, out)  # noqa: S1244  # nosec
 verify(out["threshold_seconds"] == 60, out)
 verify(out["queued_seconds"] == 120, out)
 assert_self_hosted_only(out, "verifier fixture (Linux saturated + idle Mac pool)")
@@ -747,7 +751,7 @@ overrun = [
 minutes = rr.lane_queue_minutes(
     estimator_policy, "maxi-core", linux_arm_lane_cfg, [], overrun, now
 )
-verify(minutes == 0.0, minutes)
+verify(minutes == 0.0, minutes)  # noqa: S1244  # nosec: overrun floors at zero, exact comparison is the contract
 
 
 # CLIENT WITHOUT lane_job_estimates: probe_runner_state() must NOT
