@@ -187,6 +187,19 @@ jobs:
       - name: Browser regression for moments gallery
         run: |
           set -euo pipefail
+          # The self-hosted runner does not ship the chromium runtime
+          # dependencies (libnspr4 / libnss3 / libgbm1 / libxkbcommon0 / ...).
+          # The hosted image did. Provision them with sudo + apt-get so the
+          # test runs on the same lane as the rest of self-check.
+          if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+              libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+              libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64
+          else
+            echo "::warning::sudo/apt-get not available; relying on system libraries"
+          fi
           npm install --prefix "$RUNNER_TEMP/moments-browser" --no-save playwright@1.63.0
           export NODE_PATH="$RUNNER_TEMP/moments-browser/node_modules"
           "$RUNNER_TEMP/moments-browser/node_modules/.bin/playwright" install chromium
