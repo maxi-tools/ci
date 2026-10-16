@@ -286,6 +286,134 @@ REVIEW_INFRA_LABEL = 'review-infra-unavailable'
 WAIVED_PREFIX = 'WAIVED:'
 
 
+#: Reviewer-family category that the cross-family rule refuses to credit when
+#: the producer family's `unknown`. The premise: a producer-side Hermes
+#: worktree (`wt/<slug>`) might have been written by either Claude or Codex,
+#: and the gate cannot tell. The reviewers the rule refuses to credit are
+#: the model-runner review bots -- the only two logins whose family could
+#: be claude or codex. Every other trusted review bot is `other`; their
+#: review cannot possibly be a same-family self-verification (no claude
+#: or codex model posts under `coderabbitai[bot]` etc.), so they remain
+#: accepted. Codacy HIGH RISK, maxi-config#1116, 2026-10-16:
+#: "Derive the producer family from trusted producer metadata, or make
+#: unknown-family handling fail closed so condition 2 cannot be satisfied
+#: by a potentially same-family reviewer when producer identity is
+#: unavailable." This is the second half of that finding.
+RESTRICTED_UNDER_UNKNOWN = frozenset({'claude-review', 'chatgpt-codex-connector'})
+
+
+def is_restricted_under_unknown(login):
+    """True for logins the rule refuses to credit when the producer family is unknown.
+
+    Restricted = in `RESTRICTED_UNDER_UNKNOWN` AND stripped `[bot]` is the
+    same login. Both spellings of the same account are restricted: GraphQL
+    returns the bare slug, REST would return `claude-review[bot]` or
+    `chatgpt-codex-connector[bot]`, and the restricted set must accept
+    either.
+    """
+    if not isinstance(login, str) or not login.strip():
+        return False
+    return _strip_bot_suffix(login) in RESTRICTED_UNDER_UNKNOWN
+
+
+#: Producer / reviewer FAMILIES for the cross-family rule.
+#:
+#: The producers and reviewers in this fleet come from two model families
+#: (Claude and Codex); the same shape is described in operators' producer
+#: scripts (~/.claude/skills/hermes-operator/scripts/xfam.py +
+#: producer_families.py), with families `claude|codex|other`. The gate
+#: subscribes to that scheme but never has the producer-side database in its
+#: payload, so it derives the producer family from the one field it does
+#: have: `headRefName`. The two CLI-spawned branch shapes the maximini bridge
+#: names (claude/<slug> and codex/<slug>) map directly to a producer family;
+#: everything else is `unknown`, which is treated as "no conflict"
+#: rather than "claude" or "codex", because a wrong attribution would block
+#: PRs that have nothing to do with either CLI.
+#:
+#: Reviewer families come from the reviewer's login. The trusted review bots
+#: in `TRUSTED_REVIEW_BOTS` above are split into the two families that
+#: correspond to a model-runner posting as a review; everything else is
+#: `other`. Mapping `chatgpt-codex-connector` to `codex` and `claude-review`
+#: to `claude` mirrors the registered reviewers in
+#: `maxi-review/reviewer-registry.toml`: a same-family reviewer is the
+#: cross-family rule's central concern, and the registry is the source of
+#: truth for which login maps to which family.
+#:
+#: The cross-family rule says: when the producer family is `claude` or
+#: `codex`, an APPROVAL or a counted review from a reviewer of the SAME
+#: family does NOT satisfy condition 2. That blocks a reviewer run by the
+#: same model that wrote the code from green-ticking its own output. A
+#: producer family of `unknown` means the gate cannot tell which family
+#: produced the work, and the rule degrades to "no conflict", so unknown
+#: producers fall back to the pre-existing roster/bot fallback.
+FAMILY_CLAUDE = 'claude'
+FAMILY_CODEX = 'codex'
+FAMILY_OTHER = 'other'
+FAMILY_UNKNOWN = 'unknown'
+
+#: Reviewer login (after stripping `[bot]`) -> family. Only the two model
+#: families a same-family bug actually exists for are split out; every other
+#: trusted review bot -- coderabbit, codacy, cubic, gemini, copilot,
+#: qodana, qlty/qltysh, qwen-coder-review, maxi-reviewer -- is `other`,
+#: because a reviewer from any of those is not a same-family collision
+#: with anything the producer-side rule cares about.
+REVIEWER_FAMILY_OF = {
+    'claude-review': FAMILY_CLAUDE,
+    'chatgpt-codex-connector': FAMILY_CODEX,
+}
+
+
+def reviewer_family_of_login(login):
+    """The family a reviewer's login belongs to, or FAMILY_OTHER.
+
+    `login` is taken as-written, with the `[bot]` suffix removed. Returns
+    `FAMILY_OTHER` for every reviewer not on the family map: a human
+    account's family is `other` rather than `unknown` because a human
+    approval can satisfy condition 2 even when the producer family is
+    known -- same-family rule is about reviewer automation, not about any
+    possible source of APPROVED.
+    """
+    if not isinstance(login, str) or not login.strip():
+        return FAMILY_OTHER
+    return REVIEWER_FAMILY_OF.get(_strip_bot_suffix(login), FAMILY_OTHER)
+
+
+def producer_family_of(head_ref):
+    """The producer's model family, derived from `headRefName`.
+
+    Branches named `claude/<slug>` are CLAUDE CLI sessions and imply
+    `FAMILY_CLAUDE`; `codex/<slug>` similarly implies `FAMILY_CODEX`.
+    Anything else returns `FAMILY_UNKNOWN`, which is the gate's "could not
+    determine" answer and the cross-family rule's "no conflict" answer.
+
+    `wt/<slug>` (Hermes worktree) heads do NOT imply a family here: the
+    gate does not have the Hermes export, and a card that ran on Codex and
+    produced `wt/t_xxx` looks the same as one that ran on anything else.
+    If a future change makes that export reachable from the gate, this
+    function is where it lands.
+    """
+    if not isinstance(head_ref, str) or not head_ref:
+        return FAMILY_UNKNOWN
+    head = head_ref + '/'
+    if head.startswith(FAMILY_CLAUDE + '/'):
+        return FAMILY_CLAUDE
+    if head.startswith(FAMILY_CODEX + '/'):
+        return FAMILY_CODEX
+    return FAMILY_UNKNOWN
+
+
+#: Prefix marking the cross-family review FAIL line. `_CROSSFAM_PREFIX` is
+#: what `failure_annotations` keys off to surface the new failure type on
+#: the PR checks page; the FAIL line itself follows with the reviewer(s)
+#: that were dropped and the producer family that produced the head.
+#:
+#: Kept as a module constant so a future reviewer that needs to know
+#: whether a gate verdict was about cross-family (rather than missing
+#: reviewer, malformed payload, ...) can answer that question without
+#: parsing free-form log prose.
+_CROSSFAM_PREFIX = 'CROSSFAM'
+
+
 #: The second route to condition 2, said once so the two FAIL branches cannot
 #: describe it differently. Both a human reading the log and a triage worker
 #: reading an `::error::` annotation get the same sentence.
@@ -773,6 +901,85 @@ def evaluate(doc, only=ONLY_ALL):
         # app identities, which never review anything.
         covered = [name for name in reviewers if is_trusted_review_bot(name)]
 
+    # Cross-family review: a covering reviewer whose family matches the
+    # producer family's is dropped from BOTH `covered` and `approvals`
+    # before the verdict is decided.
+    #
+    # This is the third hard rule on condition 2, after non-author (above)
+    # and head-anchored approval (above). It exists because the two model
+    # families that produce PRs in this fleet also post reviews, and a
+    # same-family reviewer can grant a condition whose stated question is
+    # "did somebody outside the author look at this?" with the same model
+    # that wrote the code. The shape is the same as `is_trusted_review_bot`:
+    # we trust a bot login about an approval, but not when the approval is
+    # the bot's own verdict on its own code.
+    #
+    # Family-detection sources, in order:
+    #   Producer family: `headRefName` prefix -- `claude/<slug>` is claude,
+    #     `codex/<slug>` is codex, anything else is `unknown`. The head
+    #     branch is attacker-chosen, so the prefix cannot be mis-interpreted
+    #     as a fan-out bypass: this rule is a block, not a bypass, and the
+    #     worst a wrong-prefix branch can do is "the gate refuses to treat
+    #     the reviewer as cross-family", which is the safe direction
+    #     (fails closed; maxi-tools-pr-merge t_c9377188, 2026-10-16).
+    #   Reviewer family: a login -> family map (REVIEWER_FAMILY_OF). The
+    #     only two logins whose family matters are the model-runner review
+    #     bots in the registry; every other reviewer is `other`, which
+    #     never collides with a claude- or codex-family producer.
+    #
+    # Two failure modes the rule handles differently:
+    #
+    #   Producer family known (claude or codex): the rule DELETES from
+    #     `covered` and `approvals` any reviewer whose family matches.
+    #     That blocks claude-review on a claude/<slug> head and
+    #     chatgpt-codex-connector on a codex/<slug> head.
+    #
+    #   Producer family UNKNOWN (wt/<slug> Hermes worktree, dependabot,
+    #     feature/<slug>): the producer could be either model family, but
+    #     we cannot tell which, so the rule DELETES only the logins that
+    #     are KNOWN to be one of the two model-runner review bots
+    #     (`claude-review`, `chatgpt-codex-connector`). Every other
+    #     trusted review bot (coderabbit, codacy, cubic, qodana, qlty,
+    #     gemini, qwen-coder-review, maxi-reviewer) is `other`; their
+    #     review cannot be a same-family self-verification, so they are
+    #     accepted. Codacy HIGH RISK, maxi-config#1116, 2026-10-16.
+    #
+    # `crossfam_dropped_coverers` and `crossfam_dropped_approvers` are the
+    # names the FAIL line cites so an operator can see which reviewers the
+    # rule removed. Computed BEFORE the filter rewrites `covered` /
+    # `approvals`, so the FAIL can refer back to the pre-filter state.
+    producer_family = producer_family_of(head_ref)
+    if producer_family in (FAMILY_CLAUDE, FAMILY_CODEX):
+        # Same-family match: a covering reviewer whose family equals the
+        # producer family's is dropped. Bot-vs-human makes no difference
+        # to this branch -- it is login family that matters.
+        crossfam_dropped_coverers = [name for name in covered
+                                      if reviewer_family_of_login(name) == producer_family]
+        crossfam_dropped_approvers = [who for (who, _kind) in approvals
+                                       if reviewer_family_of_login(who) == producer_family]
+        covered = [name for name in covered
+                   if reviewer_family_of_login(name) != producer_family]
+        approvals = [(who, kind) for (who, kind) in approvals
+                     if reviewer_family_of_login(who) != producer_family]
+    elif producer_family == FAMILY_UNKNOWN:
+        # Cannot tell the producer family. Refuse to credit reviewers
+        # whose login names them as a Claude or Codex model-runner bot,
+        # because any of them might be reviewing the same family that
+        # produced the change. `other` family reviewers are accepted.
+        crossfam_dropped_coverers = [name for name in covered
+                                      if is_restricted_under_unknown(name)]
+        crossfam_dropped_approvers = [who for (who, _kind) in approvals
+                                       if is_restricted_under_unknown(who)]
+        covered = [name for name in covered
+                   if not is_restricted_under_unknown(name)]
+        approvals = [(who, kind) for (who, kind) in approvals
+                     if not is_restricted_under_unknown(who)]
+    else:
+        crossfam_dropped_coverers = []
+        crossfam_dropped_approvers = []
+    cross_family_active = (producer_family in (FAMILY_CLAUDE, FAMILY_CODEX)
+                           or bool(crossfam_dropped_coverers or crossfam_dropped_approvers))
+
     ok = True
 
     if only in (ONLY_ALL, ONLY_THREADS) and unresolved:
@@ -801,7 +1008,46 @@ def evaluate(doc, only=ONLY_ALL):
             and isinstance(rv.get('state'), str)
             and rv['state'].upper() in COUNTED_STATES
         )
-        if asked_logins is not None:
+        # Cross-family FAIL: the rule above dropped every reviewer and
+        # every APPROVED reviewer that was covering. The standard "no
+        # reviewer" FAIL line would still be true (none covered), but it
+        # would not say WHY the reviewers that ran didn't count, and an
+        # operator seeing "no review yet" would naturally push the same
+        # same-family reviewer again. The dedicated line names the family
+        # and the dropped reviewers so the fix is "summon a different-family
+        # reviewer" rather than "summon any reviewer".
+        #
+        # The line keeps the `FAIL:` prefix so the existing
+        # `failure_annotations()` path surfaces it on the checks page;
+        # the body is the cross-family-specific reason. `_CROSSFAM_PREFIX`
+        # is also embedded for any downstream consumer that wants to tell
+        # cross-family FAILs from every other kind.
+        if cross_family_active and (crossfam_dropped_coverers or crossfam_dropped_approvers):
+            cf_lines = [crossfam_dropped_coverers, crossfam_dropped_approvers]
+            dropped_names = sorted({n for lst in cf_lines for n in lst})
+            if producer_family in (FAMILY_CLAUDE, FAMILY_CODEX):
+                mode = ('reviewer family matches producer family (' + producer_family
+                        + '). dropped by the cross-family rule: '
+                        + ', '.join(dropped_names)
+                        + '. Summon a reviewer from a different family (claude <-> codex)')
+            else:
+                # Producer family unknown: the rule refused the model-runner
+                # reviewers because any of them might be the same family
+                # that wrote the diff. The actionable fix is to route the
+                # review to a non-model reviewer (one of the `other` family
+                # bots) or surface the producer family in a way the gate can
+                # see (claude/<slug> or codex/<slug> branch prefix).
+                mode = ('producer family cannot be determined from headRefName. '
+                        + 'refused model-runner reviewers '
+                        + '(' + ', '.join(dropped_names) + ') '
+                        + 'to fail closed on a possibly same-family review. '
+                        + 'Route the next review to a non-model reviewer '
+                        + '(coderabbit, codacy, cubic, qodana, qlty, gemini, '
+                        + 'qwen-coder-review, maxi-reviewer), or push a commit '
+                        + 'with a branch prefix the gate can classify '
+                        + '(claude/ or codex/).')
+            lines.append('FAIL: ' + _CROSSFAM_PREFIX + ' ' + mode)
+        elif asked_logins is not None:
             # Roster present and non-empty: the FAIL has to name the asked
             # set so an operator knows which reviewer to summon. The gate is
             # here because nobody on the asked list has reviewed -- a
