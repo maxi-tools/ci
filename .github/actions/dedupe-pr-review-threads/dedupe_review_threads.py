@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
-"""Deduplicate bot review threads that hit the same lines in the same round.
+"""Deduplicate bot review threads across pushes and within the same round.
 
-When two or more review bots flag the same code in the same round, every
-thread still has to be replied to and resolved before review-gate goes
-green. Resolving them by hand is mechanical work the bots do not help with,
-and the round where a human reviewer should be designing instead reads as a
-thread-resolution sweep.
+Two duplicate shapes accumulate on PRs in this org:
 
-Measured on maxi-core 2026-09-16..18: 55 bot comments across 9 PRs, 8 sites
-with two or more bots in the same 8-line window, one with three (Codacy +
-qlty + maxi-reviewer on scripts/fleet/deploy-member.sh). Every duplicate is
-a thread the PR author has to handle before merge, and the handler is always
-the same shape: identify the earlier thread, mark the later ones as
-duplicates, and resolve them.
+1. Cross-push / same-finding bot re-posts (measured on maxi-core#4897,
+   2026-10-21: 262 qltysh threads, 247 unresolved across 16 pushes, 0
+   outdated, but only 31 distinct `(path, finding-text)` keys -- e.g. x48
+   on `tests/test_quality_coverage_workflow.py` with 3 copies per commit).
+   `qltysh` re-posts every finding on every push and appends a commit/run-
+   specific `<a href="https://qlty.sh/...">` link to the comment body, so
+   exact-body comparison misses and single-round multi-bot clustering skips
+   single-author components (`len(authors) < 2`) and already-resolved older
+   threads (`isResolved == True`).
 
-This script does that handler.
+2. Same-round multi-bot co-location (measured on maxi-core 2026-09-16..18:
+   55 bot comments across 9 PRs, 8 sites with two or more bots in the same
+   8-line window). When two or more review bots flag the same code in the
+   same round, every thread still has to be replied to and resolved before
+   review-gate goes green.
+
+This script handles both shapes.
 
 WHAT IT TOUCHES
   * Resolves review threads that THIS script previously resolved, on re-run.
-  * Resolves bot review threads whose author is one of the five bot logins
-    in BOT_LOGINS, when they share a (path, +-4 line window) with another
-    bot thread from a distinct bot login in the same window.
+  * Resolves unresolved bot review threads whose normalised finding key
+    `(author, path, finding text with HTML links/URLs/commit SHAs stripped,
+    line if not outdated)` matches an OLDER thread on the same PR (keeping
+    the oldest open, or resolving the newer re-post too when the oldest was
+    already resolved by a human/agent decision).
+  * Resolves bot review threads whose author is in BOT_LOGINS, when they
+    share a (path, +-4 line window) with another bot thread from a distinct
+    bot login in the same window.
   * Posts one reply on each thread it resolves, citing the kept thread.
 
 WHAT IT DOES NOT TOUCH
   * Human-authored threads. Filtered before clustering.
-  * Already-resolved threads. Filtered before clustering.
-  * File-level threads (no line number). Kept -- a file-level flag is a
-    different conversation even when two bots raise it, because neither
-    points at code.
+  * The last remaining open copy of an undecided finding key.
+  * File-level threads (no line number and not outdated). Kept -- a
+    file-level flag is a different conversation even when two bots raise it,
+    because neither points at code.
   * Threads whose author is not in BOT_LOGINS. The list is explicit on
     purpose: a bot not on it stays alone.
 
@@ -69,6 +79,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -78,20 +89,19 @@ from typing import Any
 
 #: Bots active in the org whose threads we deduplicate.
 #:
-#: Five, not three. The original three (codacy-production, coderabbitai,
+#: Six, not three. The original three (codacy-production, coderabbitai,
 #: maxi-reviewer) cover the well-known lanes; cubic-dev-ai (the
-#: `cubic . AI code reviewer` GitHub App) and chatgpt-codex-connector (the
-#: ChatGPT Codex Connector GitHub App) post prolifically on this org's
-#: PRs and were left out by the original dedupe design, which is the gap
-#: this script fills. Verified on a live maxi-core PR with five-bot
-#: co-location: codacy-production, coderabbitai, maxi-reviewer,
-#: cubic-dev-ai, chatgpt-codex-connector all on the same window.
+#: `cubic . AI code reviewer` GitHub App), chatgpt-codex-connector (the
+#: ChatGPT Codex Connector GitHub App), and qltysh (Qlty Cloud inline review
+#: comments, which re-post every `mode = "comment"` plugin finding on every
+#: push) post prolifically on this org's PRs.
 BOT_LOGINS: tuple[str, ...] = (
     "codacy-production",
     "coderabbitai",
     "maxi-reviewer",
     "cubic-dev-ai",
     "chatgpt-codex-connector",
+    "qltysh",
 )
 
 #: Default +-window for clustering. 4 means two threads whose lines differ
@@ -105,10 +115,85 @@ WINDOW: int = 4
 #: marker.
 SENTINEL = "<!-- maxi-config:dedupe -->"
 
-#: Cap on threads we will process in one run. A single PR with hundreds of
-#: unresolved bot threads is almost certainly a bot loop, not a real review;
-#: bailing out is safer than touching every thread on it.
-MAX_RESOLVE_PER_RUN = 100
+#: Cap on threads we will process in one run. Raised from 100 to 500 so a
+#: multi-push PR with accumulated qltysh re-posts (e.g. maxi-core#4897: 262
+#: qltysh threads, 247 unresolved across 31 distinct findings -> 216
+#: duplicates) can be drained in a single run instead of bailing out.
+MAX_RESOLVE_PER_RUN = 500
+
+#: GitHub GraphQL `Query.nodes(ids:)` accepts at most 100 IDs per call.
+_GRAPHQL_NODES_BATCH_SIZE = 100
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_LINK_RE = re.compile(r"<a\b[^>]*>.*?</a>", re.IGNORECASE | re.DOTALL)
+_HTML_ANCHOR_TAG_RE = re.compile(r"</?a\b[^>]*>", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s)>\]\"']+", re.IGNORECASE)
+_COMMIT_SHA_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _bot_slug(login: str | None) -> str:
+    """Return the canonical login with any trailing `[bot]` suffix stripped."""
+    if not login:
+        return ""
+    return login[:-5] if login.endswith("[bot]") else login
+
+
+def _is_bot(login: str | None, bot_logins: frozenset[str]) -> bool:
+    """True when `login` matches an entry in `bot_logins` (with or without `[bot]`)."""
+    if not login:
+        return False
+    slug = _bot_slug(login)
+    return login in bot_logins or slug in bot_logins or f"{slug}[bot]" in bot_logins
+
+
+def normalise_finding_text(body: str) -> str:
+    """Normalise a review comment body so re-posts of the same finding match.
+
+    Bots such as `qltysh` re-post identical finding prose on every push and
+    append a trailing `<a href="https://qlty.sh/...">` link (or bare URL /
+    commit SHA) that embeds the posting commit or run ID. Stripping HTML
+    comments, `<a ...>...</a>` elements, bare URLs, and 7..40-hex commit
+    SHAs before collapsing whitespace turns per-push copies of the same
+    finding into one canonical string.
+    """
+    text = _HTML_COMMENT_RE.sub(" ", body)
+    text = _HTML_LINK_RE.sub(" ", text)
+    text = _HTML_ANCHOR_TAG_RE.sub(" ", text)
+    text = _URL_RE.sub(" ", text)
+    text = _COMMIT_SHA_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def finding_key(
+    thread: dict[str, Any],
+) -> tuple[str, str, str, int | None] | None:
+    """Return the normalised cross-push dedupe key for a thread.
+
+    The key is `(author, path, normalised_finding_text, line_if_not_outdated)`:
+      * `author`: canonical bot login (`[bot]` suffix stripped).
+      * `path`: repo-relative file path.
+      * `text`: `normalise_finding_text(thread["body"])`.
+      * `line`: `int(thread["line"])` when the thread is NOT outdated, or
+        `None` when `thread["isOutdated"]` is true (because an outdated
+        thread's line anchor shifted in a later push).
+
+    Returns `None` for threads that lack an author, path, finding text, or
+    (when not outdated) a line anchor (file-level threads).
+    """
+    author = _bot_slug(thread.get("author"))
+    path = thread.get("path")
+    if not author or not path:
+        return None
+    is_outdated = bool(thread.get("isOutdated"))
+    raw_line = thread.get("line")
+    if not is_outdated and raw_line is None:
+        return None
+    text = normalise_finding_text(thread.get("body") or "")
+    if not text:
+        return None
+    line: int | None = None if is_outdated else int(raw_line)
+    return (author, path, text, line)
 
 
 def _gh_graphql_field_args(key: str, value: Any) -> list[str]:
@@ -351,22 +436,24 @@ def fetch_thread_bodies(
       }
     }
     """
-    payload = _gh_graphql(query, ids=thread_ids)
-    thread_nodes = (payload.get("data") or {}).get("nodes") or []
-    for thread in thread_nodes:
-        if not thread:
-            # `nodes(ids:)` echoes a `null` slot for every ID that does
-            # not resolve to the requested type or is unknown; the inner
-            # block is skipped rather than crashed on so a stale ID
-            # doesn't kill the whole run.
-            continue
-        thread_id = thread.get("id")
-        if not thread_id:
-            continue
-        bodies[thread_id] = "\n".join(
-            (node.get("body") or "")
-            for node in (thread.get("comments") or {}).get("nodes") or []
-        )
+    for start in range(0, len(thread_ids), _GRAPHQL_NODES_BATCH_SIZE):
+        batch = thread_ids[start : start + _GRAPHQL_NODES_BATCH_SIZE]
+        payload = _gh_graphql(query, ids=batch)
+        thread_nodes = (payload.get("data") or {}).get("nodes") or []
+        for thread in thread_nodes:
+            if not thread:
+                # `nodes(ids:)` echoes a `null` slot for every ID that does
+                # not resolve to the requested type or is unknown; the inner
+                # block is skipped rather than crashed on so a stale ID
+                # doesn't kill the whole run.
+                continue
+            thread_id = thread.get("id")
+            if not thread_id:
+                continue
+            bodies[thread_id] = "\n".join(
+                (node.get("body") or "")
+                for node in (thread.get("comments") or {}).get("nodes") or []
+            )
     return bodies
 
 
@@ -376,44 +463,135 @@ def cluster(
     *,
     window: int = WINDOW,
 ) -> list[list[dict[str, Any]]]:
-    """Group unresolved bot threads into clusters.
+    """Group bot threads into duplicate clusters `[keeper, *duplicates]`.
 
-    Two threads cluster when they share a path AND their lines differ
-    by at most 2*window. window=4 -> +-4 -> lines 10 and 18 share a
-    cluster (|18-10| = 8 = 2*window); lines 10 and 19 do not.
+    Runs in two passes:
 
-    A cluster is a maximal connected component under that relation:
-    if A is in the same window as B, and B is in the same window as C,
-    then A, B and C share a cluster even if A and C are NOT in the
-    same window -- because the duplicate-of reply goes on the LATER
-    thread and points at the EARLIEST, and an extra middle thread is
-    not a second conversation.
+    1. Cross-push / same-key deduplication (single-bot re-posts across or
+       within rounds):
+       For bot threads whose `finding_key(thread)` is defined, group by
+       `(author, path, normalised_finding_text, line_if_not_outdated)`
+       (when either thread in a `(author, path, text)` bucket is outdated,
+       its `line` is `None` and matches on `(author, path, text)`). A
+       bucket that holds an outdated copy keeps matching EVERY line of
+       that `(author, path, text)` key, because the outdated anchor
+       shifted and the re-post that followed it landed on a new line.
+       Order each group oldest-first (`createdAt`, then already-resolved
+       before unresolved on timestamp ties, then input index). Pick as
+       `keeper` the earliest thread in the group that was not resolved
+       solely by our own dedupe sentinel. Every unresolved thread after
+       `keeper` is resolved as a duplicate of `keeper`:
+         * If the oldest copy is open, it stays open and all newer copies
+           resolve against it (never resolving the last remaining copy).
+         * If the oldest copy was already resolved by a human/agent
+           decision, newer unresolved copies are re-posts of a decided
+           finding and resolve against it too.
 
-    A cluster contains at least two distinct bot authors. Single-author
-    clusters are NOT returned: a bot posting twice on the same lines is
-    a bot loop, not a duplicate, and deduping its output against itself
-    would suppress findings the reviewer should see.
+    2. Same-round multi-bot line-window deduplication:
+       Among the remaining unresolved bot threads that have a `(path, line)`
+       anchor -- the same-key DUPLICATES are excluded (they already
+       resolve against their keeper), but their KEEPER is not -- two
+       threads cluster when they share a `path` AND their lines differ by
+       at most `2*window`. Connected components with `>= 2` distinct bot
+       authors form clusters ordered by `createdAt`; a component that
+       holds a same-key keeper is headed by that keeper, so the cross-bot
+       thread sharing its line window resolves against it;
+       single-author components with distinct finding keys are dropped so
+       distinct findings by the same bot in one line window are never
+       collapsed against each other.
 
-    Threads that are already resolved, or that are not from a bot login,
-    or that lack a (path, line) anchor, are NOT returned.
-
-    Clustering is O(N log N) on the per-path sort then O(N) within each
-    path bucket (a single sweep over the line-sorted list with
-    union-find on adjacent pairs whose lines differ by < max_gap).
-    Equivalent to the naive O(N^2) union-the-pairs-within-gap, because
-    union-find is transitive: if A is within gap of B and B is within
-    gap of C, then A and C share a cluster whether or not they are
-    within gap of each other directly. Path buckets are small on real
-    PRs -- the measurement that motivated this script found at most
-    three threads per window, and a ten-thread bucket is the worst
-    case observed in two months of data.
+    Human-authored threads, threads from logins outside `bot_logins`, and
+    file-level threads (`line is None` and not outdated) are never touched.
     """
+    clusters: list[list[dict[str, Any]]] = []
+
+    # Pass 1: cross-push / within-round same-key bot deduplication.
+    keyed_candidates: list[
+        tuple[tuple[str, int, int], dict[str, Any], tuple[str, str, str, int | None]]
+    ] = []
+    for idx, thread in enumerate(threads):
+        if not _is_bot(thread.get("author"), bot_logins):
+            continue
+        key = finding_key(thread)
+        if key is None:
+            continue
+        sort_key = (
+            thread.get("createdAt") or "",
+            0 if thread.get("isResolved") else 1,
+            idx,
+        )
+        keyed_candidates.append((sort_key, thread, key))
+
+    keyed_candidates.sort(key=lambda item: item[0])
+
+    by_base_key: dict[
+        tuple[str, str, str], list[tuple[int | None, list[dict[str, Any]]]]
+    ] = defaultdict(list)
+    for _sort_key, thread, key in keyed_candidates:
+        author, path, text, line = key
+        base = (author, path, text)
+        buckets = by_base_key[base]
+        matched_idx: int | None = None
+        for idx_b, (b_line, _group) in enumerate(buckets):
+            if b_line == line or b_line is None or line is None:
+                matched_idx = idx_b
+                break
+        if matched_idx is None:
+            buckets.append((line, [thread]))
+            continue
+        b_line, group = buckets[matched_idx]
+        group.append(thread)
+        # A bucket that holds an OUTDATED copy stands for every line of
+        # the finding: an outdated thread's anchor shifted, so it matches
+        # the copies before and after the shift whatever line they sit
+        # on. Pinning it to the line of whichever copy joined it split
+        # shifted re-posts into separate groups, and those groups stayed
+        # open because a group of one is never a cluster.
+        if line is None or b_line is None:
+            buckets[matched_idx] = (None, group)
+
+    # Same-key duplicates. They already resolve against their keeper in
+    # pass 1, so pass 2 must not see them again.
+    key_dup_ids: set[str] = set()
+    # Same-key keepers -- the surviving copy of a finding key. They stay
+    # eligible for the line-window pass: excluding them left a cross-bot
+    # thread that shared the site with no partner to resolve against, and
+    # that thread stayed open forever.
+    key_keeper_ids: set[str] = set()
+    for buckets in by_base_key.values():
+        for _b_line, group in buckets:
+            if len(group) < 2:
+                continue
+            keeper_idx: int | None = None
+            for idx_g, candidate in enumerate(group):
+                if candidate.get("isResolved") and _already_processed(
+                    candidate.get("body") or ""
+                ):
+                    continue
+                keeper_idx = idx_g
+                break
+            if keeper_idx is None:
+                continue
+            keeper = group[keeper_idx]
+            dups = [
+                t for t in group[keeper_idx + 1 :] if not t.get("isResolved")
+            ]
+            if not dups:
+                continue
+            clusters.append([keeper, *dups])
+            key_keeper_ids.add(keeper["id"])
+            for dup in dups:
+                key_dup_ids.add(dup["id"])
+
+    # Pass 2: same-round multi-bot line-window deduplication.
     max_gap = 2 * window
     by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for thread in threads:
+        if thread["id"] in key_dup_ids:
+            continue
         if thread["isResolved"]:
             continue
-        if thread.get("author") not in bot_logins:
+        if not _is_bot(thread.get("author"), bot_logins):
             continue
         path = thread.get("path")
         line = thread.get("line")
@@ -421,7 +599,6 @@ def cluster(
             continue
         by_path[path].append(thread)
 
-    clusters: list[list[dict[str, Any]]] = []
     for members in by_path.values():
         # Sort by line so adjacent members whose lines differ by <=
         # max_gap are the only ones that can ever pair. A single sweep
@@ -455,10 +632,32 @@ def cluster(
 
         for indices in groups.values():
             component = [ordered[k] for k in indices]
-            authors = {t["author"] for t in component}
+            authors = {_bot_slug(t["author"]) for t in component}
             if len(authors) < 2:
                 continue
             component.sort(key=lambda t: t["createdAt"])
+            # A same-key keeper is the surviving copy of its finding key,
+            # so it ANCHORS the cross-bot cluster: it heads the cluster
+            # and stays open, and the cross-bot thread that shares its
+            # line window resolves against it. Resolving the keeper
+            # instead would close the last open copy of that key, and
+            # leaving the keeper out of the window pass altogether left
+            # the cross-bot thread with nobody to resolve against.
+            anchor = next(
+                (t for t in component if t["id"] in key_keeper_ids), None
+            )
+            if anchor is not None:
+                # A second same-key keeper keeps its own open copy: it is
+                # the survivor of its own key, not a duplicate of the
+                # anchor.
+                rest = [
+                    t
+                    for t in component
+                    if t["id"] != anchor["id"] and t["id"] not in key_keeper_ids
+                ]
+                if not rest:
+                    continue
+                component = [anchor, *rest]
             clusters.append(component)
     return clusters
 
@@ -486,7 +685,10 @@ def plan(
     """Decide what to keep, what to resolve, and what was already done.
 
     Returns (kept, to_resolve, already_processed) where:
-      * kept is the list of keeper threads (one per cluster),
+      * kept is the list of keeper threads -- one per surviving thread,
+        not one per cluster. A same-key keeper that also anchors a
+        cross-bot cluster heads both, and it is listed once because it
+        stays open either way.
       * to_resolve is a list of (duplicate, keeper) pairs -- the
         association is part of the value, not a property to be
         re-derived at apply time. A flat (dup, ...) list would force
@@ -510,6 +712,7 @@ def plan(
     script is invoked with --payload (offline).
     """
     kept: list[dict[str, Any]] = []
+    kept_ids: set[str] = set()
     to_resolve: list[tuple[dict[str, Any], dict[str, Any]]] = []
     already_processed: list[dict[str, Any]] = []
 
@@ -523,7 +726,9 @@ def plan(
 
     for cluster_ in clusters:
         keeper = cluster_[0]
-        kept.append(keeper)
+        if keeper["id"] not in kept_ids:
+            kept_ids.add(keeper["id"])
+            kept.append(keeper)
         for dup in cluster_[1:]:
             if not _already_processed(bodies.get(dup["id"], "")):
                 to_resolve.append((dup, keeper))
