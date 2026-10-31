@@ -293,7 +293,7 @@ jobs:
         # optional on workflow_call without this gate would still fail every
         # downstream step the moment the action ran.
         if: steps.credentials.outputs.has_credentials == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: app-token
         with:
           # Deliberately still `app-id` rather than `client-id`.
@@ -342,7 +342,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: steps.workspace.outputs.has_workspace == 'true'
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: '1.98.1'
           components: rustfmt, clippy
